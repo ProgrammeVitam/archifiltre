@@ -1,0 +1,73 @@
+# === Dependencies ===
+node_modules/
+bun.lockb
+
+# === Build Output ===
+dist/
+lib/
+build/
+*.tsbuildinfo
+
+# === Compiled Binary ===
+archifiltre
+archifiltre.exe
+
+# === TypeScript ===
+*.js
+*.js.map
+*.d.ts
+!*.config.js
+!*.config.mjs
+!scripts/*.mjs
+
+# === Test Coverage ===
+coverage/
+.nyc_output/
+
+# === Environment ===
+.env
+.env.local
+.env.*.local
+
+# === Logs ===
+logs/
+*.log
+npm-debug.log*
+bun-debug.log*
+lerna-debug.log*
+
+# === Temp/Cache ===
+.cache/
+tmp/
+temp/
+*.tmp
+*.temp
+
+# === OS Generated ===
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# === IDE/Editor ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === Config Files (keep most, ignore sensitive) ===
+!.editorconfig
+!.eslintrc.*
+!.prettierrc*
+!tsconfig.json
+!vitest.config.ts
+
+# === Archifiltre Specific ===
+# Keep user config directory tests but ignore actual user data
+test-output/
+*.analysis.json
+*.scan.json

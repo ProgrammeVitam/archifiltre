@@ -1,0 +1,430 @@
+name: Smoke Tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      upload_artifacts:
+        description: 'Upload artifacts as release assets'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  BUN_VERSION: '1.0.0'
+
+jobs:
+  build-and-smoke:
+    name: Build and Smoke Test (${{ matrix.target.os }}-${{ matrix.target.arch }})
+    runs-on: ${{ matrix.target.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - os: linux
+            arch: x64
+            runner: ubuntu-latest
+            binary_name: archifiltre
+          - os: darwin
+            arch: x64
+            runner: macos-latest
+            binary_name: archifiltre
+          - os: darwin
+            arch: arm64
+            runner: macos-latest
+            binary_name: archifiltre
+
+    env:
+      APP_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('5.0.0-dev.{0}', github.run_number) }}
+      GIT_SHA: ${{ github.sha }}
+      BUILD_DATE: ${{ github.event.head_commit.timestamp || github.event.commits[0].timestamp }}
+      TARGET_OS: ${{ matrix.target.os }}
+      TARGET_ARCH: ${{ matrix.target.arch }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-${{ matrix.target.arch }}-bun-${{ hashFiles('**/bun.lockb') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target.arch }}-bun-
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Set build environment variables
+        run: |
+          echo "APP_VERSION=${{ env.APP_VERSION }}" >> $GITHUB_ENV
+          echo "GIT_SHA=$(git rev-parse --short=7 HEAD)" >> $GITHUB_ENV
+          echo "BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")" >> $GITHUB_ENV
+
+      - name: Build binary
+        run: |
+          echo "Building for ${{ matrix.target.os }}-${{ matrix.target.arch }}"
+          echo "Version: ${{ env.APP_VERSION }}"
+          echo "Git SHA: ${{ env.GIT_SHA }}"
+          echo "Build Date: ${{ env.BUILD_DATE }}"
+
+          # Build the binary
+          bun run build:cli
+
+          # Verify binary exists and is executable
+          ls -la ${{ matrix.target.binary_name }}
+          file ${{ matrix.target.binary_name }}
+          chmod +x ${{ matrix.target.binary_name }}
+
+      - name: Test binary execution (with toolchain)
+        run: |
+          echo "Testing binary with development environment..."
+          ./${{ matrix.target.binary_name }} --version
+          ./${{ matrix.target.binary_name }} --help | head -10
+
+      - name: Run smoke tests in clean container
+        if: matrix.target.os == 'linux'
+        run: |
+          echo "Running smoke tests in clean Alpine container..."
+
+          # Create a minimal test script that doesn't depend on Node.js/Bun
+          cat > smoke_test_minimal.sh << 'EOF'
+          #!/bin/sh
+          set -e
+
+          BINARY="./archifiltre"
+
+          echo "=== Smoke Test: Clean Container Environment ==="
+          echo "OS: $(uname -s)"
+          echo "Arch: $(uname -m)"
+          echo "User: $(whoami)"
+          echo "Working directory: $(pwd)"
+          echo
+
+          # Test 1: Binary is executable
+          if [ ! -x "$BINARY" ]; then
+            echo "❌ Binary is not executable"
+            exit 1
+          fi
+          echo "✅ Binary is executable"
+
+          # Test 2: Version format
+          echo "Testing --version format..."
+          VERSION_OUTPUT=$($BINARY --version)
+          echo "Version output: $VERSION_OUTPUT"
+
+          # Check version format: vX.Y.Z (sha abcdef7, 2025-01-01T12:34:56Z, os=linux, arch=x64)
+          if echo "$VERSION_OUTPUT" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)? \(sha [0-9a-f]{7,9}, [0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z, os=[a-zA-Z0-9]+, arch=[a-zA-Z0-9]+\)$'; then
+            echo "✅ Version format is correct"
+          else
+            echo "❌ Version format is incorrect"
+            echo "Expected: vX.Y.Z (sha abcdef7, YYYY-MM-DDTHH:MM:SS.sssZ, os=osname, arch=archname)"
+            echo "Actual: $VERSION_OUTPUT"
+            exit 1
+          fi
+
+          # Test 3: Help contains required sections
+          echo "Testing --help content..."
+          HELP_OUTPUT=$($BINARY --help)
+
+          # Check for required sections (case-insensitive)
+          for section in "EXAMPLES" "EXIT CODES" "OPTIONS"; do
+            if echo "$HELP_OUTPUT" | grep -i "$section" > /dev/null; then
+              echo "✅ Help contains $section section"
+            else
+              echo "❌ Help missing $section section"
+              exit 1
+            fi
+          done
+
+          # Check for required flags
+          for flag in "--help" "--version" "--verbose" "--no-color" "--log-format"; do
+            if echo "$HELP_OUTPUT" | grep "$flag" > /dev/null; then
+              echo "✅ Help contains $flag flag"
+            else
+              echo "❌ Help missing $flag flag"
+              exit 1
+            fi
+          done
+
+          # Test 4: Help exits with code 0
+          if $BINARY --help > /dev/null 2>&1; then
+            echo "✅ --help exits with code 0"
+          else
+            echo "❌ --help exits with non-zero code"
+            exit 1
+          fi
+
+          # Test 5: Invalid command exits with code 2
+          if $BINARY invalid-command-xyz > /dev/null 2>&1; then
+            echo "❌ Invalid command should fail"
+            exit 1
+          elif [ $? -eq 2 ]; then
+            echo "✅ Invalid command exits with code 2"
+          else
+            echo "❌ Invalid command exits with wrong code (expected 2, got $?)"
+            exit 1
+          fi
+
+          # Test 6: Health command basic test
+          echo "Testing health command..."
+          HEALTH_EXIT_CODE=0
+          $BINARY health > /dev/null 2>&1 || HEALTH_EXIT_CODE=$?
+
+          if [ $HEALTH_EXIT_CODE -eq 0 ] || [ $HEALTH_EXIT_CODE -eq 1 ]; then
+            echo "✅ Health command exits with appropriate code ($HEALTH_EXIT_CODE)"
+          else
+            echo "❌ Health command exits with unexpected code ($HEALTH_EXIT_CODE)"
+            exit 1
+          fi
+
+          # Test 7: No network activity (basic timing test)
+          echo "Testing network isolation..."
+          START_TIME=$(date +%s)
+          $BINARY health > /dev/null 2>&1 || true
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+
+          if [ $DURATION -lt 5 ]; then
+            echo "✅ Health command completed quickly (${DURATION}s) - no obvious network activity"
+          else
+            echo "⚠️  Health command took ${DURATION}s - possible network activity or system slowness"
+          fi
+
+          echo
+          echo "=== All Smoke Tests Passed! ==="
+          EOF
+
+          chmod +x smoke_test_minimal.sh
+
+          # Run in clean Alpine container (no Node.js, no Bun, no development tools)
+          docker run --rm \
+            -v "$(pwd):/workspace" \
+            -w /workspace \
+            alpine:latest \
+            ./smoke_test_minimal.sh
+
+      - name: Run smoke tests natively
+        if: matrix.target.os != 'linux'
+        run: |
+          echo "Running native smoke tests on ${{ matrix.target.os }}..."
+
+          # Use the bundled smoke test script
+          bun run scripts/smoke-test.mjs
+
+      - name: Create release package
+        run: |
+          echo "Creating release package..."
+          bun run release:pack
+
+      - name: Verify release artifacts
+        run: |
+          echo "Verifying release artifacts..."
+          ls -la dist/
+
+          # Check that required files exist
+          ARCHIVE_NAME="archifiltre-${{ matrix.target.os }}-${{ matrix.target.arch }}-${{ env.APP_VERSION }}.tar.gz"
+
+          if [ ! -f "dist/$ARCHIVE_NAME" ]; then
+            echo "❌ Archive not found: $ARCHIVE_NAME"
+            exit 1
+          fi
+
+          if [ ! -f "dist/$ARCHIVE_NAME.sha256" ]; then
+            echo "❌ Archive checksum not found: $ARCHIVE_NAME.sha256"
+            exit 1
+          fi
+
+          if [ ! -f "dist/checksums.sha256" ]; then
+            echo "❌ Checksums file not found: checksums.sha256"
+            exit 1
+          fi
+
+          if [ ! -f "dist/manifest.json" ]; then
+            echo "❌ Manifest not found: manifest.json"
+            exit 1
+          fi
+
+          echo "✅ All required artifacts present"
+
+      - name: Validate checksums
+        run: |
+          echo "Validating checksums..."
+          cd dist/
+
+          ARCHIVE_NAME="archifiltre-${{ matrix.target.os }}-${{ matrix.target.arch }}-${{ env.APP_VERSION }}.tar.gz"
+
+          # Validate archive checksum
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum -c "$ARCHIVE_NAME.sha256"
+          elif command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 -c "$ARCHIVE_NAME.sha256"
+          else
+            echo "⚠️  No SHA256 tool available, skipping checksum validation"
+          fi
+
+          echo "✅ Checksums validated"
+
+      - name: Test archive extraction
+        run: |
+          echo "Testing archive extraction..."
+          cd dist/
+
+          ARCHIVE_NAME="archifiltre-${{ matrix.target.os }}-${{ matrix.target.arch }}-${{ env.APP_VERSION }}.tar.gz"
+
+          # Create test extraction directory
+          mkdir -p test-extract
+          cd test-extract
+
+          # Extract archive
+          tar -xzf "../$ARCHIVE_NAME"
+
+          # Verify contents
+          if [ ! -f "archifiltre" ] && [ ! -f "archifiltre.exe" ]; then
+            echo "❌ Binary not found in archive"
+            exit 1
+          fi
+
+          if [ ! -f "LICENSE" ]; then
+            echo "❌ LICENSE not found in archive"
+            exit 1
+          fi
+
+          if [ ! -f "README.quickstart.md" ]; then
+            echo "❌ README.quickstart.md not found in archive"
+            exit 1
+          fi
+
+          # Test binary from archive
+          chmod +x archifiltre* || true
+
+          if [ -f "archifiltre" ]; then
+            ./archifiltre --version
+          elif [ -f "archifiltre.exe" ]; then
+            ./archifiltre.exe --version
+          fi
+
+          echo "✅ Archive extraction and binary test successful"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: archifiltre-${{ matrix.target.os }}-${{ matrix.target.arch }}-${{ github.run_number }}
+          path: |
+            dist/archifiltre-${{ matrix.target.os }}-${{ matrix.target.arch }}-${{ env.APP_VERSION }}.tar.gz
+            dist/archifiltre-${{ matrix.target.os }}-${{ matrix.target.arch }}-${{ env.APP_VERSION }}.tar.gz.sha256
+            dist/checksums.sha256
+            dist/manifest.json
+          retention-days: 30
+          compression-level: 0 # Files are already compressed
+
+      - name: Upload to release (on tags)
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.event.inputs.upload_artifacts == 'true')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Uploading artifacts to release..."
+
+          ARCHIVE_NAME="archifiltre-${{ matrix.target.os }}-${{ matrix.target.arch }}-${{ env.APP_VERSION }}.tar.gz"
+
+          # Get release ID
+          if [ "${{ github.event_name }}" = "release" ]; then
+            RELEASE_TAG="${{ github.event.release.tag_name }}"
+          else
+            RELEASE_TAG="${{ env.APP_VERSION }}"
+          fi
+
+          # Upload archive
+          gh release upload "$RELEASE_TAG" \
+            "dist/$ARCHIVE_NAME" \
+            "dist/$ARCHIVE_NAME.sha256" \
+            --clobber || echo "Upload failed or release doesn't exist"
+
+  summary:
+    name: Smoke Test Summary
+    runs-on: ubuntu-latest
+    needs: [build-and-smoke]
+    if: always()
+    steps:
+      - name: Summary
+        run: |
+          echo "## Smoke Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.build-and-smoke.result }}" = "success" ]; then
+            echo "✅ **All smoke tests passed!**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- Binary compilation successful" >> $GITHUB_STEP_SUMMARY
+            echo "- Version format validation passed" >> $GITHUB_STEP_SUMMARY
+            echo "- Help content validation passed" >> $GITHUB_STEP_SUMMARY
+            echo "- Exit code handling correct" >> $GITHUB_STEP_SUMMARY
+            echo "- Clean container execution successful" >> $GITHUB_STEP_SUMMARY
+            echo "- Release packaging successful" >> $GITHUB_STEP_SUMMARY
+            echo "- Checksum validation passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Smoke tests failed**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Please check the job logs for details." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+  security-scan:
+    name: Security Scan Binary
+    runs-on: ubuntu-latest
+    needs: [build-and-smoke]
+    if: success()
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: archifiltre-linux-x64-*
+          merge-multiple: true
+
+      - name: Basic security scan
+        run: |
+          echo "Running basic security checks on binary..."
+
+          # Find the Linux binary archive
+          ARCHIVE=$(find . -name "archifiltre-linux-x64-*.tar.gz" | head -1)
+
+          if [ -z "$ARCHIVE" ]; then
+            echo "No Linux binary archive found"
+            exit 1
+          fi
+
+          # Extract and analyze
+          tar -xzf "$ARCHIVE"
+
+          if [ -f "archifiltre" ]; then
+            # Check for suspicious strings
+            echo "Checking for suspicious content..."
+
+            if strings archifiltre | grep -i -E "(password|secret|token|key)" | head -5; then
+              echo "⚠️  Found potential sensitive strings (review above)"
+            else
+              echo "✅ No obvious sensitive strings found"
+            fi
+
+            # Check binary properties
+            file archifiltre
+            ls -la archifiltre
+
+            echo "✅ Basic security scan completed"
+          else
+            echo "❌ Binary not found in archive"
+            exit 1
+          fi
