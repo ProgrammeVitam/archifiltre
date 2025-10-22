@@ -3,23 +3,22 @@
   "version": "5.0.0-dev",
   "description": "Privacy-friendly, 100% offline desktop tool for inventorying large file trees",
   "type": "module",
-  "main": "src/cli/archifiltre.ts",
   "bin": {
-    "archifiltre": "./archifiltre"
+    "archifiltre": "./bin/run.js"
   },
   "scripts": {
-    "build:cli": "bun build src/cli/archifiltre.ts --compile --outfile archifiltre",
+    "dev": "bun run bin/dev.js",
+    "build:cli": "bun build src/cli/bundle-entry.ts --compile --outfile archifiltre",
     "smoke:cli": "bun run scripts/smoke-test.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run test/integration",
-    "lint": "eslint src test --ext .ts && eslint scripts --ext .mjs && eslint .github --ext .yml,.yaml",
-    "lint:fix": "eslint src test --ext .ts --fix && eslint scripts --ext .mjs --fix && eslint .github --ext .yml,.yaml --fix",
+    "lint": "eslint src test --ext .ts && eslint bin --ext .js && eslint scripts --ext .mjs && eslint .github --ext .yml,.yaml",
+    "lint:fix": "eslint src test --ext .ts --fix && eslint bin --ext .js --fix && eslint scripts --ext .mjs --fix && eslint .github --ext .yml,.yaml --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "release:pack": "bun run scripts/release-pack.mjs",
-    "dev": "bun run src/cli/archifiltre.ts",
     "typecheck": "tsc --noEmit"
   },
   "keywords": [
@@ -48,7 +47,27 @@
     "vitest": "^1.0.0",
     "yaml-eslint-parser": "^1.3.0"
   },
-  "dependencies": {},
+  "dependencies": {
+    "@oclif/core": "^4.0.0"
+  },
+  "oclif": {
+    "bin": "archifiltre",
+    "dirname": "archifiltre",
+    "commands": {
+      "strategy": "explicit",
+      "target": "./src/commands.js",
+      "identifier": "COMMANDS"
+    },
+    "helpClass": "./src/cli/help.js",
+    "plugins": [],
+    "topicSeparator": " ",
+    "additionalHelpFlags": [
+      "-h"
+    ],
+    "additionalVersionFlags": [
+      "-v"
+    ]
+  },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/ProgrammeVitam/archifiltre.git"

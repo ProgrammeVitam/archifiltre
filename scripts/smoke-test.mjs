@@ -131,16 +131,12 @@ async function testVersionFlag() {
       return false;
     }
 
-    // Check version format: vX.Y.Z (sha abcdef7, 2025-01-01T12:34:56.123Z, os=linux, arch=x64)
-    const versionRegex =
-      /^v\d+\.\d+\.\d+(-\w+)? \(sha [0-9a-f]{7,9}|unknown, \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{3})?Z, os=\w+, arch=\w+\)$/;
+    // Check version format: archifiltre/X.Y.Z platform-arch runtime
+    const versionRegex = /^archifiltre\/\d+\.\d+\.\d+(-\w+)? \w+-\w+ \w+-v\d+\.\d+\.\d+$/;
 
     if (!versionRegex.test(result.stdout)) {
       log(`✗ Version format is incorrect`, 'red');
-      log(
-        `Expected format: vX.Y.Z (sha abcdef7, 2025-01-01T12:34:56.123Z, os=linux, arch=x64)`,
-        'yellow'
-      );
+      log(`Expected format: archifiltre/X.Y.Z platform-arch runtime-vX.Y.Z`, 'yellow');
       log(`Actual output: ${result.stdout}`, 'yellow');
       return false;
     }
@@ -171,7 +167,7 @@ async function testHelpFlag() {
     }
 
     const helpOutput = result.stdout.toLowerCase();
-    const requiredSections = ['examples', 'exit codes', 'options'];
+    const requiredSections = ['usage', 'commands', 'version'];
     const missingSections = [];
 
     for (const section of requiredSections) {
@@ -185,18 +181,18 @@ async function testHelpFlag() {
       return false;
     }
 
-    // Check for required flags
-    const requiredFlags = ['--help', '--version', '--verbose', '--no-color'];
+    // Check for basic content presence (Oclif format doesn't show flags in main help)
+    const requiredContent = ['privacy-friendly', 'offline'];
     const missingFlags = [];
 
-    for (const flag of requiredFlags) {
-      if (!helpOutput.includes(flag)) {
-        missingFlags.push(flag);
+    for (const content of requiredContent) {
+      if (!helpOutput.includes(content)) {
+        missingFlags.push(content);
       }
     }
 
     if (missingFlags.length > 0) {
-      log(`✗ Help output missing required flags: ${missingFlags.join(', ')}`, 'red');
+      log(`✗ Help output missing required content: ${missingFlags.join(', ')}`, 'red');
       return false;
     }
 
