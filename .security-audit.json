@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2019-09/schema",
+  "title": "Security Audit Configuration",
+  "description": "Configuration for Archifiltre security audit script",
+
+  "severity": "medium",
+  "ci": false,
+  "quiet": false,
+
+  "tools": {
+    "trivy": {
+      "enabled": true,
+      "timeout": 300,
+      "config": {
+        "skipFiles": [
+          "test/**",
+          "**/*.test.ts",
+          "**/*.spec.ts"
+        ],
+        "skipDirectories": [
+          "node_modules",
+          ".git",
+          "dist",
+          "build"
+        ]
+      }
+    },
+    "semgrep": {
+      "enabled": true,
+      "timeout": 300,
+      "config": "p/security-audit",
+      "skipRules": []
+    }
+  },
+
+  "allowlist": {
+    "vulnerabilities": [
+      {
+        "id": "EXAMPLE-CVE-2023-1234",
+        "reason": "False positive - not using vulnerable functionality",
+        "expires": "2024-12-31"
+      }
+    ],
+    "semgrepRules": [
+      {
+        "ruleId": "example.rule.id",
+        "reason": "Accepted risk - documented exception",
+        "expires": "2024-12-31"
+      }
+    ]
+  },
+
+  "reporting": {
+    "formats": ["console"],
+    "includeFixAdvice": true,
+    "maxIssuesPerTool": 10,
+    "showPassedChecks": false
+  },
+
+  "thresholds": {
+    "maxCritical": 0,
+    "maxHigh": 5,
+    "maxMedium": 20,
+    "maxLow": 50
+  },
+
+  "notifications": {
+    "onNewVulnerabilities": false,
+    "onHighSeverity": true
+  }
+}

@@ -18,7 +18,7 @@ archifiltre.exe
 *.d.ts
 !*.config.js
 !*.config.mjs
-!scripts/*.mjs
+
 
 # === Test Coverage ===
 coverage/
@@ -71,3 +71,6 @@ Thumbs.db
 test-output/
 *.analysis.json
 *.scan.json
+
+# === Security Reports ===
+security-reports/

@@ -9,17 +9,21 @@
   "scripts": {
     "dev": "bun run bin/dev.js",
     "build:cli": "bun build src/cli/bundle-entry.ts --compile --outfile archifiltre",
-    "smoke:cli": "bun run scripts/smoke-test.mjs",
+    "smoke:cli": "bun run scripts/smoke-test.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run test/integration",
-    "lint": "eslint src test --ext .ts && eslint bin --ext .js && eslint scripts --ext .mjs && eslint .github --ext .yml,.yaml",
-    "lint:fix": "eslint src test --ext .ts --fix && eslint bin --ext .js --fix && eslint scripts --ext .mjs --fix && eslint .github --ext .yml,.yaml --fix",
+    "lint": "eslint src test scripts --ext .ts && eslint bin --ext .js && eslint .github --ext .yml,.yaml",
+    "lint:fix": "eslint src test scripts --ext .ts --fix && eslint bin --ext .js --fix && eslint .github --ext .yml,.yaml --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "release:pack": "bun run scripts/release-pack.mjs",
-    "typecheck": "tsc --noEmit"
+    "release:pack": "bun run scripts/release-pack.ts",
+    "typecheck": "tsc --noEmit",
+    "security:audit": "bun run scripts/security-audit.ts",
+    "security:audit:ci": "bun run scripts/security-audit.ts --ci --severity high",
+    "security:audit:json": "bun run scripts/security-audit.ts --json --output security-report.json",
+    "security:audit:quick": "bun run scripts/security-audit.ts --skip-semgrep --quiet"
   },
   "keywords": [
     "file-tree",
@@ -36,6 +40,7 @@
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
+    "@types/tar-stream": "^3.1.4",
     "@typescript-eslint/eslint-plugin": "^8.46.2",
     "@typescript-eslint/parser": "^8.46.2",
     "eslint": "^8.54.0",

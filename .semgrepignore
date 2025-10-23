@@ -1,0 +1,80 @@
+# Dependencies
+node_modules/
+*.lock
+*.lockb
+
+# Build outputs
+dist/
+build/
+lib/
+*.tsbuildinfo
+
+# Compiled binaries
+archifiltre
+archifiltre.exe
+
+# Test files (focus on source code security)
+**/*.test.ts
+**/*.test.js
+**/*.spec.ts
+**/*.spec.js
+test/
+tests/
+__tests__/
+
+# Configuration files
+*.config.js
+*.config.mjs
+*.config.ts
+tsconfig.json
+.eslintrc.*
+.prettierrc*
+vitest.config.ts
+
+# Documentation
+*.md
+docs/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+logs/
+tmp/
+temp/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Security reports (don't scan our own reports)
+security-reports/
+
+# Git directory
+.git/
+
+# Minified files
+*.min.js
+*.min.css
+
+# Source maps
+*.map
+
+# Package manager files
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Environment files
+.env*
+
+# Cache directories
+.cache/
+.nyc_output/
+coverage/

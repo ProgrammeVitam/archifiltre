@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 /**
  * Release Packaging Script for Archifiltre
  *
@@ -26,10 +26,41 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const projectRoot = dirname(__dirname);
 
+interface BuildInfo {
+  version: string;
+  gitSha: string;
+  buildDate: string;
+  os: string;
+  arch: string;
+}
+
+interface FileInfo {
+  name: string;
+  size: number;
+  sha256: string;
+  mode: number;
+}
+
+interface CommandResult {
+  stdout: string;
+  stderr: string;
+}
+
+interface ManifestData {
+  version: string;
+  generated: string;
+  files: FileInfo[];
+}
+
+interface ReleaseFiles {
+  releaseDir: string;
+  files: string[];
+}
+
 /**
  * ANSI color codes
  */
-const colors = {
+const colors: Record<string, string> = {
   reset: '\x1b[0m',
   red: '\x1b[31m',
   green: '\x1b[32m',
@@ -42,7 +73,7 @@ const colors = {
 /**
  * Formats colored output
  */
-function colorize(text, color) {
+function colorize(text: string, color: string): string {
   if (process.env.NO_COLOR === '1' || process.env.CI === 'true') {
     return text;
   }
@@ -52,15 +83,21 @@ function colorize(text, color) {
 /**
  * Logs a message with timestamp
  */
-function log(message, color = 'reset') {
+function log(message: string, color: string = 'reset'): void {
   const timestamp = new Date().toISOString();
   console.log(`${colorize(`[${timestamp}]`, 'gray')} ${colorize(message, color)}`);
 }
 
 /**
- * Runs a shell command and returns the result
+ * Runs bun command with specified args
+ * Uses hardcoded 'bun' command to prevent command injection
  */
-function runCommand(command, args = [], options = {}) {
+function runBunCommand(
+  args: string[] = [],
+  options: Record<string, unknown> = {}
+): Promise<CommandResult> {
+  const command = 'bun'; // Hardcoded to prevent command injection
+
   return new Promise((resolve, reject) => {
     log(`Running: ${command} ${args.join(' ')}`, 'blue');
 
@@ -96,7 +133,7 @@ function runCommand(command, args = [], options = {}) {
 /**
  * Gets build information from environment or package.json
  */
-async function getBuildInfo() {
+async function getBuildInfo(): Promise<BuildInfo> {
   try {
     const packageJsonPath = join(projectRoot, 'package.json');
     const packageJson = JSON.parse(await readFile(packageJsonPath, 'utf-8'));
@@ -109,7 +146,10 @@ async function getBuildInfo() {
       arch: getArchName(),
     };
   } catch (error) {
-    log(`Warning: Could not read package.json: ${error.message}`, 'yellow');
+    log(
+      `Warning: Could not read package.json: ${error instanceof Error ? error.message : String(error)}`,
+      'yellow'
+    );
     return {
       version: '5.0.0-dev',
       gitSha: 'unknown',
@@ -123,7 +163,7 @@ async function getBuildInfo() {
 /**
  * Gets normalized OS name
  */
-function getOsName() {
+function getOsName(): string {
   const platform = process.env.TARGET_OS || process.platform;
   switch (platform) {
     case 'darwin':
@@ -140,7 +180,7 @@ function getOsName() {
 /**
  * Gets normalized architecture name
  */
-function getArchName() {
+function getArchName(): string {
   const arch = process.env.TARGET_ARCH || process.arch;
   switch (arch) {
     case 'x64':
@@ -157,7 +197,7 @@ function getArchName() {
 /**
  * Calculates SHA256 hash of a file
  */
-async function calculateFileHash(filePath) {
+async function calculateFileHash(filePath: string): Promise<string> {
   const hash = createHash('sha256');
   const stream = createReadStream(filePath);
 
@@ -171,7 +211,7 @@ async function calculateFileHash(filePath) {
 /**
  * Gets file stats including size
  */
-async function getFileInfo(filePath) {
+async function getFileInfo(filePath: string): Promise<FileInfo> {
   const stats = await stat(filePath);
   const hash = await calculateFileHash(filePath);
 
@@ -186,7 +226,7 @@ async function getFileInfo(filePath) {
 /**
  * Builds the CLI binary
  */
-async function buildBinary(buildInfo) {
+async function buildBinary(buildInfo: BuildInfo): Promise<string> {
   log('Building CLI binary...', 'bold');
 
   const binaryName = buildInfo.os === 'win32' ? 'archifiltre.exe' : 'archifiltre';
@@ -201,11 +241,9 @@ async function buildBinary(buildInfo) {
   };
 
   try {
-    await runCommand(
-      'bun',
-      ['build', 'src/cli/archifiltre.ts', '--compile', '--outfile', binaryName],
-      { env }
-    );
+    await runBunCommand(['build', 'src/cli/archifiltre.ts', '--compile', '--outfile', binaryName], {
+      env,
+    });
 
     // Ensure binary is executable on Unix-like systems
     if (buildInfo.os !== 'win32') {
@@ -215,7 +253,10 @@ async function buildBinary(buildInfo) {
     log(`✓ Binary built successfully: ${binaryName}`, 'green');
     return binaryPath;
   } catch (error) {
-    log(`✗ Failed to build binary: ${error.message}`, 'red');
+    log(
+      `✗ Failed to build binary: ${error instanceof Error ? error.message : String(error)}`,
+      'red'
+    );
     throw error;
   }
 }
@@ -223,7 +264,7 @@ async function buildBinary(buildInfo) {
 /**
  * Creates README.quickstart.md
  */
-async function createQuickStartReadme(buildInfo) {
+async function createQuickStartReadme(buildInfo: BuildInfo): Promise<string> {
   const quickStartPath = join(projectRoot, 'README.quickstart.md');
   const binaryName = buildInfo.os === 'win32' ? 'archifiltre.exe' : 'archifiltre';
 
@@ -284,7 +325,10 @@ Build Information:
 /**
  * Prepares release directory with all files
  */
-async function prepareReleaseFiles(buildInfo, binaryPath) {
+async function prepareReleaseFiles(
+  buildInfo: BuildInfo,
+  binaryPath: string
+): Promise<ReleaseFiles> {
   const releaseDir = join(projectRoot, 'release-temp');
 
   // Clean up any existing release directory
@@ -331,10 +375,10 @@ async function prepareReleaseFiles(buildInfo, binaryPath) {
 /**
  * Creates manifest.json with file metadata
  */
-async function createManifest(files, _outputPath) {
+async function createManifest(files: string[], _outputPath: string): Promise<string> {
   log('Creating manifest...', 'blue');
 
-  const manifestData = {
+  const manifestData: ManifestData = {
     version: '1.0',
     generated: new Date().toISOString(),
     files: [],
@@ -355,10 +399,10 @@ async function createManifest(files, _outputPath) {
 /**
  * Creates SHA256 checksum file
  */
-async function createChecksums(files, outputDir) {
+async function createChecksums(files: string[], outputDir: string): Promise<string> {
   log('Creating checksums...', 'blue');
 
-  const checksums = [];
+  const checksums: string[] = [];
 
   for (const filePath of files) {
     const hash = await calculateFileHash(filePath);
@@ -376,7 +420,7 @@ async function createChecksums(files, outputDir) {
 /**
  * Creates tar.gz archive
  */
-async function createArchive(releaseDir, outputPath) {
+async function createArchive(releaseDir: string, outputPath: string): Promise<string> {
   log(`Creating archive: ${basename(outputPath)}...`, 'blue');
 
   const files = await readdir(releaseDir);
@@ -414,7 +458,7 @@ async function createArchive(releaseDir, outputPath) {
 /**
  * Main release packaging function
  */
-async function createRelease() {
+async function createRelease(): Promise<void> {
   log('Starting Archifiltre Release Packaging', 'bold');
   log('======================================', 'bold');
 
@@ -470,7 +514,10 @@ async function createRelease() {
     log(`Manifest: ${distManifestPath}`, 'green');
     log(`Archive SHA256: ${archiveHash}`, 'gray');
   } catch (error) {
-    log(`✗ Release packaging failed: ${error.message}`, 'red');
+    log(
+      `✗ Release packaging failed: ${error instanceof Error ? error.message : String(error)}`,
+      'red'
+    );
     process.exit(1);
   }
 }

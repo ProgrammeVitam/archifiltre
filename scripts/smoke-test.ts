@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 /**
  * Smoke Test Script for Archifiltre CLI
  *
@@ -20,10 +20,22 @@ const __dirname = dirname(__filename);
 const projectRoot = dirname(__dirname);
 const binaryPath = join(projectRoot, 'archifiltre');
 
+interface CommandResult {
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+  duration: number;
+}
+
+interface TestCase {
+  name: string;
+  fn: () => Promise<boolean>;
+}
+
 /**
  * ANSI color codes for output formatting
  */
-const colors = {
+const colors: Record<string, string> = {
   reset: '\x1b[0m',
   red: '\x1b[31m',
   green: '\x1b[32m',
@@ -36,7 +48,7 @@ const colors = {
 /**
  * Formats colored output
  */
-function colorize(text, color) {
+function colorize(text: string, color: string): string {
   if (process.env.NO_COLOR === '1' || process.env.CI === 'true') {
     return text;
   }
@@ -46,15 +58,21 @@ function colorize(text, color) {
 /**
  * Logs a message with timestamp and color
  */
-function log(message, color = 'reset') {
+function log(message: string, color: string = 'reset'): void {
   const timestamp = new Date().toISOString();
   console.log(`${colorize(`[${timestamp}]`, 'gray')} ${colorize(message, color)}`);
 }
 
 /**
- * Runs a command and returns the result
+ * Runs the archifiltre binary with specified args
+ * Uses hardcoded binary path to prevent command injection
  */
-function runCommand(command, args = [], options = {}) {
+function runArchifiltreCommand(
+  args: string[] = [],
+  options: Record<string, unknown> = {}
+): Promise<CommandResult> {
+  const command = binaryPath; // Hardcoded to prevent command injection
+
   return new Promise((resolve, reject) => {
     const startTime = Date.now();
     const child = spawn(command, args, {
@@ -100,7 +118,7 @@ function runCommand(command, args = [], options = {}) {
 /**
  * Checks if the binary exists and is executable
  */
-async function checkBinaryExists() {
+async function checkBinaryExists(): Promise<boolean> {
   log('Checking binary existence...', 'blue');
 
   try {
@@ -109,7 +127,7 @@ async function checkBinaryExists() {
     return true;
   } catch (error) {
     log(`✗ Binary not found or not executable: ${binaryPath}`, 'red');
-    log(`Error: ${error.message}`, 'red');
+    log(`Error: ${error instanceof Error ? error.message : String(error)}`, 'red');
     return false;
   }
 }
@@ -117,11 +135,11 @@ async function checkBinaryExists() {
 /**
  * Tests the --version flag
  */
-async function testVersionFlag() {
+async function testVersionFlag(): Promise<boolean> {
   log('Testing --version flag...', 'blue');
 
   try {
-    const result = await runCommand(binaryPath, ['--version']);
+    const result = await runArchifiltreCommand(['--version']);
 
     if (result.exitCode !== 0) {
       log(`✗ --version exited with code ${result.exitCode}`, 'red');
@@ -144,7 +162,7 @@ async function testVersionFlag() {
     log(`✓ --version format is correct: ${result.stdout}`, 'green');
     return true;
   } catch (error) {
-    log(`✗ --version failed: ${error.message}`, 'red');
+    log(`✗ --version failed: ${error instanceof Error ? error.message : String(error)}`, 'red');
     return false;
   }
 }
@@ -152,11 +170,11 @@ async function testVersionFlag() {
 /**
  * Tests the --help flag
  */
-async function testHelpFlag() {
+async function testHelpFlag(): Promise<boolean> {
   log('Testing --help flag...', 'blue');
 
   try {
-    const result = await runCommand(binaryPath, ['--help']);
+    const result = await runArchifiltreCommand(['--help']);
 
     if (result.exitCode !== 0) {
       log(`✗ --help exited with code ${result.exitCode}`, 'red');
@@ -183,7 +201,7 @@ async function testHelpFlag() {
 
     // Check for basic content presence (Oclif format doesn't show flags in main help)
     const requiredContent = ['privacy-friendly', 'offline'];
-    const missingFlags = [];
+    const missingFlags: string[] = [];
 
     for (const content of requiredContent) {
       if (!helpOutput.includes(content)) {
@@ -199,7 +217,7 @@ async function testHelpFlag() {
     log(`✓ --help contains all required sections and flags`, 'green');
     return true;
   } catch (error) {
-    log(`✗ --help failed: ${error.message}`, 'red');
+    log(`✗ --help failed: ${error instanceof Error ? error.message : String(error)}`, 'red');
     return false;
   }
 }
@@ -207,11 +225,11 @@ async function testHelpFlag() {
 /**
  * Tests the health command
  */
-async function testHealthCommand() {
+async function testHealthCommand(): Promise<boolean> {
   log('Testing health command...', 'blue');
 
   try {
-    const result = await runCommand(binaryPath, ['health']);
+    const result = await runArchifiltreCommand(['health']);
 
     // Health command can exit with 0 (healthy) or 1 (issues detected)
     if (result.exitCode !== 0 && result.exitCode !== 1) {
@@ -236,7 +254,10 @@ async function testHealthCommand() {
     log(`✓ Health command works correctly (exit code: ${result.exitCode})`, 'green');
     return true;
   } catch (error) {
-    log(`✗ Health command failed: ${error.message}`, 'red');
+    log(
+      `✗ Health command failed: ${error instanceof Error ? error.message : String(error)}`,
+      'red'
+    );
     return false;
   }
 }
@@ -244,11 +265,11 @@ async function testHealthCommand() {
 /**
  * Tests invalid command handling
  */
-async function testInvalidCommand() {
+async function testInvalidCommand(): Promise<boolean> {
   log('Testing invalid command handling...', 'blue');
 
   try {
-    const result = await runCommand(binaryPath, ['nonexistent-command']);
+    const result = await runArchifiltreCommand(['nonexistent-command']);
 
     if (result.exitCode !== 2) {
       log(`✗ Invalid command should exit with code 2, got ${result.exitCode}`, 'red');
@@ -263,7 +284,10 @@ async function testInvalidCommand() {
     log(`✓ Invalid command handling works correctly`, 'green');
     return true;
   } catch (error) {
-    log(`✗ Invalid command test failed: ${error.message}`, 'red');
+    log(
+      `✗ Invalid command test failed: ${error instanceof Error ? error.message : String(error)}`,
+      'red'
+    );
     return false;
   }
 }
@@ -271,13 +295,13 @@ async function testInvalidCommand() {
 /**
  * Basic network isolation check
  */
-async function testNetworkIsolation() {
+async function testNetworkIsolation(): Promise<boolean> {
   log('Testing network isolation...', 'blue');
 
   try {
     // Run health command and check if it completes quickly (no network delays)
     const startTime = Date.now();
-    const result = await runCommand(binaryPath, ['health']);
+    const result = await runArchifiltreCommand(['health']);
     const duration = Date.now() - startTime;
 
     // Health check should complete quickly (under 5 seconds) if no network activity
@@ -295,7 +319,10 @@ async function testNetworkIsolation() {
     log(`✓ No obvious network activity detected (completed in ${duration}ms)`, 'green');
     return true;
   } catch (error) {
-    log(`✗ Network isolation test failed: ${error.message}`, 'red');
+    log(
+      `✗ Network isolation test failed: ${error instanceof Error ? error.message : String(error)}`,
+      'red'
+    );
     return false;
   }
 }
@@ -303,11 +330,11 @@ async function testNetworkIsolation() {
 /**
  * Main smoke test runner
  */
-async function runSmokeTests() {
+async function runSmokeTests(): Promise<void> {
   log('Starting Archifiltre CLI Smoke Tests', 'bold');
   log('=====================================', 'bold');
 
-  const tests = [
+  const tests: TestCase[] = [
     { name: 'Binary Existence', fn: checkBinaryExists },
     { name: 'Version Flag', fn: testVersionFlag },
     { name: 'Help Flag', fn: testHelpFlag },
@@ -328,7 +355,10 @@ async function runSmokeTests() {
         failed++;
       }
     } catch (error) {
-      log(`✗ Test "${test.name}" threw an error: ${error.message}`, 'red');
+      log(
+        `✗ Test "${test.name}" threw an error: ${error instanceof Error ? error.message : String(error)}`,
+        'red'
+      );
       failed++;
     }
 
