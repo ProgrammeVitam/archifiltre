@@ -75,6 +75,38 @@ import {
   wrapUnknownError,
 } from './errors.js';
 
+// === Logging Infrastructure ===
+export {
+  // Core logging types and interfaces
+  type ILogger,
+  type LogLevel,
+  type LogFormat,
+  type LogContext,
+  type LoggingConfig,
+  type PrivacyConfig,
+
+  // Logger instances and factories
+  logger,
+  createLogger,
+  createPrivacyFirstLogger,
+  createCLILogger,
+  createTelemetryLogger,
+
+  // Provider management
+  type LogProvider,
+  ConsoleLogProvider,
+  SentryLogProvider,
+
+  // Sanitization utilities (TODO: Re-enable once implemented)
+  // sanitizeForCLI,
+  // sanitizeForExternal,
+  // containsSensitiveData,
+
+  // System management
+  initializeLogging,
+  shutdownLogging,
+} from '@infra/logging';
+
 // === API Contract ===
 /**
  * Core API functions that CLI commands should use

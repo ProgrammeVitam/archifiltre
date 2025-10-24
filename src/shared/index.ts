@@ -108,5 +108,6 @@ export async function retry<T>(
 // - Path manipulation helpers
 // - Date/time utilities
 // - Validation helpers
-// - Logging utilities
 // - Performance measurement helpers
+
+// Note: For logging utilities, use the infrastructure layer (@infra/logging)

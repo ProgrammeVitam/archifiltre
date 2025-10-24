@@ -54,7 +54,7 @@ This document outlines the development roadmap for Archifiltre v5, a privacy-fri
   - Memory-efficient streaming
 
 - **Database Layer**
-  - SQLite integration for inventory storage
+  - PGlite integration for inventory storage
   - Schema design for file metadata
   - Indexing for fast queries
   - Transaction safety for crash recovery
@@ -78,7 +78,7 @@ archifiltre info <inventory-id>           # Show inventory details
 **Technical Milestones**:
 
 - [ ] File system traversal with metadata collection
-- [ ] SQLite database integration
+- [ ] PGlite database integration
 - [ ] Progress reporting system
 - [ ] Pause/resume functionality
 - [ ] Comprehensive error recovery
@@ -109,15 +109,6 @@ archifiltre info <inventory-id>           # Show inventory details
   - Incremental hash updates
   - Hash verification and repair
   - Space usage analytics
-
-**CLI Commands Added**:
-
-```bash
-archifiltre hash <inventory-id>           # Compute content hashes
-archifiltre duplicates <inventory-id>     # Find duplicate files
-archifiltre similar <inventory-id>        # Find similar files
-archifiltre verify <inventory-id>         # Verify hash integrity
-```
 
 **Technical Milestones**:
 
@@ -283,7 +274,7 @@ CLI ─── Internal API ─── Error System
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
 │   Core Engine   │    │  Infrastructure │    │   Data Layer    │
 │                 │    │                 │    │                 │
-│ • File Scanner  │    │ • Logging       │    │ • SQLite DB     │
+│ • File Scanner  │    │ • Logging       │    │ • PGlite DB     │
 │ • Hash Computer │    │ • Progress      │    │ • File Storage  │
 │ • Analyzer      │    │ • Config Mgmt   │    │ • Cache Layer   │
 │ • Comparator    │    │ • Error Recovery│    │ • Backup/Restore│
