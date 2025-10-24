@@ -131,7 +131,12 @@ export function formatVersionString(versionInfo: VersionInfo): string {
   // Ensure version starts with 'v'
   const version = appVersion.startsWith('v') ? appVersion : `v${appVersion}`;
 
-  return `${version} (sha ${gitSha}, ${buildDateUtc}, os=${os}, arch=${arch})`;
+  return `${version} (sha ${gitSha}, ${buildDateUtc}, os=${os}, arch=${arch})
+
+© République française – Ministère de la Culture (SNUM) / CIAF / DINUM
+Programme interministériel VITAM
+Contact: archifiltre@programmevitam.fr
+Website: https://archifiltre.fabrique.social.gouv.fr`;
 }
 
 /**

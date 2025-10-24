@@ -1,0 +1,71 @@
+# SPDX 3.0 Generator Container
+# Official Python SPDX tools with System Package Data Exchange 3.0 support
+FROM python:3.13-slim
+
+LABEL maintainer="République française – Ministère de la Culture (SNUM) / CIAF / DINUM"
+LABEL description="SPDX 3.0 SBOM Generator for Archifiltre with official Python spdx-tools"
+LABEL version="1.0.0"
+LABEL org.opencontainers.image.title="Archifiltre SPDX 3.0 Generator"
+LABEL org.opencontainers.image.description="Container for generating SPDX 3.0 SBOMs with security vulnerability integration"
+LABEL org.opencontainers.image.vendor="Programme interministériel VITAM"
+LABEL org.opencontainers.image.license="CeCILL-2.1"
+LABEL org.opencontainers.image.source="https://github.com/ProgrammeVitam/archifiltre"
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
+
+# Create non-root user for security
+RUN groupadd -r spdx && useradd -r -g spdx -d /app -s /bin/bash spdx
+
+# Set working directory
+WORKDIR /app
+
+# Install Python dependencies
+# Pin versions for reproducibility and security
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# Install SPDX tools with all optional dependencies
+RUN pip install --no-cache-dir \
+    spdx-tools==0.8.3 \
+    PyYAML==6.0.3 \
+    semantic-version==2.10.0 \
+    python-dateutil==2.9.0.post0
+
+# Copy the generator script
+COPY generate-spdx3.py /app/
+RUN chmod +x /app/generate-spdx3.py
+
+# Create directories for input/output with proper permissions
+RUN mkdir -p /workspace /output /security-reports && \
+    chown -R spdx:spdx /app /workspace /output /security-reports
+
+# Note: Running as root for proper volume write permissions
+# USER spdx
+
+# Set environment variables
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+ENV SPDX_GENERATOR_VERSION=1.0.0
+
+# Default command
+ENTRYPOINT ["python", "/app/generate-spdx3.py"]
+CMD ["--help"]
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import spdx_tools.spdx3.model; print('SPDX 3.0 ready')" || exit 1
+
+# Volume declarations for documentation
+VOLUME ["/workspace", "/output", "/security-reports"]
+
+# Expose default ports (none needed for this tool)
+# EXPOSE none
+
+# Runtime metadata
+ENV BUILD_DATE=""
+ENV VCS_REF=""
+ENV VERSION="1.0.0"

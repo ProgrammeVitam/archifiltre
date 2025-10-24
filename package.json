@@ -23,7 +23,11 @@
     "security:audit": "bun run scripts/security-audit.ts",
     "security:audit:ci": "bun run scripts/security-audit.ts --ci --severity high",
     "security:audit:json": "bun run scripts/security-audit.ts --json --output security-report.json",
-    "security:audit:quick": "bun run scripts/security-audit.ts --skip-semgrep --quiet"
+    "security:audit:quick": "bun run scripts/security-audit.ts --skip-semgrep --quiet",
+    "sbom": "bun run scripts/generate-spdx3-sbom.ts --output-dir dist/sbom",
+    "sbom:compliance": "bun run scripts/generate-spdx3-sbom.ts --output-dir dist/compliance-sbom --verbose",
+    "sbom:security": "bun run scripts/generate-spdx3-sbom.ts --output-dir dist/security-sbom --verbose",
+    "sbom:dev": "bun run scripts/generate-spdx3-sbom.ts --output-dir dist/dev-sbom --verbose --force-rebuild"
   },
   "keywords": [
     "file-tree",
@@ -31,15 +35,27 @@
     "duplicates",
     "offline",
     "privacy",
-    "desktop"
+    "desktop",
+    "government",
+    "vitam",
+    "france",
+    "ministry-of-culture",
+    "compliance",
+    "sbom"
   ],
-  "author": "Archifiltre Team",
-  "license": "MIT",
+  "author": {
+    "name": "République française – Ministère de la Culture (SNUM) / CIAF / DINUM",
+    "email": "archifiltre@programmevitam.fr",
+    "url": "https://archifiltre.fabrique.social.gouv.fr"
+  },
+  "license": "CECILL-2.1",
+  "homepage": "https://archifiltre.fabrique.social.gouv.fr",
   "engines": {
     "bun": ">=1.0.0"
   },
   "devDependencies": {
-    "@types/node": "^20.10.0",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^24.9.1",
     "@types/tar-stream": "^3.1.4",
     "@typescript-eslint/eslint-plugin": "^8.46.2",
     "@typescript-eslint/parser": "^8.46.2",
@@ -55,6 +71,8 @@
   "dependencies": {
     "@oclif/core": "^4.0.0",
     "@sentry/node": "^10.22.0",
+    "ajv": "^8.17.1",
+    "js-yaml": "^4.1.0",
     "posthog-node": "^5.10.3"
   },
   "oclif": {
@@ -80,7 +98,11 @@
     "url": "git+https://github.com/ProgrammeVitam/archifiltre.git"
   },
   "bugs": {
-    "url": "https://github.com/ProgrammeVitam/archifiltre/issues"
+    "url": "https://github.com/ProgrammeVitam/archifiltre/issues",
+    "email": "archifiltre@programmevitam.fr"
   },
-  "homepage": "https://github.com/ProgrammeVitam/archifiltre#readme"
+  "funding": {
+    "type": "government",
+    "url": "https://www.programmevitam.fr/"
+  }
 }

@@ -13,6 +13,13 @@ const INLINE_PACKAGE_CONFIG = {
   name: 'archifiltre',
   version: '5.0.0-dev',
   description: 'Privacy-friendly, 100% offline desktop tool for inventorying large file trees',
+  author: {
+    name: 'République française – Ministère de la Culture (SNUM) / CIAF / DINUM',
+    email: 'archifiltre@programmevitam.fr',
+    url: 'https://archifiltre.fabrique.social.gouv.fr',
+  },
+  license: 'CECILL-2.1',
+  homepage: 'https://archifiltre.fabrique.social.gouv.fr',
   bin: {
     archifiltre: './bin/run.js',
   },
