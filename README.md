@@ -19,6 +19,7 @@ Archifiltre v5 is a complete rebuild focused on **speed, reliability, and modula
 ### Prerequisites
 
 - [Bun](https://bun.sh/) >= 1.0.0
+- [Podman](https://podman.io/) (for security scanning in development)
 
 ### Installation
 
@@ -69,6 +70,10 @@ src/
 ├── core/                   # Business logic (future)
 ├── infra/                  # Infrastructure adapters (future)
 └── shared/                 # Cross-cutting utilities
+scripts/                    # Development & build tools (TypeScript)
+├── security-audit.ts       # Container-based security scanning
+├── release-pack.ts         # Release packaging automation
+└── smoke-test.ts           # Binary testing & validation
 ```
 
 ### Scripts
@@ -83,6 +88,11 @@ bun run test:watch          # Run tests in watch mode
 bun run lint                # Lint code
 bun run format              # Format code
 bun run typecheck           # Type checking
+
+# Security
+bun run security:audit      # Run comprehensive security scan
+bun run security:audit:ci   # CI security scan (fails on high+ severity)
+bun run security:audit:json # Generate JSON security report
 
 # Build & Release
 bun run build:cli           # Compile binary
@@ -102,6 +112,30 @@ bun run test:integration
 # All tests with coverage
 bun run test -- --coverage
 ```
+
+### Security & Development Tools
+
+The project includes **container-based security tooling** for comprehensive vulnerability scanning:
+
+```bash
+# Full security audit (dependencies + code)
+bun run security:audit
+
+# Check container image status
+bun run security:audit --check-only
+
+# Force update security scanner images
+bun run security:audit --update-images
+
+# Run in CI mode (strict thresholds)
+bun run security:audit:ci
+```
+
+**Features:**
+- **Trivy**: Dependency vulnerability scanning with CVE database
+- **Semgrep**: Static application security testing (SAST) for code patterns
+- **Container-based**: Uses Podman for isolated, up-to-date security tools
+- **Smart caching**: Only downloads image updates when needed
 
 ## Architecture
 
@@ -140,11 +174,28 @@ All commands support these standard flags:
 
 ### Development Guidelines
 
-- **TypeScript** with strict mode enabled
+- **TypeScript everywhere** with strict mode enabled
 - **ESLint + Prettier** for consistent formatting
 - **Vitest** for testing with good coverage
-- **No runtime network dependencies**
+- **Container-based security** with Trivy + Semgrep
+- **No runtime network dependencies** (containers only in development)
 - **Path aliases** (`@api/*`, `@cli/*`, etc.)
+
+### Development Environment Setup
+
+```bash
+# 1. Install dependencies
+bun install
+
+# 2. Verify security tools (requires Podman)
+bun run security:audit --check-only
+
+# 3. Run full quality checks
+bun run typecheck && bun run lint && bun run security:audit
+
+# 4. Build and test
+bun run build:cli && bun run smoke:cli
+```
 
 ### Commit Guidelines
 

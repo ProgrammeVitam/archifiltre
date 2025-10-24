@@ -34,6 +34,11 @@ interface Config {
   containerTimeout: number;
   semgrepConfig: string;
   allowlist: string[];
+  updateImages: boolean;
+  offline: boolean;
+  assumeYes: boolean;
+  showDigests: boolean;
+  checkOnly: boolean;
 }
 
 // Trivy JSON Output Interfaces
@@ -132,6 +137,31 @@ interface SemgrepPaths {
   skipped?: unknown[];
 }
 
+// Container Image Management Interfaces
+interface ContainerImage {
+  name: string;
+  registry: string;
+  tag: string;
+  fullName: string;
+  estimatedSize: string;
+}
+
+interface ImageStatus {
+  image: ContainerImage;
+  isAvailable: boolean;
+  hasUpdate: boolean;
+  localDigest?: string;
+  remoteDigest?: string;
+  needsDownload: boolean;
+}
+
+interface ImageCheckResult {
+  trivy: ImageStatus;
+  semgrep: ImageStatus;
+  hasUpdates: boolean;
+  needsSetup: boolean;
+}
+
 interface ToolStatus {
   success: boolean;
   issues: number;
@@ -189,10 +219,27 @@ class SecurityAuditor {
   private config: Config;
   private results: Results;
   private reportsDir: string;
+  private images: { trivy: ContainerImage; semgrep: ContainerImage };
 
   constructor() {
     this.config = this.parseArgs();
     this.reportsDir = join(process.cwd(), 'security-reports');
+    this.images = {
+      trivy: {
+        name: 'trivy',
+        registry: 'docker.io',
+        tag: 'latest',
+        fullName: 'docker.io/aquasec/trivy:latest',
+        estimatedSize: '45MB',
+      },
+      semgrep: {
+        name: 'semgrep',
+        registry: 'docker.io',
+        tag: 'latest',
+        fullName: 'docker.io/returntocorp/semgrep:latest',
+        estimatedSize: '85MB',
+      },
+    };
     this.results = {
       summary: {
         totalIssues: 0,
@@ -224,6 +271,11 @@ class SecurityAuditor {
       containerTimeout: 600, // 10 minutes for container operations
       semgrepConfig: 'p/security-audit',
       allowlist: [],
+      updateImages: false,
+      offline: false,
+      assumeYes: false,
+      showDigests: false,
+      checkOnly: false,
     };
 
     for (let i = 0; i < args.length; i++) {
@@ -249,6 +301,22 @@ class SecurityAuditor {
         case '--severity':
           config.severity = args[++i];
           break;
+        case '--update-images':
+          config.updateImages = true;
+          break;
+        case '--offline':
+          config.offline = true;
+          break;
+        case '--assume-yes':
+        case '--yes':
+          config.assumeYes = true;
+          break;
+        case '--show-digests':
+          config.showDigests = true;
+          break;
+        case '--check-only':
+          config.checkOnly = true;
+          break;
         case '--help':
           this.showHelp();
           process.exit(0);
@@ -271,6 +339,11 @@ Options:
   --skip-trivy         Skip dependency vulnerability scan
   --skip-semgrep       Skip static security analysis
   --severity <level>   Minimum severity to fail on (low|medium|high|critical)
+  --update-images      Force check and update all container images
+  --offline            Use cached images only, no network calls
+  --assume-yes, --yes  Auto-accept all downloads and updates
+  --show-digests       Display image digest hashes
+  --check-only         Show image status without downloading
   --help               Show this help
 
 Requirements:
@@ -279,7 +352,8 @@ Requirements:
 Examples:
   bun run scripts/security-audit.ts
   bun run scripts/security-audit.ts --ci --severity high
-  bun run scripts/security-audit.ts --json --output security-report.json`);
+  bun run scripts/security-audit.ts --json --output security-report.json
+  bun run scripts/security-audit.ts --update-images --assume-yes`);
   }
 
   public async run(): Promise<void> {
@@ -287,6 +361,12 @@ Examples:
       // Check prerequisites
       this.checkPodman();
       this.setupReportsDirectory();
+
+      // Check and manage container images
+      if (!this.config.quiet) {
+        console.log('Security Audit Starting...');
+      }
+      await this.manageContainerImages();
 
       // Run container scans in parallel
       const promises: Promise<void>[] = [];
@@ -336,22 +416,274 @@ Examples:
     }
   }
 
-  private async runTrivyContainer(): Promise<void> {
+  private async manageContainerImages(): Promise<void> {
     if (!this.config.quiet) {
-      process.stdout.write('Pulling Trivy container... ');
+      console.log('Checking container images...');
+    }
+
+    const imageStatus = await this.checkImageStatus();
+
+    // Display status
+    this.displayImageStatus(imageStatus);
+
+    // Handle check-only mode
+    if (this.config.checkOnly) {
+      if (!this.config.quiet) {
+        console.log('\nImage status check complete.');
+      }
+      process.exit(0);
+    }
+
+    // Handle updates if needed
+    if (imageStatus.hasUpdates && !this.config.quiet) {
+      const shouldUpdate = await this.promptForUpdates(imageStatus);
+      if (shouldUpdate) {
+        await this.updateImages(imageStatus);
+      }
+    } else if (imageStatus.needsSetup) {
+      const shouldSetup = await this.promptForInitialSetup(imageStatus);
+      if (shouldSetup) {
+        await this.downloadImages(imageStatus);
+      } else if (!this.config.offline) {
+        throw new Error('Container images are required for security scanning');
+      }
+    }
+
+    if (!this.config.quiet) {
+      console.log('');
+    }
+  }
+
+  private async checkImageStatus(): Promise<ImageCheckResult> {
+    const [trivyStatus, semgrepStatus] = await Promise.all([
+      this.checkSingleImageStatus(this.images.trivy),
+      this.checkSingleImageStatus(this.images.semgrep),
+    ]);
+
+    return {
+      trivy: trivyStatus,
+      semgrep: semgrepStatus,
+      hasUpdates: trivyStatus.hasUpdate || semgrepStatus.hasUpdate,
+      needsSetup: !trivyStatus.isAvailable || !semgrepStatus.isAvailable,
+    };
+  }
+
+  private async checkSingleImageStatus(image: ContainerImage): Promise<ImageStatus> {
+    try {
+      // Check if image exists locally
+      const localDigest = await this.getLocalImageDigest(image.fullName);
+      const isAvailable = !!localDigest;
+
+      // Check remote digest for updates (skip if offline mode)
+      let remoteDigest: string | undefined;
+      let hasUpdate = false;
+
+      if (!this.config.offline) {
+        try {
+          remoteDigest = await this.getRemoteImageDigest(image.fullName);
+          hasUpdate = isAvailable && localDigest !== remoteDigest;
+          if (this.config.updateImages) {
+            hasUpdate = hasUpdate || isAvailable; // Force update if requested
+          }
+        } catch {
+          // Network error or registry unavailable - assume no update
+          hasUpdate = false;
+        }
+      }
+
+      return {
+        image,
+        isAvailable,
+        hasUpdate,
+        localDigest,
+        remoteDigest,
+        needsDownload: !isAvailable || hasUpdate,
+      };
+    } catch {
+      return {
+        image,
+        isAvailable: false,
+        hasUpdate: false,
+        needsDownload: true,
+      };
+    }
+  }
+
+  private async getLocalImageDigest(imageName: string): Promise<string | undefined> {
+    try {
+      // Validate image name to prevent command injection
+      if (!this.isValidImageName(imageName)) {
+        throw new Error(`Invalid image name: ${imageName}`);
+      }
+
+      // Safe: imageName is validated against allowlist in isValidImageName() and properly quoted
+      // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process
+      const output = execSync(`podman inspect "${imageName}" --format "{{.Digest}}"`, {
+        stdio: 'pipe',
+        encoding: 'utf-8',
+      });
+      return output.trim() || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async getRemoteImageDigest(imageName: string): Promise<string> {
+    // Validate image name to prevent command injection
+    if (!this.isValidImageName(imageName)) {
+      throw new Error(`Invalid image name: ${imageName}`);
+    }
+
+    // Safe: imageName is validated against allowlist in isValidImageName() and properly quoted
+    // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process
+    const output = execSync(`podman manifest inspect "${imageName}" --format "{{.Digest}}"`, {
+      stdio: 'pipe',
+      encoding: 'utf-8',
+      timeout: 10000, // 10 second timeout
+    });
+    return output.trim();
+  }
+
+  private isValidImageName(imageName: string): boolean {
+    // Only allow known safe image names to prevent command injection
+    const allowedImages = [this.images.trivy.fullName, this.images.semgrep.fullName];
+    return allowedImages.includes(imageName);
+  }
+
+  private displayImageStatus(status: ImageCheckResult): void {
+    if (this.config.quiet) return;
+
+    const trivySymbol = status.trivy.hasUpdate ? '↻' : status.trivy.isAvailable ? '✓' : '⬇';
+    const semgrepSymbol = status.semgrep.hasUpdate ? '↻' : status.semgrep.isAvailable ? '✓' : '⬇';
+
+    const trivyText = status.trivy.hasUpdate
+      ? 'new version available'
+      : status.trivy.isAvailable
+        ? 'cached, up to date'
+        : 'not found, needs download';
+
+    const semgrepText = status.semgrep.hasUpdate
+      ? 'new version available'
+      : status.semgrep.isAvailable
+        ? 'cached, up to date'
+        : 'not found, needs download';
+
+    console.log(`  ${trivySymbol} Trivy (${status.trivy.image.estimatedSize}): ${trivyText}`);
+    console.log(
+      `  ${semgrepSymbol} Semgrep (${status.semgrep.image.estimatedSize}): ${semgrepText}`
+    );
+
+    // Show digests if requested
+    if (this.config.showDigests) {
+      if (status.trivy.localDigest) {
+        console.log(`    Local digest:  ${status.trivy.localDigest.substring(0, 16)}...`);
+      }
+      if (status.trivy.remoteDigest && status.trivy.remoteDigest !== status.trivy.localDigest) {
+        console.log(`    Remote digest: ${status.trivy.remoteDigest.substring(0, 16)}...`);
+      }
+      if (status.semgrep.localDigest) {
+        console.log(`    Local digest:  ${status.semgrep.localDigest.substring(0, 16)}...`);
+      }
+      if (
+        status.semgrep.remoteDigest &&
+        status.semgrep.remoteDigest !== status.semgrep.localDigest
+      ) {
+        console.log(`    Remote digest: ${status.semgrep.remoteDigest.substring(0, 16)}...`);
+      }
+    }
+  }
+
+  private async promptForUpdates(status: ImageCheckResult): Promise<boolean> {
+    if (this.config.assumeYes || this.config.checkOnly) return !this.config.checkOnly;
+
+    const updates: string[] = [];
+    if (status.trivy.hasUpdate) updates.push(`Trivy (${status.trivy.image.estimatedSize})`);
+    if (status.semgrep.hasUpdate) updates.push(`Semgrep (${status.semgrep.image.estimatedSize})`);
+
+    if (updates.length === 0) return false;
+
+    const updateList = updates.length === 1 ? updates[0] : updates.join(', ');
+    const question = `\nDownload ${updateList} update? [Y/n] `;
+
+    return this.promptUser(question);
+  }
+
+  private async promptForInitialSetup(status: ImageCheckResult): Promise<boolean> {
+    if (this.config.assumeYes) return true;
+    if (this.config.checkOnly) return false;
+
+    const needed: string[] = [];
+    if (!status.trivy.isAvailable) needed.push(`Trivy (${status.trivy.image.estimatedSize})`);
+    if (!status.semgrep.isAvailable) needed.push(`Semgrep (${status.semgrep.image.estimatedSize})`);
+
+    if (needed.length === 0) return true;
+
+    console.log('\nSetting up security scanning tools...');
+    console.log('\nThis tool requires container images for scanning:');
+    needed.forEach(tool => console.log(`  - ${tool}`));
+    console.log('\nImages will be cached locally for future use.');
+
+    return this.promptUser('Download now? [Y/n] ');
+  }
+
+  private promptUser(question: string): Promise<boolean> {
+    return new Promise(resolve => {
+      process.stdout.write(question);
+      process.stdin.once('data', data => {
+        const answer = data.toString().trim().toLowerCase();
+        resolve(answer === '' || answer === 'y' || answer === 'yes');
+      });
+    });
+  }
+
+  private async updateImages(status: ImageCheckResult): Promise<void> {
+    if (status.trivy.hasUpdate) {
+      await this.downloadSingleImage(status.trivy.image);
+    }
+    if (status.semgrep.hasUpdate) {
+      await this.downloadSingleImage(status.semgrep.image);
+    }
+  }
+
+  private async downloadImages(status: ImageCheckResult): Promise<void> {
+    if (!status.trivy.isAvailable) {
+      await this.downloadSingleImage(status.trivy.image);
+    }
+    if (!status.semgrep.isAvailable) {
+      await this.downloadSingleImage(status.semgrep.image);
+    }
+  }
+
+  private async downloadSingleImage(image: ContainerImage): Promise<void> {
+    if (!this.config.quiet) {
+      process.stdout.write(`  ⬇ ${image.name}: downloading... `);
     }
 
     try {
-      // Pull latest Trivy image
-      execSync('podman pull docker.io/aquasec/trivy:latest', {
-        stdio: 'pipe',
+      // Safe: image.fullName comes from hardcoded ContainerImage objects and is properly quoted
+      // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process
+      execSync(`podman pull "${image.fullName}"`, {
+        stdio: this.config.quiet ? 'pipe' : 'pipe',
         timeout: this.config.containerTimeout * 1000,
       });
 
       if (!this.config.quiet) {
-        process.stdout.write('done\nScanning dependencies... ');
+        console.log(`✓ (${image.estimatedSize})`);
       }
+    } catch (error) {
+      if (!this.config.quiet) {
+        console.log('✗ failed');
+      }
+      throw new Error(`Failed to download ${image.name}: ${(error as Error).message}`);
+    }
+  }
 
+  private async runTrivyContainer(): Promise<void> {
+    if (!this.config.quiet) {
+      process.stdout.write('Scanning dependencies... ');
+    }
+
+    try {
       const outputFile = join(this.reportsDir, `trivy-${Date.now()}.json`);
 
       // Run Trivy scan
@@ -360,8 +692,8 @@ Examples:
           `-v "${process.cwd()}:/workspace:ro" ` +
           `-v "${this.reportsDir}:/reports:rw" ` +
           `--workdir /workspace ` +
-          `docker.io/aquasec/trivy:latest ` +
-          `fs --format json --output /reports/${join('/', relative(this.reportsDir, outputFile))} ` +
+          `${this.images.trivy.fullName} ` +
+          `fs --format json --output /reports/${relative(this.reportsDir, outputFile).replace(/\\/g, '/')} ` +
           `--timeout ${this.config.containerTimeout}s ` +
           `/workspace`,
         {
@@ -392,20 +724,10 @@ Examples:
 
   private async runSemgrepContainer(): Promise<void> {
     if (!this.config.quiet) {
-      process.stdout.write('Pulling Semgrep container... ');
+      process.stdout.write('Analyzing code security... ');
     }
 
     try {
-      // Pull latest Semgrep image
-      execSync('podman pull docker.io/returntocorp/semgrep:latest', {
-        stdio: 'pipe',
-        timeout: this.config.containerTimeout * 1000,
-      });
-
-      if (!this.config.quiet) {
-        process.stdout.write('done\nAnalyzing code security... ');
-      }
-
       const outputFile = join(this.reportsDir, `semgrep-${Date.now()}.json`);
 
       // Run Semgrep scan
@@ -414,7 +736,7 @@ Examples:
           `-v "${process.cwd()}:/workspace:ro" ` +
           `-v "${this.reportsDir}:/reports:rw" ` +
           `--workdir /workspace ` +
-          `docker.io/returntocorp/semgrep:latest ` +
+          `${this.images.semgrep.fullName} ` +
           `semgrep scan ` +
           `--config ${this.config.semgrepConfig} ` +
           `--json ` +
