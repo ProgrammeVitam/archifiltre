@@ -9,6 +9,7 @@
 
 import Version from './cli/commands/version.js';
 import Health from './cli/commands/health.js';
+import Sbom from './cli/commands/sbom.js';
 
 /**
  * Explicit command registry for bundling
@@ -17,9 +18,10 @@ import Health from './cli/commands/health.js';
 export const COMMANDS = {
   version: Version,
   health: Health,
+  sbom: Sbom,
 } as const;
 
 /**
  * Export individual commands for direct access if needed
  */
-export { Version, Health };
+export { Version, Health, Sbom };

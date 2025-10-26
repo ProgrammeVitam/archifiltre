@@ -183,7 +183,7 @@ Examples:
   bun run scripts/generate-spdx3-sbom.ts --output-dir compliance-sbom --verbose
   bun run scripts/generate-spdx3-sbom.ts --exclude-dev-deps --quiet
 
-French Government Compliance Tool
+SPDX 3.0 SBOM Generator
 Organization: République française – Ministère de la Culture (SNUM)
 Program: VITAM (Programme interministériel)
 License: CeCILL-2.1

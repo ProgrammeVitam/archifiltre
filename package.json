@@ -8,7 +8,8 @@
   },
   "scripts": {
     "dev": "bun run bin/dev.js",
-    "build:cli": "bun build src/cli/bundle-entry.ts --compile --outfile archifiltre",
+    "build:cli": "bun run sbom && bun build src/cli/bundle-entry.ts --compile --outfile archifiltre",
+    "build:release": "bun run build:cli && cp dist/sbom/archifiltre-*.spdx3.yaml ./archifiltre.sbom",
     "smoke:cli": "bun run scripts/smoke-test.ts",
     "test": "vitest run",
     "test:watch": "vitest",
