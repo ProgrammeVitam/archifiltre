@@ -5,7 +5,7 @@
  */
 
 import { Command, Flags } from '@oclif/core';
-import { api, formatters, type VersionInfo } from '@api/index.js';
+import { api, formatters, type VersionInfo } from '@lib/helpers.ts';
 
 export default class Version extends Command {
   static override description = 'Show version information';
@@ -48,7 +48,7 @@ export default class Version extends Command {
       if (flags['log-format'] === 'json') {
         this.log(JSON.stringify(versionInfo, null, 2));
       } else {
-        const formattedVersion = formatters.versionString();
+        const formattedVersion = formatters.getFormattedVersion();
         this.log(formattedVersion);
       }
 

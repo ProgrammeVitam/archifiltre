@@ -5,7 +5,7 @@
  */
 
 import { Command, Flags } from '@oclif/core';
-import { api, formatters, type HealthReport } from '@api/index.js';
+import { api, formatters, type HealthReport } from '@lib/helpers.ts';
 
 export default class Health extends Command {
   static override description = 'Check system health and requirements';

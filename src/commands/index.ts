@@ -7,9 +7,10 @@
  * See: https://oclif.io/docs/command_discovery_strategies#explicit-strategy
  */
 
-import Version from './cli/commands/version.js';
-import Health from './cli/commands/health.js';
-import Sbom from './cli/commands/sbom.js';
+import Version from './version.ts';
+import Health from './health.ts';
+import Sbom from './sbom.ts';
+import Scan from './scan.ts';
 
 /**
  * Explicit command registry for bundling
@@ -19,9 +20,10 @@ export const COMMANDS = {
   version: Version,
   health: Health,
   sbom: Sbom,
+  scan: Scan,
 } as const;
 
 /**
  * Export individual commands for direct access if needed
  */
-export { Version, Health, Sbom };
+export { Version, Health, Sbom, Scan };

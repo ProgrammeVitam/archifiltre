@@ -1,10 +1,10 @@
 /**
- * Essential CLI Integration Tests
+ * CLI Commands Integration Tests
  *
- * Tests only the critical functionality that we actually control:
+ * Tests that CLI commands execute correctly:
  * - Commands execute successfully
  * - Custom branding appears in help
- * - API integration works
+ * - Basic functionality works end-to-end
  */
 
 import { describe, it, expect } from 'vitest';

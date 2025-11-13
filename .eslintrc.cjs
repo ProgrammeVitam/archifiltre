@@ -14,7 +14,7 @@ module.exports = {
   rules: {
     // Basic ESLint rules
     'no-unused-vars': 'off', // Use TypeScript version instead
-    'no-console': 'off', // CLI tool needs console output
+    'no-console': 'error', // Use logger.* instead of console.* - NO exceptions
     'no-var': 'error',
     'prefer-const': 'error',
     'object-shorthand': 'error',
@@ -28,6 +28,20 @@ module.exports = {
     '@typescript-eslint/explicit-function-return-type': 'off',
     '@typescript-eslint/explicit-module-boundary-types': 'off',
 
+    // Logging rules - enforce global logger usage
+    'no-restricted-syntax': [
+      'error',
+      {
+        selector:
+          'Decorator[expression.callee.name="inject"][expression.arguments.0.property.name="Logger"]',
+        message: 'Use global logger import instead of DI: import { logger } from "@infra/logging"',
+      },
+      {
+        selector: 'CallExpression[callee.name="inject"][arguments.0.property.name="Logger"]',
+        message: 'Use global logger import instead of DI: import { logger } from "@infra/logging"',
+      },
+    ],
+
     // Allow duplicate imports (needed for barrel exports)
     'no-duplicate-imports': 'off',
 
@@ -40,6 +54,8 @@ module.exports = {
       rules: {
         '@typescript-eslint/no-explicit-any': 'off',
         '@typescript-eslint/no-unused-vars': 'off',
+        'no-console': 'off', // Allow console in tests
+        'no-restricted-syntax': 'off', // Allow DI in tests
       },
     },
     {
@@ -59,6 +75,8 @@ module.exports = {
           'error',
           { argsIgnorePattern: '^_', varsIgnorePattern: '^_', caughtErrorsIgnorePattern: '^_' },
         ],
+        'no-console': 'off', // Allow console in build scripts
+        'no-restricted-syntax': 'off', // Allow any syntax in build scripts
       },
     },
     {

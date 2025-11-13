@@ -4,7 +4,6 @@ bun.lockb
 
 # === Build Output ===
 dist/
-lib/
 build/
 *.tsbuildinfo
 
@@ -35,6 +34,14 @@ logs/
 npm-debug.log*
 bun-debug.log*
 lerna-debug.log*
+
+# Development logs (when NODE_ENV=development)
+/logs/
+
+# Database files
+dbdata-*/
+*.sqlite
+*.db
 
 # === Temp/Cache ===
 .cache/
@@ -71,6 +78,20 @@ Thumbs.db
 test-output/
 *.analysis.json
 *.scan.json
+
+# Scan reports generated at root level
+scan-report-*.json
+scan-report-*.csv
+scan-report-*.html
+
+# Reports directory contents (but keep the directory structure)
+reports/*
+!reports/.gitignore
+!reports/README.md
+
+# SBOM files generated during build
+*.sbom
+archifiltre.sbom
 
 # === Security Reports ===
 security-reports/

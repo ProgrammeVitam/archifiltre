@@ -216,7 +216,7 @@ export default class Sbom extends Command {
             { exit: 1 }
           );
         }
-        this.log('✓ SBOM verification passed');
+        this.log('SBOM verification passed');
       }
 
       // Handle different output formats

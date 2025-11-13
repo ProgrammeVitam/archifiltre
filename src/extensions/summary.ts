@@ -1,0 +1,195 @@
+/**
+ * Summary Extension
+ *
+ * Extension for displaying detailed scan results with file breakdowns
+ */
+
+import { Command } from '@oclif/core';
+import { Observable, from, defer, of } from 'rxjs';
+import { map, catchError } from 'rxjs/operators';
+import { eq, and, count, sum, gt, sql } from 'drizzle-orm';
+import { logger } from '@lib/logging.ts';
+import type { DatabaseConnection } from '@lib/database.ts';
+import { files } from '@lib/database.ts';
+
+/**
+ * Get duplicate file statistics from database
+ */
+function getDuplicateStats(
+  connection: DatabaseConnection,
+  runId: string
+): Observable<{ duplicateGroups: number; totalDuplicateFiles: number }> {
+  return defer(() => {
+    return from(
+      connection.db
+        .select({
+          size: files.size,
+          fileCount: count(),
+        })
+        .from(files)
+        .where(
+          and(
+            eq(files.run_id, runId),
+            eq(files.is_directory, false) // Only files, exclude directories
+          )
+        )
+        .groupBy(files.size)
+        .having(gt(count(), 1)) // Only sizes with more than 1 file
+    ).pipe(
+      map(results => ({
+        duplicateGroups: results.length,
+        totalDuplicateFiles: results.reduce((sum, group) => sum + group.fileCount, 0),
+      })),
+      catchError(error => {
+        logger.error('Failed to get duplicate statistics', error as Error, { runId });
+        return of({ duplicateGroups: 0, totalDuplicateFiles: 0 });
+      })
+    );
+  });
+}
+
+/**
+ * Get folder statistics from database
+ */
+function getFolderStats(
+  connection: DatabaseConnection,
+  runId: string
+): Observable<{ totalFolders: number; emptyFolders: number }> {
+  return defer(() => {
+    // Get total folders count
+    const totalFoldersQuery = connection.db
+      .select({ totalFolders: count() })
+      .from(files)
+      .where(and(eq(files.run_id, runId), eq(files.is_directory, true)));
+
+    // Get empty folders using raw SQL with NOT EXISTS
+    const emptyFoldersQuery = connection.db
+      .select({
+        emptyFolders: sql<number>`COUNT(*)`,
+      })
+      .from(files)
+      .where(
+        and(
+          eq(files.run_id, runId),
+          eq(files.is_directory, true),
+          sql`NOT EXISTS (
+            SELECT 1 FROM files f2
+            WHERE f2.run_id = ${runId}
+              AND f2.path LIKE ${files.path} || '/%'
+          )`
+        )
+      );
+
+    return from(Promise.all([totalFoldersQuery, emptyFoldersQuery])).pipe(
+      map(([totalResult, emptyResult]) => ({
+        totalFolders: totalResult[0]?.totalFolders || 0,
+        emptyFolders: emptyResult[0]?.emptyFolders || 0,
+      })),
+      catchError(error => {
+        logger.error('Failed to get folder statistics', error as Error, { runId });
+        return of({ totalFolders: 0, emptyFolders: 0 });
+      })
+    );
+  });
+}
+
+/**
+ * Get file statistics with filtering options
+ */
+function getFilteredStats(
+  connection: DatabaseConnection,
+  runId: string,
+  options: {
+    includeHidden?: boolean;
+    includeSystem?: boolean;
+    includeDirectories?: boolean;
+  } = {}
+): Observable<{ totalFiles: number; totalSize: number }> {
+  const { includeHidden = true, includeSystem = true, includeDirectories = true } = options;
+
+  return defer(() => {
+    const conditions = [eq(files.run_id, runId)];
+
+    if (!includeHidden) {
+      conditions.push(eq(files.is_hidden, false));
+    }
+
+    if (!includeSystem) {
+      conditions.push(eq(files.is_system, false));
+    }
+
+    if (!includeDirectories) {
+      conditions.push(eq(files.is_directory, false));
+    }
+
+    return from(
+      connection.db
+        .select({
+          totalFiles: count(),
+          totalSize: sum(files.size),
+        })
+        .from(files)
+        .where(and(...conditions))
+    ).pipe(
+      map(results => ({
+        totalFiles: results[0]?.totalFiles || 0,
+        totalSize: Number(results[0]?.totalSize) || 0,
+      })),
+      catchError(error => {
+        logger.error('Failed to get filtered statistics', error as Error, { runId, options });
+        return of({ totalFiles: 0, totalSize: 0 });
+      })
+    );
+  });
+}
+
+/**
+ * Display detailed scan results summary
+ */
+export async function summary(
+  database: DatabaseConnection,
+  runId: string,
+  cli: Command
+): Promise<void> {
+  try {
+    // Get all statistics from database
+    const [totalStats, userStats, folderStats, duplicateStats] = await Promise.all([
+      getFilteredStats(database, runId, {
+        includeHidden: true,
+        includeSystem: true,
+        includeDirectories: false, // Only count files for total
+      }).toPromise(),
+      getFilteredStats(database, runId, {
+        includeHidden: false,
+        includeSystem: false,
+        includeDirectories: false,
+      }).toPromise(),
+      getFolderStats(database, runId).toPromise(),
+      getDuplicateStats(database, runId).toPromise(),
+    ]);
+
+    // Display summary in priority order
+    cli.log('');
+    cli.log('Scan completed.');
+    cli.log(`  Files discovered: ${totalStats.totalFiles.toLocaleString()}`);
+
+    if (duplicateStats.duplicateGroups > 0) {
+      cli.log(
+        `  Potential duplicates: ${duplicateStats.totalDuplicateFiles.toLocaleString()} files in ${duplicateStats.duplicateGroups.toLocaleString()} groups`
+      );
+    }
+
+    cli.log(`  Folders: ${folderStats.totalFolders.toLocaleString()}`);
+    cli.log(`  Empty folders: ${folderStats.emptyFolders.toLocaleString()}`);
+
+    const hiddenFiles = totalStats.totalFiles - userStats.totalFiles;
+    if (hiddenFiles > 0) {
+      cli.log(`  Hidden files: ${hiddenFiles.toLocaleString()}`);
+    }
+  } catch (error) {
+    logger.error('Failed to generate summary', error as Error, { runId });
+    cli.log('');
+    cli.log('Scan completed.');
+    cli.log('  Error generating detailed breakdown');
+  }
+}

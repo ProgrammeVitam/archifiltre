@@ -1,12 +1,13 @@
 #!/usr/bin/env bun
 /**
- * Bundle-Compatible Oclif Entry Point
+ * Archifiltre Main Entry Point
  *
- * Creates inline package.json configuration and command mapping
- * for standalone CLI execution without filesystem dependencies.
+ * Main CLI application entry point with embedded configuration
+ * for standalone execution and command orchestration.
  */
 
 import { Config, run } from '@oclif/core';
+import { initializeLogging, logger, shutdownLogging } from '@lib/logging.ts';
 
 // Inline package.json configuration for bundled environment
 const INLINE_PACKAGE_CONFIG = {
@@ -28,10 +29,10 @@ const INLINE_PACKAGE_CONFIG = {
     dirname: 'archifiltre',
     commands: {
       strategy: 'explicit' as const,
-      target: './src/commands.js',
+      target: './src/commands/index.js',
       identifier: 'COMMANDS',
     },
-    helpClass: './src/cli/help.js',
+    helpClass: './src/lib/help.js',
     plugins: [],
     topicSeparator: ' ',
     additionalHelpFlags: ['-h'],
@@ -53,8 +54,9 @@ async function createBundleConfig() {
     await config.load();
     return config;
   } catch (error) {
-    console.error('Failed to create bundle config:', error);
-    process.exit(1);
+    throw new Error(
+      `Failed to create bundle config: ${error instanceof Error ? error.message : String(error)}`
+    );
   }
 }
 
@@ -63,6 +65,13 @@ async function createBundleConfig() {
  */
 async function main() {
   try {
+    // Initialize simple logging system for CLI
+    await initializeLogging({
+      level: process.argv.includes('--verbose') || process.argv.includes('-v') ? 'debug' : 'info',
+      enableConsoleLogging: false, // CLI uses Oclif integration
+      enableFileLogging: true,
+    });
+
     // Create bundle-compatible config
     const config = await createBundleConfig();
 
@@ -74,7 +83,7 @@ async function main() {
       const oclifError = error as { oclif?: { exit?: number } };
 
       if (error instanceof Error && error.message) {
-        console.error(`›   Error: ${error.message}`);
+        logger.error('CLI command error', error, { context: 'oclif_error' });
       }
 
       process.exit(oclifError.oclif?.exit ?? 1);
@@ -82,15 +91,10 @@ async function main() {
 
     // Handle other errors
     const message = error instanceof Error ? error.message : 'Unknown error';
-    console.error('CLI Error:', message);
-
-    // Show stack trace in verbose mode
-    if (process.argv.includes('--verbose') || process.argv.includes('-V')) {
-      if (error instanceof Error && error.stack) {
-        console.error('\nStack Trace:');
-        console.error(error.stack);
-      }
-    }
+    logger.error('CLI execution failed', error instanceof Error ? error : new Error(message), {
+      context: 'main_entry',
+      verbose: process.argv.includes('--verbose') || process.argv.includes('-V'),
+    });
 
     process.exit(1);
   }
@@ -100,25 +104,28 @@ async function main() {
  * Handle uncaught exceptions gracefully
  */
 process.on('uncaughtException', (error: Error) => {
-  console.error('Uncaught exception:', error.message);
+  logger.error('Uncaught exception in CLI', error, { context: 'process_exception' });
   process.exit(1);
 });
 
 process.on('unhandledRejection', (reason: unknown) => {
-  console.error('Unhandled promise rejection:', reason);
+  const error = reason instanceof Error ? reason : new Error(String(reason));
+  logger.error('Unhandled promise rejection in CLI', error, { context: 'promise_rejection' });
   process.exit(1);
 });
 
 /**
  * Handle process termination signals gracefully
  */
-process.on('SIGINT', () => {
-  process.stderr.write('\nReceived SIGINT. Exiting gracefully...\n');
+process.on('SIGINT', async () => {
+  logger.info('Received SIGINT - CLI shutting down gracefully', { signal: 'SIGINT' });
+  await shutdownLogging();
   process.exit(130);
 });
 
-process.on('SIGTERM', () => {
-  process.stderr.write('\nReceived SIGTERM. Exiting gracefully...\n');
+process.on('SIGTERM', async () => {
+  logger.info('Received SIGTERM - CLI shutting down gracefully', { signal: 'SIGTERM' });
+  await shutdownLogging();
   process.exit(143);
 });
 

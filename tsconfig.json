@@ -20,11 +20,9 @@
     "types": ["vitest/globals"],
     "baseUrl": ".",
     "paths": {
-      "@cli/*": ["src/cli/*"],
-      "@api/*": ["src/api/*"],
-      "@core/*": ["src/core/*"],
-      "@infra/*": ["src/infra/*"],
-      "@shared/*": ["src/shared/*"]
+      "@commands/*": ["src/commands/*"],
+      "@lib/*": ["src/lib/*"],
+      "@extensions/*": ["src/extensions/*"]
     }
   },
   "include": ["src/**/*", "test/**/*", "scripts/**/*"],

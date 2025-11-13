@@ -4,19 +4,19 @@
   "description": "Privacy-friendly, 100% offline desktop tool for inventorying large file trees",
   "type": "module",
   "bin": {
-    "archifiltre": "./bin/run.js"
+    "archifiltre": "./archifiltre"
   },
   "scripts": {
-    "dev": "bun run bin/dev.js",
-    "build:cli": "bun run sbom && bun build src/cli/bundle-entry.ts --compile --outfile archifiltre",
+    "dev": "bun run src/main.ts",
+    "build:cli": "bun run sbom && bun build src/main.ts --compile --outfile archifiltre",
     "build:release": "bun run build:cli && cp dist/sbom/archifiltre-*.spdx3.yaml ./archifiltre.sbom",
     "smoke:cli": "bun run scripts/smoke-test.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:unit": "vitest run test/unit",
     "test:integration": "vitest run test/integration",
-    "lint": "eslint src test scripts --ext .ts && eslint bin --ext .js && eslint .github --ext .yml,.yaml",
-    "lint:fix": "eslint src test scripts --ext .ts --fix && eslint bin --ext .js --fix && eslint .github --ext .yml,.yaml --fix",
+    "lint": "eslint src test scripts --ext .ts && eslint .github --ext .yml,.yaml",
+    "lint:fix": "eslint src test scripts --ext .ts --fix && eslint .github --ext .yml,.yaml --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "release:pack": "bun run scripts/release-pack.ts",
@@ -58,6 +58,9 @@
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^24.9.1",
     "@types/tar-stream": "^3.1.4",
+    "@types/uuid": "^10.0.0",
+    "@types/winston": "^2.4.4",
+    "@types/winston-syslog": "^2.4.4",
     "@typescript-eslint/eslint-plugin": "^8.46.2",
     "@typescript-eslint/parser": "^8.46.2",
     "eslint": "^8.54.0",
@@ -70,21 +73,32 @@
     "yaml-eslint-parser": "^1.3.0"
   },
   "dependencies": {
+    "@electric-sql/pglite": "^0.3.8",
     "@oclif/core": "^4.0.0",
     "@sentry/node": "^10.22.0",
     "ajv": "^8.17.1",
+    "bottleneck": "^2.19.5",
+    "drizzle-orm": "^0.44.5",
     "js-yaml": "^4.1.0",
-    "posthog-node": "^5.10.3"
+    "posthog-node": "^5.10.3",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "smol-toml": "^1.4.2",
+    "tsyringe": "^4.10.0",
+    "uuid": "^11.1.0",
+    "winston": "^3.18.3",
+    "winston-daily-rotate-file": "^5.0.0",
+    "winston-syslog": "^2.7.1"
   },
   "oclif": {
     "bin": "archifiltre",
     "dirname": "archifiltre",
     "commands": {
       "strategy": "explicit",
-      "target": "./src/commands.js",
+      "target": "./src/commands.ts",
       "identifier": "COMMANDS"
     },
-    "helpClass": "./src/cli/help.js",
+    "helpClass": "./src/cli/help.ts",
     "plugins": [],
     "topicSeparator": " ",
     "additionalHelpFlags": [
