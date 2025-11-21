@@ -1,6 +1,6 @@
 # Archifiltre v5
 
-**Privacy-friendly, 100% offline desktop tool for inventorying large file trees, detecting duplicates/similarities, and producing exports for cleanup/analysis.**
+**Privacy-first file scanning tool for complete directory analysis and duplicate detection.**
 
 ---
 
@@ -13,26 +13,35 @@
 
 ---
 
-Archifiltre runs **entirely on your machine** with no telemetry, no servers, and no network dependencies.
+Archifiltre analyzes file systems locally with comprehensive scanning capabilities. Get complete insights into your directories with professional reporting and intelligent duplicate detection.
 
-## What's New in v5?
+## Features
 
-Archifiltre v5 is a complete rebuild focused on **speed, reliability, and modularity**:
+- **Complete directory scanning** - catalogs all files and folders with metadata
+- **Duplicate detection** - identifies potential duplicates by file size analysis  
+- **Professional reporting** - clean, actionable summaries with key insights
+- **Local processing** - runs entirely on your machine with local database storage
 
-- **Single binary** distribution via Bun compile
-- **CLI-first** architecture with internal API
-- **Crash-safe** operations with pause/resume
-- **Reproducible builds** and robust CI/CD
-- **100% offline** - no network dependencies
-
-## Quick Start
+## Installation
 
 ### Prerequisites
 
-- [Bun](https://bun.sh/) >= 1.0.0
-- [Podman](https://podman.io/) (for security scanning in development)
+**Install Bun (JavaScript runtime):**
 
-### Installation
+```bash
+# Install Bun (macOS/Linux)
+curl -fsSL https://bun.sh/install | bash
+
+# Or using npm
+npm install -g bun
+
+# Verify installation
+bun --version
+```
+
+**For Windows:** Visit [bun.sh](https://bun.sh/) for Windows installation instructions.
+
+### Setup from Source
 
 ```bash
 # Clone the repository
@@ -42,309 +51,308 @@ cd archifiltre
 # Install dependencies
 bun install
 
-# Build the CLI binary
+# Build the production binary
 bun run build:cli
 
-# Run smoke tests
+# Verify the build
+./archifiltre --version
+```
+
+### Development Setup
+
+```bash
+# Install dependencies
+bun install
+
+# Run in development mode (no build required)
+bun run dev --help
+```
+
+## Usage
+
+### Primary Commands
+
+#### File Scanning (Main Feature)
+
+```bash
+# Scan a directory
+./archifiltre scan /path/to/directory
+
+# Example output:
+# Scan completed.
+#   Files discovered: 1,234
+#   Potential duplicates: 45 files in 12 groups
+#   Folders: 25
+#   Empty folders: 3
+#   Hidden files: 8
+```
+
+**Scan Options:**
+```bash
+# Include hidden files (default: false)
+./archifiltre scan /path --include-hidden
+
+# Custom batch size for performance
+./archifiltre scan /path --batch-size 2000
+
+# Use custom database name
+./archifiltre scan /path --db my-custom-scan
+
+# Minimum file size for hash calculation
+./archifiltre scan /path --min-size 1024
+```
+
+#### System Commands
+
+```bash
+# Check system health and requirements
+./archifiltre health
+
+# Verbose health check with detailed information
+./archifiltre health --verbose
+
+# Show version information
+./archifiltre version
+
+# Show help
+./archifiltre --help
+./archifiltre scan --help  # Command-specific help
+```
+
+#### SBOM Generation
+
+```bash
+# Generate Software Bill of Materials
+./archifiltre sbom
+
+# SBOM with verbose output
+./archifiltre sbom --verbose
+```
+
+### Development Commands
+
+```bash
+# Run in development mode (faster iteration)
+bun run dev scan /path/to/test
+bun run dev health --verbose
+
+# Build production binary
+bun run build:cli
+
+# Run all tests
+bun run test
+
+# Run specific test suites
+bun run test:unit
+bun run test:integration
+
+# Code quality
+bun run lint              # Check code quality
+bun run lint:fix          # Fix auto-fixable issues
+bun run format            # Format code
+bun run format:check      # Check formatting
+
+# Type checking
+bun run typecheck
+
+# Security auditing
+bun run security:audit           # Full security audit
+bun run security:audit:quick     # Quick security check
+bun run security:audit:ci        # CI-friendly audit
+```
+
+### Build and Release
+
+```bash
+# Generate SBOM (Software Bill of Materials)
+bun run sbom                 # Standard SBOM
+bun run sbom:compliance      # Compliance-focused SBOM
+bun run sbom:security        # Security-focused SBOM
+
+# Build release package
+bun run build:release        # Includes SBOM generation
+
+# Smoke test the built binary
 bun run smoke:cli
 ```
 
-### Usage
+## Configuration
 
-```bash
-# Show help
-./archifiltre --help
+### User Configuration
 
-# Show version
-./archifiltre --version
+Create `~/.config/archifiltre/config.toml` for persistent settings:
 
-# Check system health
-./archifiltre health
+```toml
+[scanning]
+includeHidden = true
+maxDepth = 15
+calculateHashes = true
+minSizeForHash = 512
+batchSize = 2000
 
-# Enable verbose logging
-./archifiltre --verbose health
+[logging]
+level = "debug"
+enableFileLogging = true
+enableConsoleLogging = true
+maxFileSize = "50m"
+maxFiles = "7d"
 
-# Generate Software Bill of Materials (SBOM)
-bun run sbom
+[privacy]
+enableAnalytics = false
+enableCrashReporting = false
+sanitizeFilePaths = true
+allowExternalServices = false
 
-# Generate compliance-focused SBOM
-bun run sbom:compliance
-
-# Generate security-focused SBOM with vulnerabilities
-bun run sbom:security
+[storage]
+databaseName = "my-scans"
+enableWAL = true
+retentionDays = 30
+maxDatabaseSize = "1GB"
 ```
 
-## SBOM Generation
+## Understanding Results
 
-Archifiltre includes comprehensive Software Bill of Materials (SBOM) generation capabilities for compliance and security requirements. **SBOM generation is a development/build-time tool** that analyzes the software to produce compliance documentation.
+### Files Discovered
+Total number of files and directories found in the scan.
 
-### Supported Formats
+### Potential Duplicates
+Files with identical sizes that may be duplicates. Format: "X files in Y groups"
+- **Files**: Total number of potentially duplicate files
+- **Groups**: Number of different file sizes with duplicates
 
-- **SPDX 2.3** (JSON/YAML) - ISO standard for compliance
-- **CycloneDX 1.5** (JSON/XML) - OWASP standard for security
+*Example: "45 files in 12 groups" means 12 different file sizes have multiple copies, totaling 45 files that could be duplicates.*
 
-### Quick Examples
+### Folders & Empty Folders
+- **Folders**: Total directory count
+- **Empty folders**: Directories with no content (cleanup opportunities)
 
-```bash
-# Generate compliance SBOM (SPDX format)
-bun run sbom:compliance
-
-# Generate security SBOM with vulnerability data
-bun run sbom:security
-
-# Generate all formats
-bun run scripts/generate-sbom.ts --all-formats
-
-# Generate specific format
-bun run scripts/generate-sbom.ts --format spdx-json --output-dir ./reports
-```
-
-### Compliance Features
-
-- **French Government Compliance**: Meets VITAM program requirements
-- **ISO/IEC 5962:2021**: SPDX standard compliance
-- **NTIA Minimum Elements**: US government SBOM requirements
-- **License Tracking**: Comprehensive license compliance documentation
-- **Vulnerability Integration**: Security risk assessment capabilities
-
-### SBOM Scripts
-
-```bash
-# Development scripts (build-time tools)
-bun run sbom                    # Generate compliance SBOM
-bun run sbom:spdx              # SPDX compliance format
-bun run sbom:cyclonedx         # CycloneDX security format
-bun run sbom:compliance        # Full compliance package
-bun run sbom:security          # Security-focused SBOM
-
-# Direct script usage
-bun run scripts/generate-sbom.ts --help
-```
-
-## Development
-
-### Project Structure
-
-```
-src/
-├── cli/                    # CLI parsing & command routing
-├── api/                    # Internal API (in-process, no HTTP)
-│   ├── commands/          # Command handlers
-│   ├── queries/           # Query handlers
-│   ├── dto.ts             # Data transfer objects
-│   ├── errors.ts          # Typed error system
-│   └── index.ts           # Public API surface
-├── core/                   # Business logic (future)
-├── infra/                  # Infrastructure adapters (future)
-└── shared/                 # Cross-cutting utilities
-scripts/                    # Development & build tools (TypeScript)
-├── security-audit.ts       # Container-based security scanning
-├── release-pack.ts         # Release packaging automation
-└── smoke-test.ts           # Binary testing & validation
-```
-
-### Scripts
-
-```bash
-# Development
-bun run dev                 # Run CLI in development mode
-bun run test                # Run all tests
-bun run test:watch          # Run tests in watch mode
-
-# Code Quality
-bun run lint                # Lint code
-bun run format              # Format code
-bun run typecheck           # Type checking
-
-# Security
-bun run security:audit      # Run comprehensive security scan
-bun run security:audit:ci   # CI security scan (fails on high+ severity)
-bun run security:audit:json # Generate JSON security report
-
-# SBOM Generation (Build-time tools)
-bun run sbom                # Generate compliance SBOM
-bun run sbom:spdx           # Generate SPDX format for compliance
-bun run sbom:cyclonedx      # Generate CycloneDX format
-bun run sbom:compliance     # Full compliance package
-bun run sbom:security       # Security-focused SBOM with vulnerability data
-
-# Build & Release
-bun run build:cli           # Compile binary
-bun run smoke:cli           # Run smoke tests
-bun run release:pack        # Create release package
-```
-
-### Testing
-
-```bash
-# Unit tests
-bun run test:unit
-
-# Integration tests
-bun run test:integration
-
-# All tests with coverage
-bun run test -- --coverage
-```
-
-### Security & Development Tools
-
-The project includes **container-based security tooling** for comprehensive vulnerability scanning:
-
-```bash
-# Full security audit (dependencies + code)
-bun run security:audit
-
-# Check container image status
-bun run security:audit --check-only
-
-# Force update security scanner images
-bun run security:audit --update-images
-
-# Run in CI mode (strict thresholds)
-bun run security:audit:ci
-```
-
-**Features:**
-- **Trivy**: Dependency vulnerability scanning with CVE database
-- **Semgrep**: Static application security testing (SAST) for code patterns
-- **Container-based**: Uses Podman for isolated, up-to-date security tools
-- **Smart caching**: Only downloads image updates when needed
+### Hidden Files
+System and hidden files (starting with `.` on Unix systems).
 
 ## Architecture
 
-### CLI-First Approach
+### Project Structure
+```
+src/
+├── main.ts            # CLI entry point
+├── commands/          # CLI command implementations
+│   ├── scan.ts       # Main scanning command
+│   ├── health.ts     # System health checks
+│   └── version.ts    # Version information
+├── lib/              # Core functionality  
+│   ├── scanner.ts    # File scanning engine
+│   ├── database.ts   # Data storage (PGlite)
+│   ├── config.ts     # TOML configuration system
+│   └── helpers.ts    # Utility functions
+└── extensions/       # Analysis extensions
+    └── summary.ts    # Summary reporting
+```
 
-v5 starts with a **CLI-only foundation** to:
+### Database-Driven Analysis
+- **Complete cataloging** - all files stored with metadata
+- **Flexible querying** - extensions analyze data independently  
+- **PGlite database** - embedded PostgreSQL for rich queries
+- **Source of truth** - database contains the complete picture
 
-- Minimize complexity and maximize reliability
-- Enable thorough testing of the core API
-- Provide a stable contract for future UI integration
+## Development
 
-### Internal API Design
+### Development Workflow
 
-- **In-process only** - no HTTP servers or network sockets
-- **JSON-safe DTOs** with dates as ISO strings
-- **Typed errors** mapped to appropriate exit codes
-- **Modular commands** and queries for clean separation
+```bash
+# 1. Setup
+bun install
 
-### Exit Codes
+# 2. Development iteration
+bun run dev scan /test/directory     # Quick testing
+bun run lint                         # Check code quality
+bun run test                         # Run tests
 
-- `0` - Success
-- `1` - System error (file I/O, permissions, etc.)
-- `2` - Usage error (invalid flags, arguments, etc.)
+# 3. Before committing
+bun run typecheck                    # Type safety
+bun run format                       # Code formatting
+bun run security:audit:quick         # Security check
 
-## CLI Flags
+# 4. Build and test
+bun run build:cli                    # Production build
+bun run smoke:cli                    # Test the binary
+```
 
-All commands support these standard flags:
+### Creating Extensions
 
-- `--help` - Show command help
-- `--version` - Show version information
-- `--verbose` - Enable detailed logging
-- `--no-color` - Disable colored output
-- `--log-format json` - Output structured JSON logs
+Extensions analyze the complete file catalog and present custom insights:
+
+```typescript
+// src/extensions/my-analysis.ts
+import { Command } from '@oclif/core';
+import type { DatabaseConnection } from '@lib/database.ts';
+
+export async function myAnalysis(
+  database: DatabaseConnection,
+  runId: string, 
+  cli: Command
+): Promise<void> {
+  // Query the complete file catalog
+  const stats = await getMyCustomStats(database, runId);
+  
+  // Present custom analysis
+  cli.log('My Custom Analysis:');
+  cli.log(`  Custom metric: ${stats.myMetric}`);
+}
+```
+
+### Code Quality Tools
+
+```bash
+# Linting and formatting
+bun run lint                    # ESLint check
+bun run lint:fix               # Auto-fix issues
+bun run format                 # Prettier formatting
+bun run format:check           # Check formatting
+
+# Security
+bun run security:audit         # Full security audit
+bun run security:audit:quick   # Quick security scan
+bun run security:audit:json    # JSON output for CI
+
+# Type checking
+bun run typecheck             # TypeScript type checking
+```
 
 ## Contributing
 
-### Development Guidelines
+### Development Setup
+1. Fork the repository
+2. Install Bun: `curl -fsSL https://bun.sh/install | bash`
+3. Clone your fork: `git clone https://github.com/yourusername/archifiltre.git`
+4. Install dependencies: `bun install`
+5. Create a feature branch: `git checkout -b feature/your-feature`
 
-- **TypeScript everywhere** with strict mode enabled
-- **ESLint + Prettier** for consistent formatting
-- **Vitest** for testing with good coverage
-- **Container-based security** with Trivy + Semgrep
-- **No runtime network dependencies** (containers only in development)
-- **Path aliases** (`@api/*`, `@cli/*`, etc.)
-
-### Development Environment Setup
-
+### Before Submitting
 ```bash
-# 1. Install dependencies
-bun install
+# Ensure code quality
+bun run lint
+bun run typecheck
+bun run test
+bun run security:audit:quick
 
-# 2. Verify security tools (requires Podman)
-bun run security:audit --check-only
-
-# 3. Run full quality checks
-bun run typecheck && bun run lint && bun run security:audit
-
-# 4. Build and test
-bun run build:cli && bun run smoke:cli
+# Test the build
+bun run build:cli
+bun run smoke:cli
 ```
 
-### Commit Guidelines
-
-- Use conventional commits format
-- Keep commits atomic and focused
-- Include tests for new functionality
-- Ensure CI passes before merging
-
-## Roadmap
-
-**Phase 1 (Current): CLI Foundation**
-
-- ✅ Project setup and CI/CD
-- ✅ CLI parsing and help system
-- ✅ Version management and health checks
-- ✅ SBOM generation (SPDX & CycloneDX)
-- ✅ Compliance and security reporting
-- 🔄 Error handling and logging
-- ⏳ Core inventory engine
-- ⏳ File hashing and deduplication
-
-**Phase 2: Advanced Features**
-
-- ⏳ Database integration
-- ⏳ Export formats (JSON, CSV, etc.)
-- ⏳ Pause/resume functionality
-- ⏳ Progress reporting
-
-**Phase 3: UI Integration**
-
-- ⏳ Desktop UI (Electron/Tauri)
-- ⏳ Visual file tree explorer
-- ⏳ Interactive duplicate management
-
-## License
-
-CeCILL 2.1 License - see [LICENSE](LICENSE) for details.
-
-This software is governed by the CeCILL license under French law and abiding by the rules of distribution of free software.
-
-## Copyright
-
-© République française – Ministère de la Culture (SNUM) / CIAF / DINUM dans le cadre du programme interministériel VITAM
-
-## Compliance & Security
-
-### SBOM Standards Compliance
-
-- **SPDX 2.3** (ISO/IEC 5962:2021): License compliance and regulatory requirements
-- **CycloneDX 1.5** (OWASP): Security vulnerability tracking and risk management
-- **NTIA Minimum Elements**: US government SBOM requirements
-- **French Government**: VITAM program compliance standards
-
-### Security Features
-
-- **Container-based security scanning** with Trivy and Semgrep
-- **Dependency vulnerability tracking** with real-time updates
-- **License compliance verification** with detailed attribution
-- **Supply chain transparency** with complete dependency traceability
+### Pull Request Process
+1. Make your changes
+2. Add tests if applicable
+3. Update documentation
+4. Run the full test suite
+5. Submit a pull request with a clear description
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/ProgrammeVitam/archifiltre/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/ProgrammeVitam/archifiltre/discussions)
-- **Official Contact**: archifiltre@programmevitam.fr
-
-## About VITAM Program
-
-The VITAM program is an interministerial initiative for digital archiving, aimed at providing public administrations with a complete solution for the long-term preservation and access to their digital archives.
-
-Learn more: https://www.programmevitam.fr/
+- **Issues**: https://github.com/ProgrammeVitam/archifiltre/issues
+- **Email**: archifiltre@programmevitam.fr
+- **Documentation**: https://archifiltre.fabrique.social.gouv.fr
 
 ---
 
-**Remember**: Archifiltre is designed to be **100% offline and privacy-friendly**. Your data never leaves your machine.
-
-**République française – Ministère de la Culture (SNUM) / CIAF / DINUM**  
-**Programme interministériel VITAM**
+*Archifiltre v5 - Complete file system analysis for professional environments.*

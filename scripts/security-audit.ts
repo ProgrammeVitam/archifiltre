@@ -153,6 +153,10 @@ interface ImageStatus {
   localDigest?: string;
   remoteDigest?: string;
   needsDownload: boolean;
+  version?: string;
+  age?: string;
+  remoteVersion?: string;
+  remoteAge?: string;
 }
 
 interface ImageCheckResult {
@@ -474,19 +478,48 @@ Examples:
       const localDigest = await this.getLocalImageDigest(image.fullName);
       const isAvailable = !!localDigest;
 
+      // Get version and age information for available images
+      let version: string | undefined;
+      let age: string | undefined;
+      if (isAvailable) {
+        [version, age] = await Promise.all([
+          this.getImageVersion(image.fullName),
+          this.getImageAge(image.fullName),
+        ]);
+      }
+
       // Check remote digest for updates (skip if offline mode)
       let remoteDigest: string | undefined;
       let hasUpdate = false;
 
+      // Get remote information (digest, version, age)
+      let remoteVersion: string | undefined;
+      let remoteAge: string | undefined;
       if (!this.config.offline) {
         try {
-          remoteDigest = await this.getRemoteImageDigest(image.fullName);
+          // Show progress for remote checks (can be slow)
+          if (!this.config.quiet && isAvailable) {
+            process.stdout.write(`  Checking ${image.name} for updates... `);
+          }
+
+          const remoteInfo = await this.getRemoteImageInfo(image.fullName);
+          remoteDigest = remoteInfo.digest;
+          remoteVersion = remoteInfo.version;
+          remoteAge = remoteInfo.age;
+
+          if (!this.config.quiet && isAvailable) {
+            process.stdout.write('done\n');
+          }
+
           hasUpdate = isAvailable && localDigest !== remoteDigest;
           if (this.config.updateImages) {
             hasUpdate = hasUpdate || isAvailable; // Force update if requested
           }
-        } catch {
-          // Network error or registry unavailable - assume no update
+        } catch (error) {
+          // Network error or registry unavailable
+          if (!this.config.quiet && isAvailable) {
+            process.stdout.write('failed\n');
+          }
           hasUpdate = false;
         }
       }
@@ -498,6 +531,10 @@ Examples:
         localDigest,
         remoteDigest,
         needsDownload: !isAvailable || hasUpdate,
+        version,
+        age,
+        remoteVersion,
+        remoteAge,
       };
     } catch {
       return {
@@ -521,14 +558,41 @@ Examples:
       const output = execSync(`podman inspect "${imageName}" --format "{{.Digest}}"`, {
         stdio: 'pipe',
         encoding: 'utf-8',
+        timeout: 5000, // 5 second timeout for local operations
       });
-      return output.trim() || undefined;
-    } catch {
+
+      const digest = output.trim();
+
+      // Validate digest format (should start with sha256: and be 64 hex chars)
+      if (digest && digest.match(/^sha256:[a-f0-9]{64}$/)) {
+        return digest;
+      }
+
+      // If digest format is invalid, try alternative method with JSON output
+      const jsonOutput = execSync(`podman inspect "${imageName}"`, {
+        stdio: 'pipe',
+        encoding: 'utf-8',
+        timeout: 5000,
+      });
+
+      const imageInfo = JSON.parse(jsonOutput);
+      if (imageInfo && imageInfo[0]?.Digest) {
+        return imageInfo[0].Digest;
+      }
+
+      return undefined;
+    } catch (error) {
+      // Log specific error types for debugging but still return undefined
+      if (this.config.verbose) {
+        console.warn(`Failed to get local digest for ${imageName}: ${(error as Error).message}`);
+      }
       return undefined;
     }
   }
 
-  private async getRemoteImageDigest(imageName: string): Promise<string> {
+  private async getRemoteImageInfo(
+    imageName: string
+  ): Promise<{ digest: string; version?: string; age?: string }> {
     // Validate image name to prevent command injection
     if (!this.isValidImageName(imageName)) {
       throw new Error(`Invalid image name: ${imageName}`);
@@ -536,12 +600,219 @@ Examples:
 
     // Safe: imageName is validated against allowlist in isValidImageName() and properly quoted
     // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process
-    const output = execSync(`podman manifest inspect "${imageName}" --format "{{.Digest}}"`, {
+    const output = execSync(`podman manifest inspect "${imageName}"`, {
       stdio: 'pipe',
       encoding: 'utf-8',
       timeout: 10000, // 10 second timeout
     });
-    return output.trim();
+
+    try {
+      const manifest = JSON.parse(output.trim());
+
+      // For manifest lists, get the digest of the first amd64/linux manifest
+      let digest: string | undefined;
+      if (manifest.manifests && Array.isArray(manifest.manifests)) {
+        const amd64Manifest = manifest.manifests.find(
+          (m: any) => m.platform?.architecture === 'amd64' && m.platform?.os === 'linux'
+        );
+        if (amd64Manifest?.digest) {
+          digest = amd64Manifest.digest;
+        }
+        // Fallback to first manifest if no amd64/linux found
+        else if (manifest.manifests[0]?.digest) {
+          digest = manifest.manifests[0].digest;
+        }
+      }
+
+      // For single image manifests, use the config digest or fall back to a computed digest
+      if (!digest && manifest.config?.digest) {
+        digest = manifest.config.digest;
+      }
+
+      if (!digest) {
+        throw new Error('No digest found in manifest');
+      }
+
+      // Try to get remote version and age information in parallel
+      // Note: This may pull remote images which can be slow
+      const [remoteVersion, remoteAge] = await Promise.all([
+        this.getRemoteImageVersion(imageName).catch(() => undefined),
+        this.getRemoteImageAge(imageName).catch(() => undefined),
+      ]);
+
+      return {
+        digest,
+        version: remoteVersion,
+        age: remoteAge,
+      };
+    } catch (parseError) {
+      throw new Error(`Failed to parse manifest JSON: ${(parseError as Error).message}`);
+    }
+  }
+
+  private async getImageVersion(imageName: string): Promise<string | undefined> {
+    try {
+      if (!this.isValidImageName(imageName)) {
+        return undefined;
+      }
+
+      // First try to get version from image labels
+      const output = execSync(`podman inspect "${imageName}" --format "{{.Config.Labels}}"`, {
+        stdio: 'pipe',
+        encoding: 'utf-8',
+        timeout: 5000,
+      });
+
+      // Parse the labels map output (Go template format)
+      const labelsMatch = output.match(/org\.opencontainers\.image\.version:([^\s}\]]+)/);
+      if (labelsMatch && labelsMatch[1] && labelsMatch[1] !== 'develop') {
+        return labelsMatch[1];
+      }
+
+      // Fallback: try running the container to get version
+      // This is slower but more reliable for some images
+      try {
+        let versionOutput: string;
+        if (imageName.includes('trivy')) {
+          versionOutput = execSync(`podman run --rm "${imageName}" --version`, {
+            stdio: 'pipe',
+            encoding: 'utf-8',
+            timeout: 10000,
+          });
+          const versionMatch = versionOutput.match(/Version:\s*([^\s\n]+)/);
+          return versionMatch ? versionMatch[1] : undefined;
+        } else if (imageName.includes('semgrep')) {
+          versionOutput = execSync(`podman run --rm "${imageName}" semgrep --version`, {
+            stdio: 'pipe',
+            encoding: 'utf-8',
+            timeout: 10000,
+          });
+          const semgrepVersion = versionOutput.trim().split('\n')[0];
+          return semgrepVersion && semgrepVersion !== 'develop' ? semgrepVersion : undefined;
+        }
+      } catch {
+        // Fallback failed, return undefined
+      }
+
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async getImageAge(imageName: string): Promise<string | undefined> {
+    try {
+      if (!this.isValidImageName(imageName)) {
+        return undefined;
+      }
+
+      const output = execSync(`podman inspect "${imageName}" --format "{{.Created}}"`, {
+        stdio: 'pipe',
+        encoding: 'utf-8',
+        timeout: 5000,
+      });
+
+      const createdDate = new Date(output.trim());
+      if (isNaN(createdDate.getTime())) {
+        return undefined;
+      }
+
+      const now = new Date();
+      const ageMs = now.getTime() - createdDate.getTime();
+      const ageDays = Math.floor(ageMs / (1000 * 60 * 60 * 24));
+
+      if (ageDays < 1) {
+        return 'today';
+      } else if (ageDays < 7) {
+        return ageDays === 1 ? '1 day old' : `${ageDays} days old`;
+      } else if (ageDays < 30) {
+        const weeks = Math.floor(ageDays / 7);
+        return weeks === 1 ? '1 week old' : `${weeks} weeks old`;
+      } else if (ageDays < 365) {
+        const months = Math.floor(ageDays / 30);
+        return months === 1 ? '1 month old' : `${months} months old`;
+      } else {
+        const years = Math.floor(ageDays / 365);
+        return years === 1 ? '1 year old' : `${years} years old`;
+      }
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async getRemoteImageVersion(imageName: string): Promise<string | undefined> {
+    try {
+      if (!this.isValidImageName(imageName)) {
+        return undefined;
+      }
+
+      // Run the remote container directly to get version info
+      // This may pull the latest version if not cached locally
+      let versionOutput: string;
+      if (imageName.includes('trivy')) {
+        versionOutput = execSync(`podman run --rm "${imageName}" --version`, {
+          stdio: 'pipe',
+          encoding: 'utf-8',
+          timeout: 20000,
+        });
+        const versionMatch = versionOutput.match(/Version:\s*([^\s\n]+)/);
+        return versionMatch ? versionMatch[1] : undefined;
+      } else if (imageName.includes('semgrep')) {
+        versionOutput = execSync(`podman run --rm "${imageName}" semgrep --version`, {
+          stdio: 'pipe',
+          encoding: 'utf-8',
+          timeout: 20000,
+        });
+        const semgrepVersion = versionOutput.trim().split('\n')[0];
+        return semgrepVersion && semgrepVersion !== 'develop' ? semgrepVersion : undefined;
+      }
+
+      return undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async getRemoteImageAge(imageName: string): Promise<string | undefined> {
+    try {
+      if (!this.isValidImageName(imageName)) {
+        return undefined;
+      }
+
+      // Get creation date from remote image by inspecting it
+      // This will use cached remote image if available from version check
+      const output = execSync(`podman inspect "${imageName}" --format "{{.Created}}"`, {
+        stdio: 'pipe',
+        encoding: 'utf-8',
+        timeout: 10000, // Should be fast if image is already pulled
+      });
+
+      const createdDate = new Date(output.trim());
+      if (isNaN(createdDate.getTime())) {
+        return undefined;
+      }
+
+      const now = new Date();
+      const ageMs = now.getTime() - createdDate.getTime();
+      const ageDays = Math.floor(ageMs / (1000 * 60 * 60 * 24));
+
+      if (ageDays < 1) {
+        return 'today';
+      } else if (ageDays < 7) {
+        return ageDays === 1 ? '1 day old' : `${ageDays} days old`;
+      } else if (ageDays < 30) {
+        const weeks = Math.floor(ageDays / 7);
+        return weeks === 1 ? '1 week old' : `${weeks} weeks old`;
+      } else if (ageDays < 365) {
+        const months = Math.floor(ageDays / 30);
+        return months === 1 ? '1 month old' : `${months} months old`;
+      } else {
+        const years = Math.floor(ageDays / 365);
+        return years === 1 ? '1 year old' : `${years} years old`;
+      }
+    } catch {
+      return undefined;
+    }
   }
 
   private isValidImageName(imageName: string): boolean {
@@ -553,24 +824,72 @@ Examples:
   private displayImageStatus(status: ImageCheckResult): void {
     if (this.config.quiet) return;
 
-    const trivySymbol = status.trivy.hasUpdate ? '↻' : status.trivy.isAvailable ? '✓' : '⬇';
-    const semgrepSymbol = status.semgrep.hasUpdate ? '↻' : status.semgrep.isAvailable ? '✓' : '⬇';
+    // Helper function to determine status symbol, size display, and message
+    const getImageDisplay = (imageStatus: ImageStatus) => {
+      const versionText = imageStatus.version ? ` v${imageStatus.version}` : '';
+      const ageText = imageStatus.age ? `, ${imageStatus.age}` : '';
 
-    const trivyText = status.trivy.hasUpdate
-      ? 'new version available'
-      : status.trivy.isAvailable
-        ? 'cached, up to date'
-        : 'not found, needs download';
+      if (!imageStatus.isAvailable) {
+        // Image not found locally but can be downloaded
+        return {
+          symbol: '[!]',
+          sizeDisplay: `${imageStatus.image.estimatedSize} to download`,
+          text: 'not found, needs download',
+        };
+      }
 
-    const semgrepText = status.semgrep.hasUpdate
-      ? 'new version available'
-      : status.semgrep.isAvailable
-        ? 'cached, up to date'
-        : 'not found, needs download';
+      if (!imageStatus.remoteDigest) {
+        // Registry check failed, using cached version - this is an error condition
+        return {
+          symbol: '[ERROR]',
+          sizeDisplay: `${imageStatus.image.estimatedSize} cached${ageText}`,
+          text: 'Registry check failed, using cached version',
+        };
+      }
 
-    console.log(`  ${trivySymbol} Trivy (${status.trivy.image.estimatedSize}): ${trivyText}`);
+      if (imageStatus.hasUpdate) {
+        // New version available - action recommended
+        // Show both current cached size and download size for full system visibility
+        const remoteAgeText = imageStatus.remoteAge ? `, ${imageStatus.remoteAge}` : '';
+
+        // Show remote version information with context
+        let updateText: string;
+        if (imageStatus.remoteVersion) {
+          if (imageStatus.version && imageStatus.version === imageStatus.remoteVersion) {
+            updateText = `v${imageStatus.remoteVersion} available (updated build)`;
+          } else {
+            updateText = `v${imageStatus.remoteVersion} available`;
+          }
+        } else {
+          updateText = 'new version available';
+        }
+
+        return {
+          symbol: '[!]',
+          sizeDisplay: `${imageStatus.image.estimatedSize} cached${ageText}`,
+          text: `${updateText} (${imageStatus.image.estimatedSize} to download${remoteAgeText})`,
+        };
+      }
+
+      // Everything up to date
+      return {
+        symbol: '[OK]',
+        sizeDisplay: `${imageStatus.image.estimatedSize} cached${ageText}`,
+        text: 'verified up to date',
+      };
+    };
+
+    const trivyDisplay = getImageDisplay(status.trivy);
+    const semgrepDisplay = getImageDisplay(status.semgrep);
+
+    const trivyVersionText = status.trivy.version ? ` v${status.trivy.version}` : '';
+    const semgrepVersionText = status.semgrep.version ? ` v${status.semgrep.version}` : '';
+
     console.log(
-      `  ${semgrepSymbol} Semgrep (${status.semgrep.image.estimatedSize}): ${semgrepText}`
+      `  ${trivyDisplay.symbol} Trivy${trivyVersionText} (${trivyDisplay.sizeDisplay}): ${trivyDisplay.text}`
+    );
+    console.log(
+      `  ${semgrepDisplay.symbol} Semgrep${semgrepVersionText} (${semgrepDisplay.sizeDisplay}): ${semgrepDisplay.text}`
     );
 
     // Show digests if requested
