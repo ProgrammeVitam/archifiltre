@@ -11,6 +11,7 @@ import Version from './version.ts';
 import Health from './health.ts';
 import Sbom from './sbom.ts';
 import Scan from './scan.ts';
+import ExposeDb from './expose-db.ts';
 
 /**
  * Explicit command registry for bundling
@@ -21,9 +22,10 @@ export const COMMANDS = {
   health: Health,
   sbom: Sbom,
   scan: Scan,
+  'expose-db': ExposeDb,
 } as const;
 
 /**
  * Export individual commands for direct access if needed
  */
-export { Version, Health, Sbom, Scan };
+export { Version, Health, Sbom, Scan, ExposeDb };

@@ -128,7 +128,7 @@ function getFilteredStats(
       connection.db
         .select({
           totalFiles: count(),
-          totalSize: sum(files.physical_size),
+          totalSize: sum(files.content_size),
         })
         .from(files)
         .where(and(...conditions))
