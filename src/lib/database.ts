@@ -357,6 +357,40 @@ export function getFilesNeedingHash(
 }
 
 /**
+ * Count real duplicate groups by hash
+ * Returns the number of hash groups that have duplicates (2+ files with same hash)
+ */
+export function countRealDuplicateGroups(
+  connection: DatabaseConnection,
+  runId: string
+): Observable<number> {
+  return defer(() => {
+    logger.debug('Counting real duplicate groups by hash', { runId });
+
+    return from(
+      connection.db
+        .select({
+          hash: files.hash,
+          fileCount: count(),
+        })
+        .from(files)
+        .where(and(eq(files.run_id, runId), isNotNull(files.hash)))
+        .groupBy(files.hash)
+        .having(sql`count(*) > 1`)
+    ).pipe(
+      map(results => results.length), // Count of hash groups with duplicates
+      tap(duplicateGroups =>
+        logger.debug('Real duplicate groups counted', { runId, duplicateGroups })
+      ),
+      catchError(error => {
+        logger.error('Failed to count real duplicate groups', error as Error, { runId });
+        return of(0);
+      })
+    );
+  });
+}
+
+/**
  * Get scan statistics
  */
 export function getScanStats(connection: DatabaseConnection, runId: string): Observable<ScanStats> {
@@ -499,6 +533,7 @@ export const dbOperations = {
   updateHash: updateFileHash,
   findDuplicateSizes,
   getFilesNeedingHash,
+  countRealDuplicates: countRealDuplicateGroups,
   getStats: getScanStats,
   getAllFiles,
   healthCheck: checkHealth,

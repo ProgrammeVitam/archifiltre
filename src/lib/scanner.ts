@@ -26,11 +26,14 @@ import { logger } from '@lib/logging.ts';
 import {
   cleanDatabase,
   insertFileBatch,
+  findDuplicateSizes,
+  countRealDuplicateGroups,
   type DatabaseConnection,
   type FileRow,
   files,
 } from '@lib/database.ts';
 import { ArchiveReader, libarchiveWasm } from 'libarchive-wasm';
+import { performHashing } from '@lib/hash-calculator.ts';
 
 // Archive Detection Constants
 const ARCHIVE_EXTENSIONS = new Set([
@@ -527,17 +530,34 @@ export function scanDirectory(
     // Phase 4: Prefilter after ingestion completes
     last(), // Wait for ingestion to complete
     switchMap(() => findDuplicateSizes(connection, config.runId)),
-    tap(duplicateSizeGroups => {
-      duplicateGroups = duplicateSizeGroups.length;
-      logger.debug('Prefilter found duplicate groups', {
-        duplicateGroups,
+    tap(duplicateSizes => {
+      logger.debug('Prefilter found potential duplicate sizes', {
+        duplicateSizeCount: duplicateSizes.length,
         runId: config.runId,
       });
-      progressCallback?.(`found ${duplicateGroups} potential duplicate groups`);
-      logger.debug('Prefilter completed', {
+      progressCallback?.(`found ${duplicateSizes.length} sizes with potential duplicates`);
+    }),
+
+    // Phase 5: Hash calculation for files with duplicate content_size
+    switchMap(() =>
+      performHashing(connection, config.runId, config.rootPath, (processed, total, errors) => {
+        if (processed % 100 === 0 || processed === total) {
+          const percentage = total > 0 ? ((processed / total) * 100).toFixed(1) : '0.0';
+          const status = `hashed ${processed.toLocaleString()}/${total.toLocaleString()} files (${percentage}%)`;
+          progressCallback?.(errors > 0 ? `${status}, ${errors} errors` : status);
+        }
+      })
+    ),
+
+    // Phase 6: Real duplicate detection by hash
+    switchMap(() => countRealDuplicateGroups(connection, config.runId)),
+    tap(realDuplicateGroups => {
+      duplicateGroups = realDuplicateGroups;
+      logger.debug('Real duplicate detection completed', {
+        duplicateGroups: realDuplicateGroups,
         runId: config.runId,
-        duplicateGroups,
       });
+      progressCallback?.(`found ${realDuplicateGroups} real duplicate groups`);
     }),
     map(() => ({
       phase: 'complete' as const,
@@ -550,7 +570,7 @@ export function scanDirectory(
       logger.error('Scan pipeline failed', error as Error, { runId: config.runId });
       throw error;
     })
-  );
+  ) as Observable<ScanResult>;
 }
 
 /**
@@ -697,42 +717,6 @@ function toFileRow(runId: string, entry: FileEntry): FileRow {
     archive_format: entry.archiveFormat,
     extraction_error: entry.extractionError,
   };
-}
-
-/**
- * Find file sizes that have multiple files (potential duplicates)
- * Only considers actual FILES, not directories
- */
-function findDuplicateSizes(connection: DatabaseConnection, runId: string): Observable<number[]> {
-  return from(
-    connection.db
-      .select({
-        size: files.content_size,
-        fileCount: count(),
-      })
-      .from(files)
-      .where(
-        and(
-          eq(files.run_id, runId),
-          eq(files.is_directory, false), // Only files, exclude directories
-          isNotNull(files.content_size) // Only files with content_size
-        )
-      )
-      .groupBy(files.content_size)
-      .having(gt(count(), 1)) // Only sizes with more than 1 file
-  ).pipe(
-    map(
-      results =>
-        results
-          .map(r => r.size)
-          .filter((s): s is number => s !== null)
-          .sort((a, b) => b - a) // Sort by size descending (largest files first)
-    ),
-    catchError(error => {
-      logger.error('Failed to find duplicate sizes', error as Error, { runId });
-      return from([[]]);
-    })
-  );
 }
 
 /**

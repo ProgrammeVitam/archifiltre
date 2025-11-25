@@ -79,6 +79,7 @@
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.3.8",
+    "@node-rs/xxhash": "^1.7.6",
     "@oclif/core": "^4.0.0",
     "@sentry/node": "^10.22.0",
     "ajv": "^8.17.1",
