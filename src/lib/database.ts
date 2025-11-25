@@ -20,14 +20,15 @@ import { logger } from '@lib/logging.ts';
 
 /**
  * Files table schema - includes ALL discovered items (files + directories)
- * for complete inventory with SQL-based analysis capabilities
+ * with physical_size (actual disk usage) and content_size (logical content for comparison)
  */
 export const files = pgTable(
   'files',
   {
     run_id: text('run_id').notNull(),
     path: text('path').notNull(),
-    size: integer('size').notNull(),
+    physical_size: integer('physical_size').notNull(), // Actual bytes on disk
+    content_size: integer('content_size'), // Logical content size for comparison
     mtime: integer('mtime').notNull(),
     is_directory: boolean('is_directory').notNull(),
     is_hidden: boolean('is_hidden').notNull(),
@@ -37,7 +38,8 @@ export const files = pgTable(
   table => ({
     pk: primaryKey({ columns: [table.run_id, table.path] }),
     runIdIdx: index('idx_files_run_id').on(table.run_id),
-    sizeIdx: index('idx_files_size').on(table.size),
+    physicalSizeIdx: index('idx_files_physical_size').on(table.physical_size),
+    contentSizeIdx: index('idx_files_content_size').on(table.content_size),
     hashIdx: index('idx_files_hash').on(table.hash),
   })
 );
@@ -54,7 +56,8 @@ export interface DatabaseConnection {
 
 export interface ScanStats {
   totalFiles: number;
-  totalSize: number;
+  totalPhysicalSize: number; // Renamed from totalSize
+  totalContentSize: number; // New - sum of content sizes
   duplicateGroups: number;
   duplicateFiles: number;
 }
@@ -80,7 +83,8 @@ async function initializeSchema(db: ReturnType<typeof drizzle>): Promise<void> {
       CREATE TABLE IF NOT EXISTS files (
         run_id TEXT NOT NULL,
         path TEXT NOT NULL,
-        size INTEGER NOT NULL,
+        physical_size INTEGER NOT NULL,
+        content_size INTEGER,
         mtime INTEGER NOT NULL,
         is_directory BOOLEAN NOT NULL,
         is_hidden BOOLEAN NOT NULL,
@@ -92,14 +96,19 @@ async function initializeSchema(db: ReturnType<typeof drizzle>): Promise<void> {
 
     // Create indexes for performance
     await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_files_run_id ON files (run_id)`);
-    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_files_size ON files (size)`);
+    await db.execute(
+      sql`CREATE INDEX IF NOT EXISTS idx_files_physical_size ON files (physical_size)`
+    );
+    await db.execute(
+      sql`CREATE INDEX IF NOT EXISTS idx_files_content_size ON files (content_size) WHERE content_size IS NOT NULL`
+    );
     await db.execute(
       sql`CREATE INDEX IF NOT EXISTS idx_files_hash ON files (hash) WHERE hash IS NOT NULL`
     );
     await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_files_hidden ON files (is_hidden)`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_files_system ON files (is_system)`);
 
-    logger.debug('Database schema initialized');
+    logger.debug('Database schema initialized with physical_size and content_size');
   } catch (error) {
     logger.error('Failed to initialize database schema', error as Error);
     throw error;
@@ -158,8 +167,6 @@ export function cleanDatabase(connection: DatabaseConnection, runId: string): Ob
       logger.debug('Closed existing database connection');
 
       // Recreate database with fresh schema
-      // Note: We don't know the original DB name, so we'll recreate with a default name
-      // This works because each scan typically uses a fresh database anyway
       const dbPath = './dbdata-main';
 
       // Delete existing database directory
@@ -255,27 +262,33 @@ export function updateFileHash(
 }
 
 /**
- * Find files with duplicate sizes (candidates for hash calculation)
+ * Find files with duplicate content sizes (candidates for hash calculation)
+ * Uses content_size for deduplication as per specification
  */
 export function findDuplicateSizes(
   connection: DatabaseConnection,
   runId: string
 ): Observable<number[]> {
   return defer(() => {
-    logger.debug('Finding duplicate sizes', { runId });
+    logger.debug('Finding duplicate content sizes', { runId });
 
     return from(
       connection.db
-        .select({ size: files.size })
+        .select({ size: files.content_size })
         .from(files)
-        .where(eq(files.run_id, runId))
-        .groupBy(files.size)
+        .where(
+          and(
+            eq(files.run_id, runId),
+            isNotNull(files.content_size) // Only files with content_size (excludes archives/directories)
+          )
+        )
+        .groupBy(files.content_size)
         .having(sql`count(*) > 1`)
     ).pipe(
-      map(results => results.map(r => r.size)),
-      tap(sizes => logger.debug('Found duplicate sizes', { count: sizes.length })),
+      map(results => results.map(r => r.size!).filter(s => s !== null)), // Filter out nulls and ensure number[]
+      tap(sizes => logger.debug('Found duplicate content sizes', { count: sizes.length })),
       catchError(error => {
-        logger.error('Failed to find duplicate sizes', error as Error, { runId });
+        logger.error('Failed to find duplicate content sizes', error as Error, { runId });
         return of([]);
       })
     );
@@ -283,7 +296,7 @@ export function findDuplicateSizes(
 }
 
 /**
- * Get files that need hashing
+ * Get files that need hashing (based on content_size duplicates)
  */
 export function getFilesNeedingHash(
   connection: DatabaseConnection,
@@ -298,7 +311,11 @@ export function getFilesNeedingHash(
         .select({ path: files.path })
         .from(files)
         .where(
-          and(eq(files.run_id, runId), isNull(files.hash), inArray(files.size, duplicateSizes))
+          and(
+            eq(files.run_id, runId),
+            isNull(files.hash),
+            inArray(files.content_size, duplicateSizes)
+          )
         )
     ).pipe(
       map(results => results.map(r => r.path)),
@@ -322,14 +339,16 @@ export function getScanStats(connection: DatabaseConnection, runId: string): Obs
       connection.db
         .select({
           totalFiles: count(),
-          totalSize: sum(files.size),
+          totalPhysicalSize: sum(files.physical_size),
+          totalContentSize: sum(files.content_size),
         })
         .from(files)
         .where(eq(files.run_id, runId))
     ).pipe(
       switchMap(basicStats => {
         const totalFiles = basicStats[0]?.totalFiles || 0;
-        const totalSize = Number(basicStats[0]?.totalSize) || 0;
+        const totalPhysicalSize = Number(basicStats[0]?.totalPhysicalSize) || 0;
+        const totalContentSize = Number(basicStats[0]?.totalContentSize) || 0;
 
         // Get duplicate stats
         return from(
@@ -352,7 +371,8 @@ export function getScanStats(connection: DatabaseConnection, runId: string): Obs
 
             return {
               totalFiles,
-              totalSize,
+              totalPhysicalSize,
+              totalContentSize,
               duplicateGroups: duplicateGroupsCount,
               duplicateFiles: duplicateFilesCount,
             };
@@ -363,7 +383,8 @@ export function getScanStats(connection: DatabaseConnection, runId: string): Obs
         logger.error('Failed to get scan statistics', error as Error, { runId });
         return of({
           totalFiles: 0,
-          totalSize: 0,
+          totalPhysicalSize: 0,
+          totalContentSize: 0,
           duplicateGroups: 0,
           duplicateFiles: 0,
         });

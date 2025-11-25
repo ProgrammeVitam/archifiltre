@@ -20,7 +20,7 @@ import {
   last,
   catchError,
 } from 'rxjs/operators';
-import { eq, and, count, gt } from 'drizzle-orm';
+import { eq, and, count, gt, isNotNull } from 'drizzle-orm';
 import { logger } from '@lib/logging.ts';
 import {
   cleanDatabase,
@@ -33,7 +33,8 @@ import {
 // Types
 export interface FileEntry {
   path: string;
-  size: number;
+  physical_size: number;
+  content_size: number | null;
   mtime: number;
   isDirectory: boolean;
   isHidden: boolean;
@@ -242,7 +243,8 @@ async function* walkFilesGenerator(
           // Yield directory for complete inventory with metadata
           yield {
             path: relativePath,
-            size: 0,
+            physical_size: 0,
+            content_size: null, // Directories don't have content_size
             mtime: 0,
             isDirectory: true,
             isHidden,
@@ -255,7 +257,8 @@ async function* walkFilesGenerator(
             // Yield file immediately with metadata for flexible filtering
             yield {
               path: relativePath,
-              size: stats.size,
+              physical_size: stats.size,
+              content_size: stats.size, // For regular files, content_size = physical_size
               mtime: Math.floor(stats.mtimeMs / 1000),
               isDirectory: false,
               isHidden,
@@ -285,7 +288,8 @@ function toFileRow(runId: string, entry: FileEntry): FileRow {
   return {
     run_id: runId,
     path: entry.path,
-    size: entry.size,
+    physical_size: entry.physical_size,
+    content_size: entry.content_size,
     mtime: entry.mtime,
     is_directory: entry.isDirectory,
     is_hidden: entry.isHidden,
@@ -302,21 +306,26 @@ function findDuplicateSizes(connection: DatabaseConnection, runId: string): Obse
   return from(
     connection.db
       .select({
-        size: files.size,
+        size: files.content_size,
         fileCount: count(),
       })
       .from(files)
       .where(
         and(
           eq(files.run_id, runId),
-          eq(files.is_directory, false) // Only files, exclude directories
+          eq(files.is_directory, false), // Only files, exclude directories
+          isNotNull(files.content_size) // Only files with content_size
         )
       )
-      .groupBy(files.size)
+      .groupBy(files.content_size)
       .having(gt(count(), 1)) // Only sizes with more than 1 file
   ).pipe(
     map(
-      results => results.map(r => r.size).sort((a, b) => b - a) // Sort by size descending (largest files first)
+      results =>
+        results
+          .map(r => r.size)
+          .filter((s): s is number => s !== null)
+          .sort((a, b) => b - a) // Sort by size descending (largest files first)
     ),
     catchError(error => {
       logger.error('Failed to find duplicate sizes', error as Error, { runId });

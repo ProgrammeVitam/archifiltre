@@ -7,7 +7,7 @@
 import { Command } from '@oclif/core';
 import { Observable, from, defer, of } from 'rxjs';
 import { map, catchError } from 'rxjs/operators';
-import { eq, and, count, sum, gt, sql } from 'drizzle-orm';
+import { eq, and, count, sum, gt, sql, isNotNull } from 'drizzle-orm';
 import { logger } from '@lib/logging.ts';
 import type { DatabaseConnection } from '@lib/database.ts';
 import { files } from '@lib/database.ts';
@@ -23,17 +23,18 @@ function getDuplicateStats(
     return from(
       connection.db
         .select({
-          size: files.size,
+          size: files.content_size,
           fileCount: count(),
         })
         .from(files)
         .where(
           and(
             eq(files.run_id, runId),
-            eq(files.is_directory, false) // Only files, exclude directories
+            eq(files.is_directory, false), // Only files, exclude directories
+            isNotNull(files.content_size) // Only files with content_size
           )
         )
-        .groupBy(files.size)
+        .groupBy(files.content_size)
         .having(gt(count(), 1)) // Only sizes with more than 1 file
     ).pipe(
       map(results => ({
@@ -126,7 +127,7 @@ function getFilteredStats(
       connection.db
         .select({
           totalFiles: count(),
-          totalSize: sum(files.size),
+          totalSize: sum(files.physical_size),
         })
         .from(files)
         .where(and(...conditions))
@@ -136,7 +137,7 @@ function getFilteredStats(
         totalSize: Number(results[0]?.totalSize) || 0,
       })),
       catchError(error => {
-        logger.error('Failed to get filtered statistics', error as Error, { runId, options });
+        logger.error('Failed to get filtered statistics', error as Error, { runId });
         return of({ totalFiles: 0, totalSize: 0 });
       })
     );
@@ -168,21 +169,29 @@ export async function summary(
       getDuplicateStats(database, runId).toPromise(),
     ]);
 
+    // Provide defaults for potentially undefined values
+    const safeStats = {
+      total: totalStats ?? { totalFiles: 0, totalSize: 0 },
+      user: userStats ?? { totalFiles: 0, totalSize: 0 },
+      folders: folderStats ?? { totalFolders: 0, emptyFolders: 0 },
+      duplicates: duplicateStats ?? { duplicateGroups: 0, totalDuplicateFiles: 0 },
+    };
+
     // Display summary in priority order
     cli.log('');
     cli.log('Scan completed.');
-    cli.log(`  Files discovered: ${totalStats.totalFiles.toLocaleString()}`);
+    cli.log(`  Files discovered: ${safeStats.total.totalFiles.toLocaleString()}`);
 
-    if (duplicateStats.duplicateGroups > 0) {
+    if (safeStats.duplicates.duplicateGroups > 0) {
       cli.log(
-        `  Potential duplicates: ${duplicateStats.totalDuplicateFiles.toLocaleString()} files in ${duplicateStats.duplicateGroups.toLocaleString()} groups`
+        `  Potential duplicates: ${safeStats.duplicates.totalDuplicateFiles.toLocaleString()} files in ${safeStats.duplicates.duplicateGroups.toLocaleString()} groups`
       );
     }
 
-    cli.log(`  Folders: ${folderStats.totalFolders.toLocaleString()}`);
-    cli.log(`  Empty folders: ${folderStats.emptyFolders.toLocaleString()}`);
+    cli.log(`  Folders: ${safeStats.folders.totalFolders.toLocaleString()}`);
+    cli.log(`  Empty folders: ${safeStats.folders.emptyFolders.toLocaleString()}`);
 
-    const hiddenFiles = totalStats.totalFiles - userStats.totalFiles;
+    const hiddenFiles = safeStats.total.totalFiles - safeStats.user.totalFiles;
     if (hiddenFiles > 0) {
       cli.log(`  Hidden files: ${hiddenFiles.toLocaleString()}`);
     }
