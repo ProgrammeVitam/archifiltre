@@ -9,7 +9,7 @@
 
 import * as path from 'node:path';
 import { promises as fsp } from 'node:fs';
-import { Observable, from } from 'rxjs';
+import { Observable, from, of } from 'rxjs';
 import {
   tap,
   map,
@@ -19,6 +19,7 @@ import {
   switchMap,
   last,
   catchError,
+  mergeMap,
 } from 'rxjs/operators';
 import { eq, and, count, gt, isNotNull } from 'drizzle-orm';
 import { logger } from '@lib/logging.ts';
@@ -29,6 +30,346 @@ import {
   type FileRow,
   files,
 } from '@lib/database.ts';
+import { ArchiveReader, libarchiveWasm } from 'libarchive-wasm';
+
+// Archive Detection Constants
+const ARCHIVE_EXTENSIONS = new Set([
+  '.zip',
+  '.jar',
+  '.war',
+  '.ear',
+  '.apk',
+  '.7z',
+  '.rar',
+  '.tar',
+  '.tar.gz',
+  '.tgz',
+  '.tar.bz2',
+  '.tbz2',
+  '.tar.xz',
+  '.txz',
+  '.gz',
+  '.bz2',
+  '.xz',
+  '.lz4',
+  '.lzma',
+  '.cab',
+  '.iso',
+  '.dmg',
+]);
+
+const ARCHIVE_MAGIC_NUMBERS = new Map([
+  // ZIP family
+  [new Uint8Array([0x50, 0x4b, 0x03, 0x04]), 'zip'], // Standard ZIP
+  [new Uint8Array([0x50, 0x4b, 0x05, 0x06]), 'zip'], // Empty ZIP
+  [new Uint8Array([0x50, 0x4b, 0x07, 0x08]), 'zip'], // Spanned ZIP
+  // 7-Zip
+  [new Uint8Array([0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]), '7z'],
+  // RAR
+  [new Uint8Array([0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00]), 'rar'], // RAR 4.x
+  [new Uint8Array([0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x01, 0x00]), 'rar'], // RAR 5.x
+  // TAR (POSIX)
+  [new Uint8Array([0x75, 0x73, 0x74, 0x61, 0x72, 0x00, 0x30, 0x30]), 'tar'],
+  [new Uint8Array([0x75, 0x73, 0x74, 0x61, 0x72, 0x20, 0x20, 0x00]), 'tar'],
+  // GZIP
+  [new Uint8Array([0x1f, 0x8b]), 'gz'],
+  // BZIP2
+  [new Uint8Array([0x42, 0x5a, 0x68]), 'bz2'],
+  // XZ
+  [new Uint8Array([0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00]), 'xz'],
+]);
+
+// Archive Detection Functions
+/**
+ * Check if a file is an archive based on extension
+ */
+function isArchiveByExtension(filePath: string): boolean {
+  const ext = path.extname(filePath).toLowerCase();
+  return ARCHIVE_EXTENSIONS.has(ext);
+}
+
+/**
+ * Check if file content matches archive magic numbers
+ * Reads only the first 16 bytes for efficiency
+ */
+async function isArchiveByMagicNumber(
+  filePath: string
+): Promise<{ isArchive: boolean; format?: string }> {
+  try {
+    const absolutePath = path.resolve(filePath);
+    const fd = await fsp.open(absolutePath, 'r');
+    const buffer = Buffer.alloc(16);
+    const { bytesRead } = await fd.read(buffer, 0, 16, 0);
+    await fd.close();
+
+    if (bytesRead === 0) {
+      return { isArchive: false };
+    }
+
+    const fileHeader = new Uint8Array(buffer.subarray(0, bytesRead));
+
+    // Check each magic number pattern
+    for (const [magicBytes, format] of ARCHIVE_MAGIC_NUMBERS.entries()) {
+      if (fileHeader.length >= magicBytes.length) {
+        const matches = magicBytes.every((byte, index) => fileHeader[index] === byte);
+        if (matches) {
+          return { isArchive: true, format };
+        }
+      }
+    }
+
+    return { isArchive: false };
+  } catch (error) {
+    logger.debug('Failed to read magic number', { filePath, error: (error as Error).message });
+    return { isArchive: false };
+  }
+}
+
+/**
+ * Comprehensive archive detection combining extension and magic number checks
+ */
+export async function isArchiveFile(
+  filePath: string
+): Promise<{ isArchive: boolean; format?: string }> {
+  // Quick check by extension first
+  if (isArchiveByExtension(filePath)) {
+    const ext = path.extname(filePath).toLowerCase().slice(1); // Remove dot
+
+    // For common extensions, trust the extension
+    if (['zip', 'jar', 'war', 'ear', 'apk', '7z', 'rar', 'tar'].includes(ext)) {
+      return { isArchive: true, format: ext };
+    }
+
+    // For compressed files, verify with magic number
+    const magicCheck = await isArchiveByMagicNumber(filePath);
+    if (magicCheck.isArchive) {
+      return magicCheck;
+    }
+
+    // Extension suggests archive but magic number doesn't confirm - trust extension
+    return { isArchive: true, format: ext };
+  }
+
+  // Extension doesn't suggest archive, but check magic number for misnamed files
+  return await isArchiveByMagicNumber(filePath);
+}
+
+// Archive Processing Configuration
+interface ArchiveProcessingConfig {
+  maxDepth: number;
+  maxArchiveSize: number; // in bytes
+  timeoutMs: number;
+  enableNesting: boolean;
+}
+
+const DEFAULT_ARCHIVE_CONFIG: ArchiveProcessingConfig = {
+  maxDepth: 3,
+  maxArchiveSize: 100 * 1024 * 1024, // 100MB
+  timeoutMs: 30000, // 30 seconds
+  enableNesting: true,
+};
+
+/**
+ * Get archive processing configuration from scan config
+ */
+function getArchiveConfig(scanConfig: ScanConfig): ArchiveProcessingConfig {
+  return {
+    maxDepth: scanConfig.maxArchiveDepth ?? DEFAULT_ARCHIVE_CONFIG.maxDepth,
+    maxArchiveSize: scanConfig.maxArchiveSize ?? DEFAULT_ARCHIVE_CONFIG.maxArchiveSize,
+    timeoutMs: scanConfig.archiveTimeoutMs ?? DEFAULT_ARCHIVE_CONFIG.timeoutMs,
+    enableNesting: scanConfig.enableArchiveNesting ?? DEFAULT_ARCHIVE_CONFIG.enableNesting,
+  };
+}
+
+/**
+ * Process archive file and extract metadata for all entries
+ */
+async function processArchiveEntries(
+  archivePath: string,
+  rootPath: string,
+  entry: FileEntry,
+  config: ArchiveProcessingConfig = DEFAULT_ARCHIVE_CONFIG
+): Promise<FileEntry[]> {
+  const results: FileEntry[] = [];
+
+  // Add the archive container itself (with content_size = null as per spec)
+  const archiveContainer: FileEntry = {
+    ...entry,
+    isArchiveContainer: true,
+    content_size: null, // Archive containers have no content_size per spec
+    archiveFormat: entry.archiveFormat,
+    extractionError: null,
+  };
+  results.push(archiveContainer);
+
+  // Check size limits
+  if (entry.physical_size > config.maxArchiveSize) {
+    logger.debug('Archive exceeds size limit, skipping processing', {
+      path: archivePath,
+      size: entry.physical_size,
+      limit: config.maxArchiveSize,
+    });
+
+    archiveContainer.extractionError = `Archive too large (${entry.physical_size} bytes > ${config.maxArchiveSize} bytes)`;
+    return results;
+  }
+
+  // Check depth limits
+  if (entry.archiveDepth >= config.maxDepth) {
+    logger.debug('Archive exceeds depth limit, skipping processing', {
+      path: archivePath,
+      depth: entry.archiveDepth,
+      limit: config.maxDepth,
+    });
+
+    archiveContainer.extractionError = `Archive nesting too deep (depth ${entry.archiveDepth} >= ${config.maxDepth})`;
+    return results;
+  }
+
+  try {
+    const absolutePath = path.resolve(rootPath, archivePath);
+    const archiveBuffer = await fsp.readFile(absolutePath);
+
+    // Initialize libarchive WASM
+    const mod = await libarchiveWasm();
+    const reader = new ArchiveReader(mod, new Int8Array(archiveBuffer));
+
+    let entryCount = 0;
+    const maxEntries = 10000; // Prevent memory exhaustion
+
+    try {
+      for (const archiveEntry of reader.entries()) {
+        if (entryCount >= maxEntries) {
+          logger.warn('Archive has too many entries, stopping processing', {
+            path: archivePath,
+            processedEntries: entryCount,
+            limit: maxEntries,
+          });
+          break;
+        }
+
+        if (archiveEntry && typeof archiveEntry.getPathname === 'function') {
+          const entryPath = archiveEntry.getPathname();
+          const size = archiveEntry.getSize() || 0;
+          const filetype = archiveEntry.getFiletype?.() || 'File';
+          const isDirectory = filetype === 'Directory' || entryPath.endsWith('/');
+          const modTime = archiveEntry.getModificationTime?.() || 0;
+
+          // Create relative path: archive.zip/path/to/file.txt
+          const relativePath = `${entry.path}/${entryPath}`;
+
+          const archiveFileEntry: FileEntry = {
+            path: relativePath,
+            physical_size: 0, // Files within archives have no physical footprint
+            content_size: isDirectory ? null : size, // Decompressed size for files, null for directories
+            mtime: modTime > 0 ? Math.floor(modTime / 1000) : entry.mtime,
+            isDirectory,
+            isHidden: false, // Archive entries are not considered hidden
+            isSystem: false, // Archive entries are not considered system files
+            isArchiveContainer: false,
+            archiveParentPath: entry.path,
+            archiveDepth: entry.archiveDepth + 1,
+            archiveFormat: entry.archiveFormat,
+            extractionError: null,
+          };
+
+          results.push(archiveFileEntry);
+          entryCount++;
+
+          // If this entry is also an archive and nesting is enabled, process it recursively
+          if (!isDirectory && config.enableNesting && entry.archiveDepth + 1 < config.maxDepth) {
+            const archiveCheck = await isArchiveFile(entryPath);
+            if (archiveCheck.isArchive) {
+              // Note: We can't process nested archives from memory easily with libarchive-wasm
+              // So we'll just mark them as archive containers but not process their contents
+              archiveFileEntry.isArchiveContainer = true;
+              archiveFileEntry.content_size = null;
+              archiveFileEntry.archiveFormat = archiveCheck.format || 'unknown';
+
+              logger.debug('Found nested archive (marked but not processed)', {
+                path: relativePath,
+                format: archiveCheck.format,
+                depth: entry.archiveDepth + 1,
+              });
+            }
+          }
+        }
+      }
+    } finally {
+      reader.free();
+    }
+
+    logger.debug('Archive processing completed', {
+      path: archivePath,
+      entriesFound: entryCount,
+      format: entry.archiveFormat,
+    });
+  } catch (error) {
+    logger.error('Failed to process archive', error as Error, {
+      path: archivePath,
+      format: entry.archiveFormat,
+    });
+
+    archiveContainer.extractionError = `Processing failed: ${(error as Error).message}`;
+  }
+
+  return results;
+}
+
+/**
+ * Process a file entry and determine if it's an archive that needs processing
+ */
+function processFileEntry(
+  rootPath: string,
+  entry: FileEntry,
+  config: ArchiveProcessingConfig
+): Observable<FileEntry[]> {
+  return from(
+    (async () => {
+      // Skip directories and files that are already marked as archive containers
+      if (entry.isDirectory || entry.isArchiveContainer) {
+        return [entry];
+      }
+
+      // Check if this is an archive file
+      const absolutePath = path.resolve(rootPath, entry.path);
+      const archiveCheck = await isArchiveFile(absolutePath);
+
+      if (archiveCheck.isArchive) {
+        logger.debug('Processing archive file', {
+          path: entry.path,
+          format: archiveCheck.format,
+          size: entry.physical_size,
+        });
+
+        // Update entry with archive information
+        const archiveEntry: FileEntry = {
+          ...entry,
+          archiveFormat: archiveCheck.format || 'unknown',
+        };
+
+        // Process the archive and return all entries (container + contents)
+        return await processArchiveEntries(entry.path, rootPath, archiveEntry, config);
+      }
+
+      // Regular file, return as-is
+      return [entry];
+    })()
+  ).pipe(
+    catchError(error => {
+      logger.error('Failed to process file entry', error as Error, {
+        path: entry.path,
+      });
+
+      // Return the original entry with error information
+      const errorEntry: FileEntry = {
+        ...entry,
+        extractionError: `File processing failed: ${(error as Error).message}`,
+      };
+      return of([errorEntry]);
+    })
+  );
+}
 
 // Types
 export interface FileEntry {
@@ -39,6 +380,12 @@ export interface FileEntry {
   isDirectory: boolean;
   isHidden: boolean;
   isSystem: boolean;
+  // Archive preprocessing fields
+  isArchiveContainer: boolean;
+  archiveParentPath: string | null;
+  archiveDepth: number;
+  archiveFormat: string | null;
+  extractionError: string | null;
 }
 
 export interface ScanConfig {
@@ -46,6 +393,12 @@ export interface ScanConfig {
   runId: string;
   includeHidden?: boolean; // Legacy parameter - all files are now cataloged with metadata flags
   batchSize?: number;
+  // Archive preprocessing options
+  enableArchiveProcessing?: boolean;
+  maxArchiveDepth?: number;
+  maxArchiveSize?: number; // in bytes
+  archiveTimeoutMs?: number;
+  enableArchiveNesting?: boolean;
 }
 
 export interface ScanResult {
@@ -89,6 +442,39 @@ export function scanDirectory(
               runId: config.runId,
             });
             progressCallback?.(`found ${filesDiscovered.toLocaleString()} files`);
+          }
+        }),
+
+        // NEW: Archive preprocessing step (only if enabled)
+        mergeMap(entry => {
+          if (config.enableArchiveProcessing !== false) {
+            // Default to enabled
+            const archiveConfig = getArchiveConfig(config);
+            return processFileEntry(config.rootPath, entry, archiveConfig);
+          }
+          return of([entry]);
+        }, 3), // Process up to 3 archives concurrently
+
+        // Flatten the array of entries (each file might become multiple entries if it's an archive)
+        mergeMap(entries => from(entries)),
+
+        // Update progress accounting for archive entries
+        tap(entry => {
+          // Only count entries that weren't counted in the initial discovery
+          if (entry.archiveParentPath) {
+            filesDiscovered++;
+
+            // Update progress every 100 archive entries
+            if (filesDiscovered % 100 === 0) {
+              logger.debug('Archive entries discovered', {
+                totalDiscovered: filesDiscovered,
+                archiveEntry: entry.path,
+                runId: config.runId,
+              });
+              progressCallback?.(
+                `found ${filesDiscovered.toLocaleString()} files (including archive contents)`
+              );
+            }
           }
         }),
 
@@ -249,6 +635,11 @@ async function* walkFilesGenerator(
             isDirectory: true,
             isHidden,
             isSystem,
+            isArchiveContainer: false,
+            archiveParentPath: null,
+            archiveDepth: 0,
+            archiveFormat: null,
+            extractionError: null,
           };
         } else if (entry.isFile()) {
           try {
@@ -258,11 +649,16 @@ async function* walkFilesGenerator(
             yield {
               path: relativePath,
               physical_size: stats.size,
-              content_size: stats.size, // For regular files, content_size = physical_size
+              content_size: stats.size, // For regular files, content_size = physical_size (will be updated for archives)
               mtime: Math.floor(stats.mtimeMs / 1000),
               isDirectory: false,
               isHidden,
               isSystem,
+              isArchiveContainer: false, // Will be updated during archive processing
+              archiveParentPath: null,
+              archiveDepth: 0,
+              archiveFormat: null,
+              extractionError: null,
             };
           } catch (error) {
             logger.warn('Cannot access file', {
@@ -295,6 +691,11 @@ function toFileRow(runId: string, entry: FileEntry): FileRow {
     is_hidden: entry.isHidden,
     is_system: entry.isSystem,
     hash: null, // Hash calculated later if needed
+    is_archive_container: entry.isArchiveContainer,
+    archive_parent_path: entry.archiveParentPath,
+    archive_depth: entry.archiveDepth,
+    archive_format: entry.archiveFormat,
+    extraction_error: entry.extractionError,
   };
 }
 

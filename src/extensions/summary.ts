@@ -7,6 +7,7 @@
 import { Command } from '@oclif/core';
 import { Observable, from, defer, of } from 'rxjs';
 import { map, catchError } from 'rxjs/operators';
+import { getScanStats } from '@lib/database.ts';
 import { eq, and, count, sum, gt, sql, isNotNull } from 'drizzle-orm';
 import { logger } from '@lib/logging.ts';
 import type { DatabaseConnection } from '@lib/database.ts';
@@ -154,7 +155,7 @@ export async function summary(
 ): Promise<void> {
   try {
     // Get all statistics from database
-    const [totalStats, userStats, folderStats, duplicateStats] = await Promise.all([
+    const [totalStats, userStats, folderStats, duplicateStats, scanStats] = await Promise.all([
       getFilteredStats(database, runId, {
         includeHidden: true,
         includeSystem: true,
@@ -167,6 +168,7 @@ export async function summary(
       }).toPromise(),
       getFolderStats(database, runId).toPromise(),
       getDuplicateStats(database, runId).toPromise(),
+      getScanStats(database, runId).toPromise(),
     ]);
 
     // Provide defaults for potentially undefined values
@@ -175,6 +177,16 @@ export async function summary(
       user: userStats ?? { totalFiles: 0, totalSize: 0 },
       folders: folderStats ?? { totalFolders: 0, emptyFolders: 0 },
       duplicates: duplicateStats ?? { duplicateGroups: 0, totalDuplicateFiles: 0 },
+      scan: scanStats ?? {
+        totalFiles: 0,
+        totalPhysicalSize: 0,
+        totalContentSize: 0,
+        duplicateGroups: 0,
+        duplicateFiles: 0,
+        totalArchives: 0,
+        totalArchiveEntries: 0,
+        archiveFormats: [],
+      },
     };
 
     // Display summary in priority order
@@ -190,6 +202,16 @@ export async function summary(
 
     cli.log(`  Folders: ${safeStats.folders.totalFolders.toLocaleString()}`);
     cli.log(`  Empty folders: ${safeStats.folders.emptyFolders.toLocaleString()}`);
+
+    // Show archive statistics if any archives were found
+    if (safeStats.scan.totalArchives > 0) {
+      cli.log(`  Archives: ${safeStats.scan.totalArchives.toLocaleString()}`);
+      cli.log(`  Archive entries: ${safeStats.scan.totalArchiveEntries.toLocaleString()}`);
+
+      if (safeStats.scan.archiveFormats.length > 0) {
+        cli.log(`  Archive formats: ${safeStats.scan.archiveFormats.join(', ')}`);
+      }
+    }
 
     const hiddenFiles = safeStats.total.totalFiles - safeStats.user.totalFiles;
     if (hiddenFiles > 0) {

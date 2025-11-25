@@ -25,8 +25,8 @@ export default class Scan extends Command {
   static override examples = [
     '<%= config.bin %> <%= command.id %> /path/to/scan',
     '<%= config.bin %> <%= command.id %> ~/Documents --include-hidden',
-    '<%= config.bin %> <%= command.id %> /data --batch-size 2000',
-    '<%= config.bin %> <%= command.id %> /files --db custom-scan',
+    '<%= config.bin %> <%= command.id %> /data --batch-size 2000 --disable-archives',
+    '<%= config.bin %> <%= command.id %> /files --db custom-scan --max-archive-depth 5',
   ];
 
   static override flags = {
@@ -59,6 +59,32 @@ export default class Scan extends Command {
     }),
     'no-color': Flags.boolean({
       description: 'Disable colored output',
+      default: false,
+    }),
+    'disable-archives': Flags.boolean({
+      description: 'Disable archive processing (archives will be treated as regular files)',
+      default: false,
+    }),
+    'max-archive-depth': Flags.integer({
+      description: 'Maximum depth for nested archives',
+      default: 3,
+      min: 1,
+      max: 10,
+    }),
+    'max-archive-size': Flags.integer({
+      description: 'Maximum archive size in MB for processing',
+      default: 100,
+      min: 1,
+      max: 1000,
+    }),
+    'archive-timeout': Flags.integer({
+      description: 'Timeout for archive processing in seconds',
+      default: 30,
+      min: 5,
+      max: 300,
+    }),
+    'disable-archive-nesting': Flags.boolean({
+      description: 'Disable processing of archives within archives',
       default: false,
     }),
   };
@@ -98,6 +124,11 @@ export default class Scan extends Command {
         runId,
         includeHidden: flags['include-hidden'],
         batchSize: flags['batch-size'],
+        enableArchiveProcessing: !flags['disable-archives'],
+        maxArchiveDepth: flags['max-archive-depth'],
+        maxArchiveSize: flags['max-archive-size'] * 1024 * 1024, // Convert MB to bytes
+        archiveTimeoutMs: flags['archive-timeout'] * 1000, // Convert seconds to milliseconds
+        enableArchiveNesting: !flags['disable-archive-nesting'],
       };
 
       // Start scanning with clean oclif action

@@ -34,6 +34,12 @@ export const files = pgTable(
     is_hidden: boolean('is_hidden').notNull(),
     is_system: boolean('is_system').notNull(),
     hash: text('hash'), // Only files get hashed, directories remain NULL
+    // Archive preprocessing fields
+    is_archive_container: boolean('is_archive_container').default(false),
+    archive_parent_path: text('archive_parent_path'), // Path to parent archive if nested
+    archive_depth: integer('archive_depth').default(0), // Nesting level (0 = root level)
+    archive_format: text('archive_format'), // 'zip', 'tar', '7z', etc.
+    extraction_error: text('extraction_error'), // Error message if archive processing failed
   },
   table => ({
     pk: primaryKey({ columns: [table.run_id, table.path] }),
@@ -41,6 +47,9 @@ export const files = pgTable(
     physicalSizeIdx: index('idx_files_physical_size').on(table.physical_size),
     contentSizeIdx: index('idx_files_content_size').on(table.content_size),
     hashIdx: index('idx_files_hash').on(table.hash),
+    archiveContainerIdx: index('idx_files_archive_container').on(table.is_archive_container),
+    archiveParentIdx: index('idx_files_archive_parent').on(table.archive_parent_path),
+    archiveDepthIdx: index('idx_files_archive_depth').on(table.archive_depth),
   })
 );
 
@@ -60,6 +69,10 @@ export interface ScanStats {
   totalContentSize: number; // New - sum of content sizes
   duplicateGroups: number;
   duplicateFiles: number;
+  // Archive statistics
+  totalArchives: number; // Number of archive containers
+  totalArchiveEntries: number; // Number of files within archives
+  archiveFormats: string[]; // List of archive formats found
 }
 
 // === Database Management ===
@@ -90,6 +103,11 @@ async function initializeSchema(db: ReturnType<typeof drizzle>): Promise<void> {
         is_hidden BOOLEAN NOT NULL,
         is_system BOOLEAN NOT NULL,
         hash TEXT,
+        is_archive_container BOOLEAN DEFAULT FALSE,
+        archive_parent_path TEXT,
+        archive_depth INTEGER DEFAULT 0,
+        archive_format TEXT,
+        extraction_error TEXT,
         CONSTRAINT files_pkey PRIMARY KEY (run_id, path)
       )
     `);
@@ -107,8 +125,19 @@ async function initializeSchema(db: ReturnType<typeof drizzle>): Promise<void> {
     );
     await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_files_hidden ON files (is_hidden)`);
     await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_files_system ON files (is_system)`);
+    await db.execute(
+      sql`CREATE INDEX IF NOT EXISTS idx_files_archive_container ON files (is_archive_container)`
+    );
+    await db.execute(
+      sql`CREATE INDEX IF NOT EXISTS idx_files_archive_parent ON files (archive_parent_path) WHERE archive_parent_path IS NOT NULL`
+    );
+    await db.execute(
+      sql`CREATE INDEX IF NOT EXISTS idx_files_archive_depth ON files (archive_depth)`
+    );
 
-    logger.debug('Database schema initialized with physical_size and content_size');
+    logger.debug(
+      'Database schema initialized with physical_size, content_size, and archive preprocessing fields'
+    );
   } catch (error) {
     logger.error('Failed to initialize database schema', error as Error);
     throw error;
@@ -350,24 +379,48 @@ export function getScanStats(connection: DatabaseConnection, runId: string): Obs
         const totalPhysicalSize = Number(basicStats[0]?.totalPhysicalSize) || 0;
         const totalContentSize = Number(basicStats[0]?.totalContentSize) || 0;
 
+        // Get archive stats
+        const archiveStatsQuery = connection.db
+          .select({
+            totalArchives: count(),
+            archiveFormats: sql<
+              string[]
+            >`array_agg(DISTINCT archive_format) FILTER (WHERE archive_format IS NOT NULL)`,
+          })
+          .from(files)
+          .where(and(eq(files.run_id, runId), eq(files.is_archive_container, true)));
+
+        const archiveEntriesQuery = connection.db
+          .select({
+            totalArchiveEntries: count(),
+          })
+          .from(files)
+          .where(and(eq(files.run_id, runId), isNotNull(files.archive_parent_path)));
+
         // Get duplicate stats
+        const duplicateStatsQuery = connection.db
+          .select({
+            hash: files.hash,
+            fileCount: count(),
+          })
+          .from(files)
+          .where(and(eq(files.run_id, runId), isNotNull(files.hash)))
+          .groupBy(files.hash)
+          .having(sql`count(*) > 1`);
+
         return from(
-          connection.db
-            .select({
-              hash: files.hash,
-              fileCount: count(),
-            })
-            .from(files)
-            .where(and(eq(files.run_id, runId), isNotNull(files.hash)))
-            .groupBy(files.hash)
-            .having(sql`count(*) > 1`)
+          Promise.all([archiveStatsQuery, archiveEntriesQuery, duplicateStatsQuery])
         ).pipe(
-          map(duplicateGroups => {
+          map(([archiveStats, archiveEntriesStats, duplicateGroups]) => {
             const duplicateGroupsCount = duplicateGroups.length;
             const duplicateFilesCount = duplicateGroups.reduce(
               (sum, group) => sum + (group.fileCount || 0),
               0
             );
+
+            const totalArchives = archiveStats[0]?.totalArchives || 0;
+            const totalArchiveEntries = archiveEntriesStats[0]?.totalArchiveEntries || 0;
+            const archiveFormats = archiveStats[0]?.archiveFormats || [];
 
             return {
               totalFiles,
@@ -375,6 +428,9 @@ export function getScanStats(connection: DatabaseConnection, runId: string): Obs
               totalContentSize,
               duplicateGroups: duplicateGroupsCount,
               duplicateFiles: duplicateFilesCount,
+              totalArchives,
+              totalArchiveEntries,
+              archiveFormats: archiveFormats.filter(f => f !== null),
             };
           })
         );
@@ -387,6 +443,9 @@ export function getScanStats(connection: DatabaseConnection, runId: string): Obs
           totalContentSize: 0,
           duplicateGroups: 0,
           duplicateFiles: 0,
+          totalArchives: 0,
+          totalArchiveEntries: 0,
+          archiveFormats: [],
         });
       })
     );

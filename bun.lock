@@ -11,6 +11,7 @@
         "bottleneck": "^2.19.5",
         "drizzle-orm": "^0.44.5",
         "js-yaml": "^4.1.0",
+        "libarchive-wasm": "^1.2.0",
         "posthog-node": "^5.10.3",
         "reflect-metadata": "^0.2.2",
         "rxjs": "^7.8.2",
@@ -545,6 +546,8 @@
     "kuler": ["kuler@2.0.0", "", {}, "sha512-Xq9nH7KlWZmXAtodXDDRE7vs6DU1gTU8zYDHDiWLSip45Egwq3plLHzPn27NgvzL2r1LMPC1vdqh98sQxtqj4A=="],
 
     "levn": ["levn@0.4.1", "", { "dependencies": { "prelude-ls": "^1.2.1", "type-check": "~0.4.0" } }, "sha512-+bT2uH4E5LGE7h/n3evcS/sQlJXCpIp6ym8OWJ5eV6+67Dsql/LaaT7qJBAt2rzfoa/5QBGBhxDix1dMt2kQKQ=="],
+
+    "libarchive-wasm": ["libarchive-wasm@1.2.0", "", {}, "sha512-aunFn8oL9VwGRj+brRvdOv8BRUD4Ea1WxJW45IdiuXE2Vp/m/X+M1UxSU+yPzXfc1mPPC8AARaflg/CtF11u8g=="],
 
     "lilconfig": ["lilconfig@3.1.3", "", {}, "sha512-/vlFKAoH5Cgt3Ie+JLhRbwOsCQePABiU3tJ1egGvyQ+33R/vcwM2Zl2QR/LzjsBeItPt3oSVXapn+m4nQDvpzw=="],
 
