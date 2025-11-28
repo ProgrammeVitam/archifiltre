@@ -113,8 +113,6 @@ export default class Scan extends Command {
       const rootPath = pathValidation.resolvedPath!;
       const runId = flags['run-id'] || generateRunId();
 
-      this.log(`Scanning ${rootPath}`);
-
       // Create database connection
       database = await createScanDatabase(flags.db);
 
