@@ -1,12 +1,15 @@
 /**
- * Hash Calculator - Streaming xxHash64 Implementation
+ * Hash Calculator - Archive-Aware Streaming xxHash64 Implementation
  *
  * Calculates xxhash64 hashes for files with duplicate content_size using streaming processing.
- * Uses bounded memory regardless of dataset size - critical for 10M+ file scans.
+ * Supports on-demand archive extraction for comprehensive duplicate detection across
+ * regular files and archive contents. Uses bounded memory regardless of dataset size.
  *
  * Key design principles:
  * - Never load all file paths into memory (unlike Archiscan)
  * - Uses content_size for prefiltering (not physical_size)
+ * - Archive-aware: extracts content on-demand from ZIP, TAR, 7Z, etc.
+ * - Cross-platform path normalization for Windows/Unix compatibility
  * - Pure RxJS Observable pipeline for integration
  * - Batch processing with controlled concurrency
  * - Database as source of truth for all operations
@@ -15,7 +18,7 @@
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { promises as fs } from 'node:fs';
-import { Observable, from, of, EMPTY, defer, range } from 'rxjs';
+import { Observable, from, of, defer, range } from 'rxjs';
 import {
   switchMap,
   mergeMap,
@@ -25,16 +28,21 @@ import {
   filter,
   catchError,
   finalize,
-  take,
-  expand,
   scan,
   last,
 } from 'rxjs/operators';
 import { xxh64 } from '@node-rs/xxhash';
+import { ArchiveReader, libarchiveWasm } from 'libarchive-wasm';
 import { logger } from '@lib/logging.ts';
 import type { DatabaseConnection } from '@lib/database.ts';
-import { findDuplicateSizes, getFilesNeedingHash, updateFileHash, files } from '@lib/database.ts';
+import { findDuplicateSizes, files } from '@lib/database.ts';
 import { eq, and, count, isNull, inArray, sql } from 'drizzle-orm';
+import {
+  normalizePath,
+  toSystemPath,
+  getArchiveRelativePath,
+  pathEquals,
+} from '@lib/path-utils.ts';
 
 // Hash calculation configuration
 export interface HashConfig {
@@ -58,6 +66,13 @@ export interface HashUpdate {
   hash: string;
 }
 
+// File entry for hashing with archive metadata
+export interface FileHashEntry {
+  path: string;
+  archiveParentPath?: string;
+  archiveFormat?: string;
+}
+
 /**
  * Default hashing configuration
  */
@@ -67,35 +82,113 @@ export const DEFAULT_HASH_CONFIG: Required<Omit<HashConfig, 'onProgress'>> = {
 };
 
 /**
- * Calculate xxhash64 for a single file
+ * Calculate xxhash64 for a buffer
  * Uses @node-rs/xxhash for optimal performance with buffer-based hashing
  */
-async function calculateFileHash(filePath: string): Promise<string> {
-  const buffer = await fs.readFile(filePath);
+function calculateBufferHash(buffer: Uint8Array): string {
   const hash = xxh64(buffer);
   // Convert BigInt to hex string with consistent 16-character padding
   return hash.toString(16).padStart(16, '0');
 }
 
 /**
- * Hash a single file with error handling
+ * Calculate xxhash64 for a regular filesystem file
  */
-function hashSingleFile(rootPath: string, relativePath: string): Observable<HashUpdate | null> {
+async function calculateFileHash(filePath: string): Promise<string> {
+  const buffer = await fs.readFile(filePath);
+  return calculateBufferHash(buffer);
+}
+
+/**
+ * Extract and hash a specific file from an archive with cross-platform path handling
+ */
+async function extractAndHashFromArchive(
+  rootPath: string,
+  archiveParentPath: string,
+  relativePath: string
+): Promise<string> {
+  const archivePath = path.join(rootPath, toSystemPath(archiveParentPath));
+  const archiveBuffer = await fs.readFile(archivePath);
+
+  // Initialize libarchive WASM
+  const mod = await libarchiveWasm();
+  const reader = new ArchiveReader(mod, new Int8Array(archiveBuffer));
+
+  try {
+    // Get the path within the archive using proper normalization
+    const targetPath = getArchiveRelativePath(relativePath, archiveParentPath);
+
+    for (const entry of reader.entries()) {
+      if (entry && typeof entry.getPathname === 'function') {
+        const entryPath = normalizePath(entry.getPathname());
+        const normalizedTarget = normalizePath(targetPath);
+
+        if (pathEquals(entryPath, normalizedTarget)) {
+          const filetype = entry.getFiletype?.() || 'File';
+          if (filetype !== 'Directory' && !entryPath.endsWith('/')) {
+            // Hybrid approach: trust non-zero metadata, always verify 0-byte files
+            const reportedSize = entry.getSize() || 0;
+
+            if (reportedSize === 0) {
+              // Don't trust 0-byte metadata - always extract to verify
+              const content = entry.readData();
+              return calculateBufferHash(new Uint8Array(content || []));
+            } else {
+              // Trust non-zero metadata, extract and hash normally
+              const content = entry.readData();
+              if (content) {
+                return calculateBufferHash(new Uint8Array(content));
+              }
+              throw new Error(`Could not extract content for ${targetPath}`);
+            }
+          }
+          throw new Error(`Entry ${targetPath} is not a file`);
+        }
+      }
+    }
+
+    throw new Error(`File ${targetPath} not found in archive ${archiveParentPath}`);
+  } finally {
+    reader.free();
+  }
+}
+
+/**
+ * Hash a single file with archive-aware processing and cross-platform path handling
+ */
+function hashSingleFile(rootPath: string, fileEntry: FileHashEntry): Observable<HashUpdate | null> {
   return defer(async () => {
     try {
-      // Convert relative path to OS-specific path
-      const osPath = relativePath.replace(/\//g, path.sep);
-      const fullPath = path.join(rootPath, osPath);
+      let hash: string;
 
-      const hash = await calculateFileHash(fullPath);
+      if (fileEntry.archiveParentPath) {
+        // Archive entry - extract on-demand and hash
+        logger.debug('Hashing archive entry', {
+          path: fileEntry.path,
+          archive: fileEntry.archiveParentPath,
+          format: fileEntry.archiveFormat,
+        });
+
+        hash = await extractAndHashFromArchive(
+          rootPath,
+          fileEntry.archiveParentPath,
+          fileEntry.path
+        );
+      } else {
+        // Regular filesystem file - use normalized path conversion
+        const systemPath = toSystemPath(fileEntry.path);
+        const fullPath = path.join(rootPath, systemPath);
+        hash = await calculateFileHash(fullPath);
+      }
 
       return {
-        path: relativePath,
-        hash: hash,
+        path: fileEntry.path,
+        hash,
       };
     } catch (error) {
       logger.warn('Hash calculation failed', {
-        path: relativePath,
+        path: fileEntry.path,
+        archiveParent: fileEntry.archiveParentPath,
         error: error instanceof Error ? error.message : String(error),
       });
       return null; // Signal failure but continue processing
@@ -103,7 +196,8 @@ function hashSingleFile(rootPath: string, relativePath: string): Observable<Hash
   }).pipe(
     catchError(error => {
       logger.warn('Hash calculation error', {
-        path: relativePath,
+        path: fileEntry.path,
+        archiveParent: fileEntry.archiveParentPath,
         error: error instanceof Error ? error.message : String(error),
       });
       return of(null);
@@ -114,6 +208,7 @@ function hashSingleFile(rootPath: string, relativePath: string): Observable<Hash
 /**
  * Get a batch of files that need hashing using streaming SQL
  * This avoids loading all file paths into memory
+ * Now includes archive metadata for archive-aware processing
  */
 function getFilesBatch(
   connection: DatabaseConnection,
@@ -121,13 +216,17 @@ function getFilesBatch(
   duplicateSizes: number[],
   offset: number,
   batchSize: number
-): Observable<string[]> {
+): Observable<FileHashEntry[]> {
   if (!duplicateSizes.length) return of([]);
 
   return defer(() => {
     return from(
       connection.db
-        .select({ path: files.path })
+        .select({
+          path: files.path,
+          archiveParentPath: files.archive_parent_path,
+          archiveFormat: files.archive_format,
+        })
         .from(files)
         .where(
           and(
@@ -139,7 +238,13 @@ function getFilesBatch(
         .limit(batchSize)
         .offset(offset)
     ).pipe(
-      map(results => results.map(r => r.path)),
+      map(results =>
+        results.map(r => ({
+          path: r.path,
+          archiveParentPath: r.archiveParentPath || undefined,
+          archiveFormat: r.archiveFormat || undefined,
+        }))
+      ),
       catchError(error => {
         logger.error('Failed to get files batch', error as Error, {
           runId,
@@ -229,19 +334,30 @@ function updateHashBatch(
 }
 
 /**
- * Process a single batch of files for hashing
+ * Process a single batch of files for hashing with archive-aware processing
  */
 function processBatch(
   connection: DatabaseConnection,
   runId: string,
   rootPath: string,
-  filePaths: string[],
+  fileEntries: FileHashEntry[],
   concurrency: number
 ): Observable<number> {
-  if (!filePaths.length) return of(0);
+  if (!fileEntries.length) return of(0);
 
-  return from(filePaths).pipe(
-    mergeMap(relativePath => hashSingleFile(rootPath, relativePath), concurrency),
+  // Log batch composition for debugging
+  const archiveEntries = fileEntries.filter(e => e.archiveParentPath).length;
+  const regularEntries = fileEntries.length - archiveEntries;
+
+  logger.debug('Processing hash batch', {
+    runId,
+    totalFiles: fileEntries.length,
+    regularFiles: regularEntries,
+    archiveEntries,
+  });
+
+  return from(fileEntries).pipe(
+    mergeMap(fileEntry => hashSingleFile(rootPath, fileEntry), concurrency),
     filter((result): result is HashUpdate => result !== null),
     // Collect all hashes from this batch
     tap(update => {
@@ -271,7 +387,7 @@ function processBatch(
     catchError(error => {
       logger.error('Batch processing failed', error as Error, {
         runId,
-        batchSize: filePaths.length,
+        batchSize: fileEntries.length,
       });
       return of(0);
     })
@@ -290,7 +406,7 @@ export function calculateHashes(
 ): Observable<void> {
   const finalConfig = { ...DEFAULT_HASH_CONFIG, ...config };
 
-  let stats: HashStats = {
+  const stats: HashStats = {
     totalFiles: 0,
     processed: 0,
     errors: 0,
@@ -347,22 +463,22 @@ export function calculateHashes(
                 offset,
                 finalConfig.batchSize
               ).pipe(
-                switchMap(filePaths => {
-                  if (!filePaths.length) {
+                switchMap(fileEntries => {
+                  if (!fileEntries.length) {
                     return of(0); // No more files to process
                   }
 
                   logger.debug('Processing hash batch', {
                     runId,
                     offset,
-                    batchSize: filePaths.length,
+                    batchSize: fileEntries.length,
                   });
 
                   return processBatch(
                     connection,
                     runId,
                     rootPath,
-                    filePaths,
+                    fileEntries,
                     finalConfig.concurrency
                   ).pipe(
                     tap(processed => {
