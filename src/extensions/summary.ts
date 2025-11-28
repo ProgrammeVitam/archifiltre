@@ -24,7 +24,7 @@ function getDuplicateStats(
     return from(
       connection.db
         .select({
-          size: files.content_size,
+          hash: files.hash,
           fileCount: count(),
         })
         .from(files)
@@ -32,11 +32,11 @@ function getDuplicateStats(
           and(
             eq(files.run_id, runId),
             eq(files.is_directory, false), // Only files, exclude directories
-            isNotNull(files.content_size) // Only files with content_size
+            isNotNull(files.hash) // Only files with hash (successfully processed)
           )
         )
-        .groupBy(files.content_size)
-        .having(gt(count(), 1)) // Only sizes with more than 1 file
+        .groupBy(files.hash)
+        .having(gt(count(), 1)) // Only hashes with more than 1 file (real duplicates)
     ).pipe(
       map(results => ({
         duplicateGroups: results.length,
@@ -45,6 +45,28 @@ function getDuplicateStats(
       catchError(error => {
         logger.error('Failed to get duplicate statistics', error as Error, { runId });
         return of({ duplicateGroups: 0, totalDuplicateFiles: 0 });
+      })
+    );
+  });
+}
+
+/**
+ * Get empty files count from database
+ */
+function getEmptyFilesCount(connection: DatabaseConnection, runId: string): Observable<number> {
+  return defer(() => {
+    return from(
+      connection.db
+        .select({ count: count() })
+        .from(files)
+        .where(
+          and(eq(files.run_id, runId), eq(files.content_size, 0), eq(files.is_directory, false))
+        )
+    ).pipe(
+      map(results => results[0]?.count || 0),
+      catchError(error => {
+        logger.error('Failed to get empty files count', error as Error, { runId });
+        return of(0);
       })
     );
   });
@@ -155,21 +177,23 @@ export async function summary(
 ): Promise<void> {
   try {
     // Get all statistics from database
-    const [totalStats, userStats, folderStats, duplicateStats, scanStats] = await Promise.all([
-      getFilteredStats(database, runId, {
-        includeHidden: true,
-        includeSystem: true,
-        includeDirectories: false, // Only count files for total
-      }).toPromise(),
-      getFilteredStats(database, runId, {
-        includeHidden: false,
-        includeSystem: false,
-        includeDirectories: false,
-      }).toPromise(),
-      getFolderStats(database, runId).toPromise(),
-      getDuplicateStats(database, runId).toPromise(),
-      getScanStats(database, runId).toPromise(),
-    ]);
+    const [totalStats, userStats, folderStats, duplicateStats, scanStats, emptyFilesCount] =
+      await Promise.all([
+        getFilteredStats(database, runId, {
+          includeHidden: true,
+          includeSystem: true,
+          includeDirectories: false, // Only count files for total
+        }).toPromise(),
+        getFilteredStats(database, runId, {
+          includeHidden: false,
+          includeSystem: false,
+          includeDirectories: false,
+        }).toPromise(),
+        getFolderStats(database, runId).toPromise(),
+        getDuplicateStats(database, runId).toPromise(),
+        getScanStats(database, runId).toPromise(),
+        getEmptyFilesCount(database, runId).toPromise(),
+      ]);
 
     // Provide defaults for potentially undefined values
     const safeStats = {
@@ -196,8 +220,12 @@ export async function summary(
 
     if (safeStats.duplicates.duplicateGroups > 0) {
       cli.log(
-        `  Potential duplicates: ${safeStats.duplicates.totalDuplicateFiles.toLocaleString()} files in ${safeStats.duplicates.duplicateGroups.toLocaleString()} groups`
+        `  Duplicates: ${safeStats.duplicates.totalDuplicateFiles.toLocaleString()} files in ${safeStats.duplicates.duplicateGroups.toLocaleString()} groups`
       );
+    }
+
+    if ((emptyFilesCount || 0) > 0) {
+      cli.log(`  Empty files: ${(emptyFilesCount || 0).toLocaleString()}`);
     }
 
     cli.log(`  Folders: ${safeStats.folders.totalFolders.toLocaleString()}`);
