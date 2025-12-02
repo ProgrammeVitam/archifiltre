@@ -18,7 +18,8 @@
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { promises as fs } from 'node:fs';
-import { Observable, from, of, defer, range } from 'rxjs';
+import type { Observable} from 'rxjs';
+import { from, of, defer, range } from 'rxjs';
 import {
   switchMap,
   mergeMap,

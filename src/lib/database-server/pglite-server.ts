@@ -22,7 +22,7 @@ export interface PGLiteServerOptions {
 
 export class PGLiteServer {
   private db: PGlite | null = null;
-  private server: any = null;
+  private server: unknown = null;
   private options: Required<PGLiteServerOptions>;
 
   constructor(options: PGLiteServerOptions = {}) {

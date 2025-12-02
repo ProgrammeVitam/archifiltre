@@ -14,7 +14,7 @@
  */
 
 import { execSync } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from 'fs';
 import { join, relative } from 'path';
 
 // ============================================================================
@@ -186,7 +186,7 @@ Examples:
 SPDX 3.0 SBOM Generator
 Organization: République française – Ministère de la Culture (SNUM)
 Program: VITAM (Programme interministériel)
-License: CeCILL-2.1
+License: Apache-2.0
 `);
   }
 
@@ -275,7 +275,7 @@ License: CeCILL-2.1
       ).trim();
 
       const imageDate = new Date(imageInfo);
-      const containerfileStats = require('fs').statSync(this.containerImage.containerfile);
+      const containerfileStats = statSync(this.containerImage.containerfile);
       const containerfileDate = containerfileStats.mtime;
 
       return {

@@ -9,7 +9,8 @@
 
 import * as path from 'node:path';
 import { promises as fsp } from 'node:fs';
-import { Observable, from, of } from 'rxjs';
+import type { Observable } from 'rxjs';
+import { from, of } from 'rxjs';
 import {
   tap,
   map,
@@ -21,7 +22,13 @@ import {
   catchError,
   mergeMap,
 } from 'rxjs/operators';
-import { eq, and, count, gt, isNotNull } from 'drizzle-orm';
+import {
+  eq as _eq,
+  and as _and,
+  count as _count,
+  gt as _gt,
+  isNotNull as _isNotNull,
+} from 'drizzle-orm';
 import { logger } from '@lib/logging.ts';
 import {
   cleanDatabase,
@@ -30,7 +37,7 @@ import {
   countRealDuplicateGroups,
   type DatabaseConnection,
   type FileRow,
-  files,
+  files as _files,
 } from '@lib/database.ts';
 import { ArchiveReader, libarchiveWasm } from 'libarchive-wasm';
 import { performHashing } from '@lib/hash-calculator.ts';

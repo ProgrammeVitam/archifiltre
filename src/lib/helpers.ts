@@ -5,6 +5,8 @@
  * No side effects, framework-agnostic, and highly reusable.
  */
 
+import { homedir, freemem } from 'os';
+
 /**
  * Formats bytes as human-readable string
  */
@@ -97,15 +99,15 @@ export async function retry<T>(
     }
   }
 
-  throw lastError!;
+  throw lastError || new Error('All retry attempts failed');
 }
 
 /**
  * Sanitizes file paths for privacy (replaces home directory with ~)
  */
 export function sanitizePath(path: string): string {
-  const homedir = require('os').homedir();
-  return path.replace(homedir, '~');
+  const homedirPath = homedir();
+  return path.replace(homedirPath, '~');
 }
 
 /**
@@ -265,7 +267,7 @@ export const api = {
     const majorVersion = parseInt(nodeVersion.substring(1).split('.')[0], 10);
     const nodeOk = majorVersion >= 18;
 
-    const memoryMB = Math.round(require('os').freemem() / (1024 * 1024));
+    const memoryMB = Math.round(freemem() / (1024 * 1024));
     const memoryOk = memoryMB >= 100;
 
     const checks = [

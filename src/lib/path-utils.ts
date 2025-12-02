@@ -82,7 +82,7 @@ export function getArchiveRelativePath(fullPath: string, archiveParentPath: stri
   const normalizedFull = normalizePath(fullPath);
   const normalizedParent = normalizePath(archiveParentPath);
 
-  if (!normalizedFull.startsWith(normalizedParent + '/')) {
+  if (!normalizedFull.startsWith(`${normalizedParent  }/`)) {
     throw new Error(`Path ${fullPath} is not within archive ${archiveParentPath}`);
   }
 
@@ -120,7 +120,7 @@ export function pathEquals(path1: string, path2: string): boolean {
 export function isWithinArchive(filePath: string, archivePath: string): boolean {
   const normalizedFile = normalizePath(filePath);
   const normalizedArchive = normalizePath(archivePath);
-  return normalizedFile.startsWith(normalizedArchive + '/');
+  return normalizedFile.startsWith(`${normalizedArchive  }/`);
 }
 
 /**

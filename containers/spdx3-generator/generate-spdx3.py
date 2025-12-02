@@ -9,7 +9,7 @@ enhanced vulnerability tracking.
 Usage: python generate-spdx3.py [options]
 
 Author: République française – Ministère de la Culture (SNUM) / CIAF / DINUM
-License: CeCILL-2.1
+License: Apache-2.0
 Program: VITAM (Programme interministériel)
 """
 
@@ -408,7 +408,7 @@ class Spdx3Generator:
             f.write("# Organization: République française – Ministère de la Culture (SNUM)\n")
             f.write("# Program: VITAM (Programme interministériel)\n")
             f.write("# Standard: System Package Data Exchange (SPDX) 3.0.1\n")
-            f.write("# License: CeCILL-2.1\n")
+            f.write("# License: Apache-2.0\n")
             f.write("# Security: Integrated vulnerability and security finding data\n\n")
             yaml.dump(yaml_data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
 
@@ -443,7 +443,7 @@ class Spdx3Generator:
             self.log("  Standard: SPDX 3.0.1 - System Package Data Exchange")
             self.log("  Organization: République française – Ministère de la Culture (SNUM)")
             self.log("  Program: VITAM (Programme interministériel)")
-            self.log("  License: CeCILL-2.1")
+            self.log("  License: Apache-2.0")
 
             self.log("\nSPDX 3.0 generation completed successfully!")
 
@@ -468,7 +468,7 @@ Examples:
 SPDX 3.0 SBOM Generator
 Organization: République française – Ministère de la Culture (SNUM)
 Program: VITAM (Programme interministériel)
-License: CeCILL-2.1
+License: Apache-2.0
         """
     )
 

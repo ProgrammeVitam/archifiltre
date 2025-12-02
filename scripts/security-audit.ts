@@ -19,7 +19,7 @@
  *   --severity <level> Minimum severity to fail (low, medium, high, critical)
  */
 
-import { execSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import { writeFileSync, readFileSync, existsSync, unlinkSync, mkdirSync } from 'fs';
 import { join, relative } from 'path';
 
@@ -402,7 +402,10 @@ Examples:
 
   private checkPodman(): void {
     try {
-      execSync('podman --version', { stdio: 'pipe' });
+      const result = spawnSync('podman', ['--version'], { encoding: 'utf-8' });
+      if (result.error || result.status !== 0) {
+        throw result.error || new Error('Podman not found');
+      }
     } catch {
       throw new Error(
         'Podman is not installed or not in PATH.\n' +
@@ -515,7 +518,7 @@ Examples:
           if (this.config.updateImages) {
             hasUpdate = hasUpdate || isAvailable; // Force update if requested
           }
-        } catch (error) {
+        } catch (_error) {
           // Network error or registry unavailable
           if (!this.config.quiet && isAvailable) {
             process.stdout.write('failed\n');
@@ -553,13 +556,19 @@ Examples:
         throw new Error(`Invalid image name: ${imageName}`);
       }
 
-      // Safe: imageName is validated against allowlist in isValidImageName() and properly quoted
-      // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process
-      const output = execSync(`podman inspect "${imageName}" --format "{{.Digest}}"`, {
-        stdio: 'pipe',
+      // Safe: imageName is validated against allowlist and passed as separate argument
+      const result = spawnSync('podman', ['inspect', imageName, '--format', '{{.Digest}}'], {
         encoding: 'utf-8',
-        timeout: 5000, // 5 second timeout for local operations
+        timeout: 5000,
       });
+
+      if (result.error || result.status !== 0) {
+        throw (
+          result.error || new Error(`Command failed with status ${result.status}: ${result.stderr}`)
+        );
+      }
+
+      const output = result.stdout;
 
       const digest = output.trim();
 
@@ -569,11 +578,19 @@ Examples:
       }
 
       // If digest format is invalid, try alternative method with JSON output
-      const jsonOutput = execSync(`podman inspect "${imageName}"`, {
-        stdio: 'pipe',
+      const jsonResult = spawnSync('podman', ['inspect', imageName], {
         encoding: 'utf-8',
         timeout: 5000,
       });
+
+      if (jsonResult.error || jsonResult.status !== 0) {
+        throw (
+          jsonResult.error ||
+          new Error(`Command failed with status ${jsonResult.status}: ${jsonResult.stderr}`)
+        );
+      }
+
+      const jsonOutput = jsonResult.stdout;
 
       const imageInfo = JSON.parse(jsonOutput);
       if (imageInfo && imageInfo[0]?.Digest) {
@@ -598,13 +615,19 @@ Examples:
       throw new Error(`Invalid image name: ${imageName}`);
     }
 
-    // Safe: imageName is validated against allowlist in isValidImageName() and properly quoted
-    // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process
-    const output = execSync(`podman manifest inspect "${imageName}"`, {
-      stdio: 'pipe',
+    // Safe: imageName is validated against allowlist and passed as separate argument
+    const result = spawnSync('podman', ['manifest', 'inspect', imageName], {
       encoding: 'utf-8',
-      timeout: 10000, // 10 second timeout
+      timeout: 10000,
     });
+
+    if (result.error || result.status !== 0) {
+      throw (
+        result.error || new Error(`Command failed with status ${result.status}: ${result.stderr}`)
+      );
+    }
+
+    const output = result.stdout;
 
     try {
       const manifest = JSON.parse(output.trim());
@@ -612,8 +635,15 @@ Examples:
       // For manifest lists, get the digest of the first amd64/linux manifest
       let digest: string | undefined;
       if (manifest.manifests && Array.isArray(manifest.manifests)) {
+        interface ManifestItem {
+          platform?: {
+            architecture?: string;
+            os?: string;
+          };
+          digest?: string;
+        }
         const amd64Manifest = manifest.manifests.find(
-          (m: any) => m.platform?.architecture === 'amd64' && m.platform?.os === 'linux'
+          (m: ManifestItem) => m.platform?.architecture === 'amd64' && m.platform?.os === 'linux'
         );
         if (amd64Manifest?.digest) {
           digest = amd64Manifest.digest;
@@ -657,11 +687,16 @@ Examples:
       }
 
       // First try to get version from image labels
-      const output = execSync(`podman inspect "${imageName}" --format "{{.Config.Labels}}"`, {
-        stdio: 'pipe',
+      const result = spawnSync('podman', ['inspect', imageName, '--format', '{{.Config.Labels}}'], {
         encoding: 'utf-8',
         timeout: 5000,
       });
+
+      if (result.error || result.status !== 0) {
+        return undefined;
+      }
+
+      const output = result.stdout;
 
       // Parse the labels map output (Go template format)
       const labelsMatch = output.match(/org\.opencontainers\.image\.version:([^\s}\]]+)/);
@@ -674,19 +709,33 @@ Examples:
       try {
         let versionOutput: string;
         if (imageName.includes('trivy')) {
-          versionOutput = execSync(`podman run --rm "${imageName}" --version`, {
-            stdio: 'pipe',
+          const versionResult = spawnSync('podman', ['run', '--rm', imageName, '--version'], {
             encoding: 'utf-8',
             timeout: 10000,
           });
+
+          if (versionResult.error || versionResult.status !== 0) {
+            return undefined;
+          }
+
+          versionOutput = versionResult.stdout;
           const versionMatch = versionOutput.match(/Version:\s*([^\s\n]+)/);
           return versionMatch ? versionMatch[1] : undefined;
         } else if (imageName.includes('semgrep')) {
-          versionOutput = execSync(`podman run --rm "${imageName}" semgrep --version`, {
-            stdio: 'pipe',
-            encoding: 'utf-8',
-            timeout: 10000,
-          });
+          const versionResult = spawnSync(
+            'podman',
+            ['run', '--rm', imageName, 'semgrep', '--version'],
+            {
+              encoding: 'utf-8',
+              timeout: 10000,
+            }
+          );
+
+          if (versionResult.error || versionResult.status !== 0) {
+            return undefined;
+          }
+
+          versionOutput = versionResult.stdout;
           const semgrepVersion = versionOutput.trim().split('\n')[0];
           return semgrepVersion && semgrepVersion !== 'develop' ? semgrepVersion : undefined;
         }
@@ -706,11 +755,16 @@ Examples:
         return undefined;
       }
 
-      const output = execSync(`podman inspect "${imageName}" --format "{{.Created}}"`, {
-        stdio: 'pipe',
+      const result = spawnSync('podman', ['inspect', imageName, '--format', '{{.Created}}'], {
         encoding: 'utf-8',
         timeout: 5000,
       });
+
+      if (result.error || result.status !== 0) {
+        return undefined;
+      }
+
+      const output = result.stdout;
 
       const createdDate = new Date(output.trim());
       if (isNaN(createdDate.getTime())) {
@@ -750,19 +804,33 @@ Examples:
       // This may pull the latest version if not cached locally
       let versionOutput: string;
       if (imageName.includes('trivy')) {
-        versionOutput = execSync(`podman run --rm "${imageName}" --version`, {
-          stdio: 'pipe',
+        const versionResult = spawnSync('podman', ['run', '--rm', imageName, '--version'], {
           encoding: 'utf-8',
-          timeout: 20000,
+          timeout: 15000, // Longer timeout for remote pulls
         });
+
+        if (versionResult.error || versionResult.status !== 0) {
+          return undefined;
+        }
+
+        versionOutput = versionResult.stdout;
         const versionMatch = versionOutput.match(/Version:\s*([^\s\n]+)/);
         return versionMatch ? versionMatch[1] : undefined;
       } else if (imageName.includes('semgrep')) {
-        versionOutput = execSync(`podman run --rm "${imageName}" semgrep --version`, {
-          stdio: 'pipe',
-          encoding: 'utf-8',
-          timeout: 20000,
-        });
+        const versionResult = spawnSync(
+          'podman',
+          ['run', '--rm', imageName, 'semgrep', '--version'],
+          {
+            encoding: 'utf-8',
+            timeout: 15000, // Longer timeout for remote pulls
+          }
+        );
+
+        if (versionResult.error || versionResult.status !== 0) {
+          return undefined;
+        }
+
+        versionOutput = versionResult.stdout;
         const semgrepVersion = versionOutput.trim().split('\n')[0];
         return semgrepVersion && semgrepVersion !== 'develop' ? semgrepVersion : undefined;
       }
@@ -781,11 +849,16 @@ Examples:
 
       // Get creation date from remote image by inspecting it
       // This will use cached remote image if available from version check
-      const output = execSync(`podman inspect "${imageName}" --format "{{.Created}}"`, {
-        stdio: 'pipe',
+      const result = spawnSync('podman', ['inspect', imageName, '--format', '{{.Created}}'], {
         encoding: 'utf-8',
         timeout: 10000, // Should be fast if image is already pulled
       });
+
+      if (result.error || result.status !== 0) {
+        return undefined;
+      }
+
+      const output = result.stdout;
 
       const createdDate = new Date(output.trim());
       if (isNaN(createdDate.getTime())) {
@@ -826,7 +899,7 @@ Examples:
 
     // Helper function to determine status symbol, size display, and message
     const getImageDisplay = (imageStatus: ImageStatus) => {
-      const versionText = imageStatus.version ? ` v${imageStatus.version}` : '';
+      const _versionText = imageStatus.version ? ` v${imageStatus.version}` : '';
       const ageText = imageStatus.age ? `, ${imageStatus.age}` : '';
 
       if (!imageStatus.isAvailable) {
@@ -979,12 +1052,15 @@ Examples:
     }
 
     try {
-      // Safe: image.fullName comes from hardcoded ContainerImage objects and is properly quoted
-      // nosemgrep: javascript.lang.security.detect-child-process.detect-child-process
-      execSync(`podman pull "${image.fullName}"`, {
-        stdio: this.config.quiet ? 'pipe' : 'pipe',
+      // Safe: image.fullName comes from hardcoded ContainerImage objects and passed as separate argument
+      const result = spawnSync('podman', ['pull', image.fullName], {
+        encoding: 'utf-8',
         timeout: this.config.containerTimeout * 1000,
       });
+
+      if (result.error || result.status !== 0) {
+        throw result.error || new Error(`Failed to pull image: ${result.stderr}`);
+      }
 
       if (!this.config.quiet) {
         console.log(`✓ (${image.estimatedSize})`);
@@ -1005,21 +1081,37 @@ Examples:
     try {
       const outputFile = join(this.reportsDir, `trivy-${Date.now()}.json`);
 
-      // Run Trivy scan
-      execSync(
-        `podman run --rm ` +
-          `-v "${process.cwd()}:/workspace:ro" ` +
-          `-v "${this.reportsDir}:/reports:rw" ` +
-          `--workdir /workspace ` +
-          `${this.images.trivy.fullName} ` +
-          `fs --format json --output /reports/${relative(this.reportsDir, outputFile).replace(/\\/g, '/')} ` +
-          `--timeout ${this.config.containerTimeout}s ` +
-          `/workspace`,
+      // Run Trivy scan with secure argument passing
+      const result = spawnSync(
+        'podman',
+        [
+          'run',
+          '--rm',
+          '-v',
+          `${process.cwd()}:/workspace:ro`,
+          '-v',
+          `${this.reportsDir}:/reports:rw`,
+          '--workdir',
+          '/workspace',
+          this.images.trivy.fullName,
+          'fs',
+          '--format',
+          'json',
+          '--output',
+          `/reports/${relative(this.reportsDir, outputFile).replace(/\\/g, '/')}`,
+          '--timeout',
+          `${this.config.containerTimeout}s`,
+          '/workspace',
+        ],
         {
-          stdio: 'pipe',
+          encoding: 'utf-8',
           timeout: (this.config.containerTimeout + 60) * 1000,
         }
       );
+
+      if (result.error || result.status !== 0) {
+        throw result.error || new Error(`Trivy scan failed: ${result.stderr}`);
+      }
 
       // Parse results
       if (existsSync(outputFile)) {
@@ -1049,24 +1141,39 @@ Examples:
     try {
       const outputFile = join(this.reportsDir, `semgrep-${Date.now()}.json`);
 
-      // Run Semgrep scan
-      execSync(
-        `podman run --rm ` +
-          `-v "${process.cwd()}:/workspace:ro" ` +
-          `-v "${this.reportsDir}:/reports:rw" ` +
-          `--workdir /workspace ` +
-          `${this.images.semgrep.fullName} ` +
-          `semgrep scan ` +
-          `--config ${this.config.semgrepConfig} ` +
-          `--json ` +
-          `--output /reports/${relative(this.reportsDir, outputFile).replace(/\\/g, '/')} ` +
-          `--timeout ${this.config.containerTimeout} ` +
-          `/workspace`,
+      // Run Semgrep scan with secure argument passing
+      const result = spawnSync(
+        'podman',
+        [
+          'run',
+          '--rm',
+          '-v',
+          `${process.cwd()}:/workspace:ro`,
+          '-v',
+          `${this.reportsDir}:/reports:rw`,
+          '--workdir',
+          '/workspace',
+          this.images.semgrep.fullName,
+          'semgrep',
+          'scan',
+          '--config',
+          this.config.semgrepConfig,
+          '--json',
+          '--output',
+          `/reports/${relative(this.reportsDir, outputFile).replace(/\\/g, '/')}`,
+          '--timeout',
+          `${this.config.containerTimeout}`,
+          '/workspace',
+        ],
         {
-          stdio: 'pipe',
+          encoding: 'utf-8',
           timeout: (this.config.containerTimeout + 60) * 1000,
         }
       );
+
+      if (result.error || result.status !== 0) {
+        throw result.error || new Error(`Semgrep scan failed: ${result.stderr}`);
+      }
 
       // Parse results
       if (existsSync(outputFile)) {

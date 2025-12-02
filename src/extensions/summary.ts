@@ -4,8 +4,9 @@
  * Extension for displaying detailed scan results with file breakdowns
  */
 
-import { Command } from '@oclif/core';
-import { Observable, from, defer, of } from 'rxjs';
+import type { Command } from '@oclif/core';
+import type { Observable} from 'rxjs';
+import { from, defer, of } from 'rxjs';
 import { map, catchError } from 'rxjs/operators';
 import { getScanStats } from '@lib/database.ts';
 import { eq, and, count, sum, gt, sql, isNotNull } from 'drizzle-orm';

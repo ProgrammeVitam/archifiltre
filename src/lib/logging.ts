@@ -10,6 +10,7 @@ import DailyRotateFile from 'winston-daily-rotate-file';
 import { join } from 'path';
 import { homedir, hostname } from 'os';
 import { mkdirSync, existsSync } from 'fs';
+import { getLogsDir } from './platform-paths.ts';
 
 // === Types ===
 
@@ -41,13 +42,7 @@ export interface LoggingConfig {
 // === Environment Detection ===
 
 function getEnvironmentLogDirectory(): string {
-  const isDevelopment = process.env.NODE_ENV === 'development' || !process.env.NODE_ENV;
-
-  if (isDevelopment) {
-    return join(process.cwd(), 'logs');
-  } else {
-    return join(homedir(), '.archifiltre', 'logs');
-  }
+  return getLogsDir();
 }
 
 // === Oclif Integration Registry ===
@@ -111,8 +106,8 @@ function getSyslogPriority(level: string): number {
   const facility = 16;
   const severityMap: Record<string, number> = {
     error: 3, // Error conditions
-    warn: 4,  // Warning conditions
-    info: 6,  // Informational messages
+    warn: 4, // Warning conditions
+    info: 6, // Informational messages
     debug: 7, // Debug-level messages
   };
   const severity = severityMap[level] || 6;
@@ -148,10 +143,7 @@ class ArchifiltrLogger {
     if (this.config.enableConsoleLogging) {
       transports.push(
         new winston.transports.Console({
-          format: winston.format.combine(
-            winston.format.colorize(),
-            winston.format.simple()
-          ),
+          format: winston.format.combine(winston.format.colorize(), winston.format.simple()),
         })
       );
     }
@@ -214,9 +206,7 @@ class ArchifiltrLogger {
 
     // Send to Oclif command if available
     if (oclifCommand) {
-      const contextStr = sanitizedContext
-        ? ` ${JSON.stringify(sanitizedContext)}`
-        : '';
+      const contextStr = sanitizedContext ? ` ${JSON.stringify(sanitizedContext)}` : '';
       const fullMessage = `${message}${contextStr}`;
 
       switch (level) {

@@ -227,7 +227,7 @@ This tool is designed for French government compliance requirements:
 
 - **Organization**: République française – Ministère de la Culture (SNUM)
 - **Program**: VITAM (Programme interministériel)
-- **License**: CeCILL-2.1
+- **License**: Apache-2.0
 - **Standard**: SPDX 3.0.1 (System Package Data Exchange)
 - **Contact**: archifiltre@programmevitam.fr
 
@@ -262,7 +262,7 @@ The `generate-spdx3.py` script can be tested independently:
 
 ## License
 
-CeCILL-2.1 - Compatible with French government requirements
+Apache-2.0 - Compatible with French government requirements
 
 ## Support
 

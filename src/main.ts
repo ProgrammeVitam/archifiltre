@@ -1,133 +1,311 @@
 #!/usr/bin/env bun
 /**
- * Archifiltre Main Entry Point
+ * Standalone Archifiltre CLI
  *
- * Main CLI application entry point with embedded configuration
- * for standalone execution and command orchestration.
+ * Self-contained entry point that bypasses oclif's file-based command discovery
+ * while maintaining compatibility with oclif Command classes.
  */
 
-import { Config, run } from '@oclif/core';
+import { Command, Config, Interfaces } from '@oclif/core';
 import { initializeLogging, logger, shutdownLogging } from '@lib/logging.ts';
+import path from 'node:path';
+import fs from 'node:fs';
 
-// Inline package.json configuration for bundled environment
-const INLINE_PACKAGE_CONFIG = {
-  name: 'archifiltre',
-  version: '5.0.0-dev',
-  description: 'Privacy-friendly, 100% offline desktop tool for inventorying large file trees',
-  author: {
-    name: 'République française – Ministère de la Culture (SNUM) / CIAF / DINUM',
-    email: 'archifiltre@programmevitam.fr',
-    url: 'https://archifiltre.fabrique.social.gouv.fr',
-  },
-  license: 'CECILL-2.1',
-  homepage: 'https://archifiltre.fabrique.social.gouv.fr',
-  bin: {
-    archifiltre: './bin/run.js',
-  },
-  oclif: {
-    bin: 'archifiltre',
-    dirname: 'archifiltre',
-    commands: {
-      strategy: 'explicit' as const,
-      target: './src/commands/index.js',
-      identifier: 'COMMANDS',
-    },
-    helpClass: './src/lib/help.js',
-    plugins: [],
-    topicSeparator: ' ',
-    additionalHelpFlags: ['-h'],
-    additionalVersionFlags: ['-v'],
-  },
+// Import commands directly
+import Version from './commands/version.ts';
+import Health from './commands/health.ts';
+import Sbom from './commands/sbom.ts';
+import Scan from './commands/scan.ts';
+import ExposeDb from './commands/expose-db.ts';
+import { getAppDataDir } from '@lib/platform-paths.ts';
+
+// Command registry
+const COMMANDS: Record<string, typeof Command> = {
+  version: Version,
+  health: Health,
+  sbom: Sbom,
+  scan: Scan,
+  'expose-db': ExposeDb,
 };
 
 /**
- * Create bundle-compatible Oclif configuration
+ * Minimal Config implementation that avoids file system reads
  */
-async function createBundleConfig() {
-  try {
-    const config = new Config({
-      root: process.cwd(),
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      pjson: INLINE_PACKAGE_CONFIG as any,
+class StandaloneConfig extends Config {
+  constructor() {
+    // In standalone mode, set working directory to platform-specific app data directory
+    // This ensures all runtime files (including PGlite WASM files) are stored in the
+    // correct user data location instead of wherever the binary was executed from
+    const appDataDir = getAppDataDir();
+
+    // Ensure app data directory exists before changing to it
+    if (!fs.existsSync(appDataDir)) {
+      fs.mkdirSync(appDataDir, { recursive: true });
+    }
+
+    // Change working directory - this makes ALL runtime files go to the right place:
+    // - PGlite WebAssembly files → ~/.local/share/archifiltre/pglite/
+    // - Temp files → ~/.local/share/archifiltre/temp/
+    // - Any other runtime artifacts → ~/.local/share/archifiltre/
+    // (Paths automatically adapt to Windows/macOS conventions via getAppDataDir())
+    process.chdir(appDataDir);
+
+    super({ root: appDataDir });
+
+    const dataPath = path.join(appDataDir, '.archifiltre');
+
+    // Use Object.defineProperty to override readonly properties
+    Object.defineProperty(this, 'name', { value: 'archifiltre', writable: false });
+    Object.defineProperty(this, 'version', { value: '5.0.0-dev', writable: false });
+    Object.defineProperty(this, 'bin', { value: 'archifiltre', writable: false });
+    Object.defineProperty(this, 'root', { value: appDataDir, writable: false });
+    Object.defineProperty(this, 'dataDir', { value: dataPath, writable: false });
+    Object.defineProperty(this, 'configDir', { value: dataPath, writable: false });
+    Object.defineProperty(this, 'cacheDir', {
+      value: path.join(dataPath, 'cache'),
+      writable: false,
+    });
+    Object.defineProperty(this, 'errlog', {
+      value: path.join(dataPath, 'error.log'),
+      writable: false,
     });
 
-    await config.load();
-    return config;
-  } catch (error) {
-    throw new Error(
-      `Failed to create bundle config: ${error instanceof Error ? error.message : String(error)}`
-    );
+    // Set package.json data without reading from disk
+    Object.defineProperty(this, 'pjson', {
+      value: {
+        name: 'archifiltre',
+        version: '5.0.0-dev',
+        description:
+          'Privacy-friendly, 100% offline desktop tool for inventorying large file trees',
+        oclif: {
+          bin: 'archifiltre',
+          topicSeparator: ' ',
+        },
+      },
+      writable: false,
+    });
+
+    Object.defineProperty(this, 'plugins', { value: new Map(), writable: false });
+    Object.defineProperty(this, 'commands', { value: [], writable: false });
+    Object.defineProperty(this, 'topics', { value: [], writable: false });
+    Object.defineProperty(this, 'commandIDs', { value: Object.keys(COMMANDS), writable: false });
+  }
+
+  async load() {
+    return this;
+  }
+
+  async runHook<T extends keyof Interfaces.Hooks>(
+    event: T,
+    opts: Interfaces.Hooks[T]['options']
+  ): Promise<Interfaces.Hooks[T]['return']> {
+    return {} as Interfaces.Hooks[T]['return'];
+  }
+
+  findCommand(id: string): Interfaces.Command | undefined {
+    const CommandClass = COMMANDS[id];
+    if (!CommandClass) return undefined;
+
+    return {
+      id,
+      load: async () => CommandClass as any,
+      description: CommandClass.description || '',
+      aliases: [],
+      hidden: false,
+      usage: CommandClass.usage,
+      examples: CommandClass.examples || [],
+    } as Interfaces.Command;
   }
 }
 
 /**
- * Main entry point for bundled CLI
+ * Display help information
+ */
+function showHelp(commandName?: string) {
+  if (commandName) {
+    const CommandClass = COMMANDS[commandName];
+    if (!CommandClass) {
+      console.error(`Command '${commandName}' not found\n`);
+      showHelp();
+      return;
+    }
+
+    console.log(`${CommandClass.description || commandName}\n`);
+    console.log(`USAGE`);
+    console.log(`  $ archifiltre ${commandName} ${CommandClass.usage || '[OPTIONS]'}\n`);
+
+    if (CommandClass.args && Object.keys(CommandClass.args).length > 0) {
+      console.log('ARGUMENTS');
+      for (const [name, arg] of Object.entries(CommandClass.args)) {
+        const argDef = arg as any;
+        const required = argDef.required ? ' (required)' : '';
+        console.log(`  ${name}${required}  ${argDef.description || ''}`);
+      }
+      console.log();
+    }
+
+    if (CommandClass.flags && Object.keys(CommandClass.flags).length > 0) {
+      console.log('FLAGS');
+      for (const [name, flag] of Object.entries(CommandClass.flags)) {
+        const flagDef = flag as any;
+        const char = flagDef.char ? `-${flagDef.char}, ` : '    ';
+        const defaultVal = flagDef.default !== undefined ? ` [default: ${flagDef.default}]` : '';
+        console.log(`  ${char}--${name}  ${flagDef.description || ''}${defaultVal}`);
+      }
+      console.log();
+    }
+
+    if (CommandClass.examples && CommandClass.examples.length > 0) {
+      console.log('EXAMPLES');
+      for (const example of CommandClass.examples) {
+        const formatted = example
+          .replace(/<%= config.bin %>/g, 'archifiltre')
+          .replace(/<%= command.id %>/g, commandName);
+        console.log(`  $ ${formatted}`);
+      }
+    }
+  } else {
+    console.log(`Archifiltre v5.0.0-dev
+Privacy-friendly, 100% offline file tree inventory tool
+
+USAGE
+  $ archifiltre COMMAND [OPTIONS]
+
+COMMANDS`);
+
+    const maxLength = Math.max(...Object.keys(COMMANDS).map(cmd => cmd.length));
+    for (const [name, CommandClass] of Object.entries(COMMANDS)) {
+      const padding = ' '.repeat(maxLength - name.length + 4);
+      console.log(`  ${name}${padding}${CommandClass.description || ''}`);
+    }
+
+    console.log(`
+GLOBAL FLAGS
+  --help, -h        Show help
+  --version, -v     Show version
+  --verbose, -V     Enable verbose output
+  --no-color        Disable colored output
+
+For more information, visit: https://github.com/ProgrammeVitam/archifiltre`);
+  }
+}
+
+/**
+ * Parse command line arguments
+ */
+function parseArgs(argv: string[]) {
+  const globalFlags: Record<string, any> = {};
+  const args: string[] = [];
+  let command: string | undefined;
+  let isHelp = false;
+  let isVersion = false;
+
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+
+    if (arg === '--help' || arg === '-h') {
+      isHelp = true;
+      continue;
+    }
+
+    if (arg === '--version' || arg === '-v') {
+      isVersion = true;
+      continue;
+    }
+
+    if (arg === '--verbose' || arg === '-V') {
+      globalFlags.verbose = true;
+      args.push(arg);
+      continue;
+    }
+
+    if (arg === '--no-color') {
+      globalFlags.noColor = true;
+      process.env.NO_COLOR = '1';
+      args.push(arg);
+      continue;
+    }
+
+    if (!arg.startsWith('-') && !command) {
+      command = arg;
+    } else {
+      args.push(arg);
+    }
+  }
+
+  return { command, args, globalFlags, isHelp, isVersion };
+}
+
+/**
+ * Main entry point
  */
 async function main() {
   try {
-    // Initialize simple logging system for CLI
+    const { command, args, globalFlags, isHelp, isVersion } = parseArgs(process.argv.slice(2));
+
+    // Initialize logging
     await initializeLogging({
-      level: process.argv.includes('--verbose') || process.argv.includes('-v') ? 'debug' : 'info',
-      enableConsoleLogging: false, // CLI uses Oclif integration
+      level: globalFlags.verbose ? 'debug' : 'info',
+      enableConsoleLogging: false,
       enableFileLogging: true,
     });
 
-    // Create bundle-compatible config
-    const config = await createBundleConfig();
+    const config = new StandaloneConfig();
 
-    // Run Oclif with our custom config
-    await run(process.argv.slice(2), config);
+    // Handle version flag
+    if (isVersion && !command) {
+      const versionCmd = new Version([], config);
+      await versionCmd.run();
+      return;
+    }
+
+    // Handle help
+    if (isHelp || !command) {
+      showHelp(command);
+      return;
+    }
+
+    // Find and run command
+    const CommandClass = COMMANDS[command];
+
+    if (!CommandClass) {
+      console.error(`Error: Command '${command}' not found\n`);
+      showHelp();
+      process.exit(1);
+    }
+
+    // Run the command
+    const commandInstance = new CommandClass(args, config);
+    await commandInstance.run();
   } catch (error) {
-    // Handle Oclif errors gracefully
     if (error && typeof error === 'object' && 'oclif' in error) {
       const oclifError = error as { oclif?: { exit?: number } };
-
       if (error instanceof Error && error.message) {
-        logger.error('CLI command error', error, { context: 'oclif_error' });
+        logger.error('Command error', error);
+        console.error(error.message);
       }
-
       process.exit(oclifError.oclif?.exit ?? 1);
     }
 
-    // Handle other errors
     const message = error instanceof Error ? error.message : 'Unknown error';
-    logger.error('CLI execution failed', error instanceof Error ? error : new Error(message), {
-      context: 'main_entry',
-      verbose: process.argv.includes('--verbose') || process.argv.includes('-V'),
-    });
-
+    logger.error('CLI execution failed', error instanceof Error ? error : new Error(message));
+    console.error(`Error: ${message}`);
     process.exit(1);
+  } finally {
+    await shutdownLogging();
   }
 }
 
-/**
- * Handle uncaught exceptions gracefully
- */
-process.on('uncaughtException', (error: Error) => {
-  logger.error('Uncaught exception in CLI', error, { context: 'process_exception' });
-  process.exit(1);
-});
-
-process.on('unhandledRejection', (reason: unknown) => {
-  const error = reason instanceof Error ? reason : new Error(String(reason));
-  logger.error('Unhandled promise rejection in CLI', error, { context: 'promise_rejection' });
-  process.exit(1);
-});
-
-/**
- * Handle process termination signals gracefully
- */
+// Handle process termination signals
 process.on('SIGINT', async () => {
-  logger.info('Received SIGINT - CLI shutting down gracefully', { signal: 'SIGINT' });
   await shutdownLogging();
   process.exit(130);
 });
 
 process.on('SIGTERM', async () => {
-  logger.info('Received SIGTERM - CLI shutting down gracefully', { signal: 'SIGTERM' });
   await shutdownLogging();
   process.exit(143);
 });
 
-// Start the application
+// Run the CLI
 main();

@@ -147,7 +147,7 @@ export default class Sbom extends Command {
 
     if (verbose) {
       output += `\nAdditional Information:\n`;
-      output += `  License: CeCILL-2.1\n`;
+      output += `  License: Apache-2.0\n`;
       output += `  Contact: archifiltre@programmevitam.fr\n`;
       output += `  Website: https://archifiltre.fabrique.social.gouv.fr\n`;
       output += `  Program: https://www.programmevitam.fr/\n\n`;

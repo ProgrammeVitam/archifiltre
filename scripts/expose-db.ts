@@ -73,13 +73,13 @@ async function main() {
 
     const connectionInfo = server.getConnectionInfo();
 
-    console.log('[OK] Database server started on localhost:' + connectionInfo.port + '\n');
+    console.log(`[OK] Database server started on localhost:${  connectionInfo.port  }\n`);
 
     console.log('Connection Details:');
-    console.log('  Host: ' + connectionInfo.host);
-    console.log('  Port: ' + connectionInfo.port);
-    console.log('  Database: ' + connectionInfo.database);
-    console.log('  Username: ' + connectionInfo.username);
+    console.log(`  Host: ${  connectionInfo.host}`);
+    console.log(`  Port: ${  connectionInfo.port}`);
+    console.log(`  Database: ${  connectionInfo.database}`);
+    console.log(`  Username: ${  connectionInfo.username}`);
     console.log('  Password: (empty)\n');
 
     console.log('Connect with DBeaver:');
@@ -87,15 +87,15 @@ async function main() {
 
     console.log('Or via command line:');
     console.log(
-      '  psql -h ' +
-        connectionInfo.host +
-        ' -p ' +
-        connectionInfo.port +
-        ' -U ' +
-        connectionInfo.username +
-        ' -d ' +
-        connectionInfo.database +
-        '\n'
+      `  psql -h ${ 
+        connectionInfo.host 
+        } -p ${ 
+        connectionInfo.port 
+        } -U ${ 
+        connectionInfo.username 
+        } -d ${ 
+        connectionInfo.database 
+        }\n`
     );
 
     console.log('Sample queries:');

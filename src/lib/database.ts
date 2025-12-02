@@ -6,15 +6,22 @@
  */
 
 import * as path from 'node:path';
-
 import { promises as fs } from 'node:fs';
-import { Observable, from, of, defer, EMPTY } from 'rxjs';
+import { file } from 'bun';
+import { getDatabasePath } from './platform-paths.ts';
+import type { Observable } from 'rxjs';
+import { from, of, defer, EMPTY } from 'rxjs';
 import { map, catchError, tap, switchMap } from 'rxjs/operators';
 import { drizzle } from 'drizzle-orm/pglite';
 import { PGlite } from '@electric-sql/pglite';
 import { pgTable, text, integer, index, primaryKey, boolean } from 'drizzle-orm/pg-core';
 import { eq, and, count, sum, inArray, isNull, isNotNull, sql } from 'drizzle-orm';
 import { logger } from '@lib/logging.ts';
+import { isStandalone } from './platform-paths.ts';
+
+// Import PGlite WASM files for bundled executable (embedded at build time)
+import wasmPath from '../../pglite/pglite.wasm' with { type: 'file' };
+import dataPath from '../../pglite/pglite.data' with { type: 'file' };
 
 // === Schema Definition ===
 
@@ -81,9 +88,7 @@ export interface ScanStats {
  * Create a safe database path for all platforms
  */
 function createDatabasePath(name: string): string {
-  // Simple approach: always use local directory
-  const safeName = name.replace(/[^a-zA-Z0-9-_]/g, '_');
-  return `./dbdata-${safeName}`;
+  return getDatabasePath(name);
 }
 
 /**
@@ -150,20 +155,40 @@ async function initializeSchema(db: ReturnType<typeof drizzle>): Promise<void> {
 export async function createDatabase(name: string): Promise<DatabaseConnection> {
   try {
     const dbPath = createDatabasePath(name);
+    const resolvedPath = path.resolve(dbPath);
+
+    logger.debug('Creating database', { name, dbPath, resolvedPath });
 
     // Ensure directory exists
-    await fs.mkdir(path.dirname(path.resolve(dbPath)), { recursive: true }).catch(() => {});
+    await fs.mkdir(resolvedPath, { recursive: true });
 
-    const pg = await PGlite.create(dbPath);
+    // Initialize PGlite with explicit dataDir for standalone compatibility
+    const pg = new PGlite({
+      dataDir: resolvedPath,
+
+      // Provide WASM files for bundled executable
+      wasmModule: isStandalone()
+        ? await WebAssembly.compile(await file(wasmPath).arrayBuffer())
+        : undefined,
+
+      fsBundle: isStandalone() ? file(dataPath) : undefined,
+    });
+
+    // Wait for PGlite to be ready
+    await pg.waitReady;
+
     const db = drizzle(pg, { schema: { files } });
 
     await initializeSchema(db);
 
-    logger.debug('Database created', { path: dbPath });
+    logger.debug('Database created successfully', { path: resolvedPath });
 
     return { pg, db };
   } catch (error) {
-    logger.error('Failed to create database', error as Error, { name });
+    logger.error('Failed to create database', error as Error, {
+      name,
+      dbPath: createDatabasePath(name),
+    });
     throw error;
   }
 }
@@ -196,7 +221,7 @@ export function cleanDatabase(connection: DatabaseConnection, runId: string): Ob
       logger.debug('Closed existing database connection');
 
       // Recreate database with fresh schema
-      const dbPath = './dbdata-main';
+      const dbPath = createDatabasePath('main');
 
       // Delete existing database directory
       try {
@@ -208,9 +233,18 @@ export function cleanDatabase(connection: DatabaseConnection, runId: string): Ob
       }
 
       // Create fresh database
-      await fs.mkdir(path.dirname(path.resolve(dbPath)), { recursive: true }).catch(() => {});
+      const resolvedPath = path.resolve(dbPath);
+      await fs.mkdir(resolvedPath, { recursive: true });
 
-      const newPg = await PGlite.create(dbPath);
+      const newPg = new PGlite({
+        dataDir: resolvedPath,
+        // Provide WASM files for bundled executable (same as createDatabase)
+        wasmModule: isStandalone()
+          ? await WebAssembly.compile(await file(wasmPath).arrayBuffer())
+          : undefined,
+        fsBundle: isStandalone() ? file(dataPath) : undefined,
+      });
+      await newPg.waitReady;
       const newDb = drizzle(newPg, { schema: { files } });
 
       // Initialize fresh schema

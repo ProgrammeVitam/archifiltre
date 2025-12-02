@@ -8,7 +8,7 @@ LABEL version="1.0.0"
 LABEL org.opencontainers.image.title="Archifiltre SPDX 3.0 Generator"
 LABEL org.opencontainers.image.description="Container for generating SPDX 3.0 SBOMs with security vulnerability integration"
 LABEL org.opencontainers.image.vendor="Programme interministériel VITAM"
-LABEL org.opencontainers.image.license="CeCILL-2.1"
+LABEL org.opencontainers.image.license="Apache-2.0"
 LABEL org.opencontainers.image.source="https://github.com/ProgrammeVitam/archifiltre"
 
 # Install system dependencies

@@ -411,7 +411,7 @@ async function createChecksums(files: string[], outputDir: string): Promise<stri
   }
 
   const checksumPath = join(outputDir, 'checksums.sha256');
-  await writeFile(checksumPath, checksums.join('\n') + '\n', 'utf-8');
+  await writeFile(checksumPath, `${checksums.join('\n')  }\n`, 'utf-8');
 
   log(`✓ Created checksums.sha256`, 'green');
   return checksumPath;

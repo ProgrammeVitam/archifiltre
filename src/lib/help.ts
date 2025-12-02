@@ -5,8 +5,8 @@
  * while letting Oclif handle all standard CLI behavior.
  */
 
-import { Help, Command } from '@oclif/core';
-import type { Config } from '@oclif/core';
+import { Help } from '@oclif/core';
+import type { Config , Command } from '@oclif/core';
 
 export default class ArchifiltreHelp extends Help {
   constructor(config: Config) {
@@ -22,10 +22,10 @@ export default class ArchifiltreHelp extends Help {
     // Replace description and VERSION section with branded header
     const withBrandedHeader = defaultHelp.replace(
       /^[\s\S]*?\n\n[\s\S]*?VERSION[\s\S]*?\n\s+[\s\S]*?\n\n/,
-      this.getBrandedHeader() + '\n\n'
+      `${this.getBrandedHeader()  }\n\n`
     );
 
-    return withBrandedHeader + '\n' + this.getFooter();
+    return `${withBrandedHeader  }\n${  this.getFooter()}`;
   }
 
   /**
@@ -33,7 +33,7 @@ export default class ArchifiltreHelp extends Help {
    */
   formatCommand(command: Command.Loadable): string {
     const defaultHelp = super.formatCommand(command);
-    return defaultHelp + '\n' + this.getFooter();
+    return `${defaultHelp  }\n${  this.getFooter()}`;
   }
 
   /**
