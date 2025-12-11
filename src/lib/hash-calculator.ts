@@ -18,7 +18,7 @@
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { promises as fs } from 'node:fs';
-import type { Observable} from 'rxjs';
+import type { Observable } from 'rxjs';
 import { from, of, defer, range } from 'rxjs';
 import {
   switchMap,
@@ -32,8 +32,8 @@ import {
   scan,
   last,
 } from 'rxjs/operators';
-import { xxh64 } from '@node-rs/xxhash';
-import { ArchiveReader, libarchiveWasm } from 'libarchive-wasm';
+import { ArchiveReader } from 'libarchive-wasm';
+import { initializeLibarchiveWasm } from '@lib/libarchive-init.ts';
 import { logger } from '@lib/logging.ts';
 import type { DatabaseConnection } from '@lib/database.ts';
 import { findDuplicateSizes, files } from '@lib/database.ts';
@@ -87,7 +87,8 @@ export const DEFAULT_HASH_CONFIG: Required<Omit<HashConfig, 'onProgress'>> = {
  * Uses @node-rs/xxhash for optimal performance with buffer-based hashing
  */
 function calculateBufferHash(buffer: Uint8Array): string {
-  const hash = xxh64(buffer);
+  // Use Bun's native xxh64 - fastest and cross-platform!
+  const hash = Bun.hash(buffer, 'xxhash64');
   // Convert BigInt to hex string with consistent 16-character padding
   return hash.toString(16).padStart(16, '0');
 }
@@ -112,7 +113,7 @@ async function extractAndHashFromArchive(
   const archiveBuffer = await fs.readFile(archivePath);
 
   // Initialize libarchive WASM
-  const mod = await libarchiveWasm();
+  const mod = await initializeLibarchiveWasm();
   const reader = new ArchiveReader(mod, new Int8Array(archiveBuffer));
 
   try {

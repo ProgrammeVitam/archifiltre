@@ -20,8 +20,8 @@ import { logger } from '@lib/logging.ts';
 import { isStandalone } from './platform-paths.ts';
 
 // Import PGlite WASM files for bundled executable (embedded at build time)
-import wasmPath from '../../pglite/pglite.wasm' with { type: 'file' };
-import dataPath from '../../pglite/pglite.data' with { type: 'file' };
+import wasmPath from '../../wasm_binaries/pglite.wasm' with { type: 'file' };
+import dataPath from '../../wasm_binaries/pglite.data' with { type: 'file' };
 
 // === Schema Definition ===
 

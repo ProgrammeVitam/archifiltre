@@ -7,12 +7,13 @@
     "archifiltre": "./archifiltre"
   },
   "scripts": {
+    "copy-wasm": "bun run scripts/copy-wasm.ts",
     "dev": "bun run src/main.ts",
     "expose-db": "bun run scripts/expose-db.ts",
     "expose-db:debug": "bun run scripts/expose-db.ts --debug",
     "expose-db:port": "bun run scripts/expose-db.ts --port=5433",
     "expose-db:help": "bun run scripts/expose-db.ts --help",
-    "prebuild": "mkdir -p dist && bun run sbom",
+    "prebuild": "mkdir -p dist && bun run copy-wasm && bun run sbom",
     "build": "bun run prebuild && bun build src/main.ts --compile --outfile dist/archifiltre --minify-syntax --minify-whitespace",
     "build:cli": "bun run prebuild && bun build src/main.ts --compile --outfile dist/archifiltre --minify-syntax --minify-whitespace",
     "build:release": "bun run build && cp dist/sbom/archifiltre-*.spdx3.yaml ./archifiltre.sbom",
@@ -40,7 +41,9 @@
     "sbom": "bun run scripts/generate-spdx3-sbom.ts --output-dir dist/sbom",
     "sbom:compliance": "bun run scripts/generate-spdx3-sbom.ts --output-dir dist/compliance-sbom --verbose",
     "sbom:security": "bun run scripts/generate-spdx3-sbom.ts --output-dir dist/security-sbom --verbose",
-    "sbom:dev": "bun run scripts/generate-spdx3-sbom.ts --output-dir dist/dev-sbom --verbose --force-rebuild"
+    "sbom:dev": "bun run scripts/generate-spdx3-sbom.ts --output-dir dist/dev-sbom --verbose --force-rebuild",
+    "smoke:linux": "bun run scripts/smoke-test.ts linux",
+    "smoke:windows": "bun run scripts/smoke-test.ts windows"
   },
   "keywords": [
     "file-tree",

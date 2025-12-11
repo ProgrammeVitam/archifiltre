@@ -39,33 +39,21 @@ import {
   type FileRow,
   files as _files,
 } from '@lib/database.ts';
-import { ArchiveReader, libarchiveWasm } from 'libarchive-wasm';
+import { ArchiveReader } from 'libarchive-wasm';
+import { initializeLibarchiveWasm } from '@lib/libarchive-init.ts';
 import { performHashing } from '@lib/hash-calculator.ts';
 
 // Archive Detection Constants
+// prettier-ignore
 const ARCHIVE_EXTENSIONS = new Set([
-  '.zip',
-  '.jar',
-  '.war',
-  '.ear',
-  '.apk',
-  '.7z',
-  '.rar',
-  '.tar',
-  '.tar.gz',
-  '.tgz',
-  '.tar.bz2',
-  '.tbz2',
-  '.tar.xz',
-  '.txz',
-  '.gz',
-  '.bz2',
-  '.xz',
-  '.lz4',
-  '.lzma',
-  '.cab',
-  '.iso',
-  '.dmg',
+  '.zip', '.jar', '.war', '.ear',    // ZIP family
+  '.7z',                             // 7-Zip
+  '.rar',                            // RAR
+  '.tar', '.tar.gz', '.tgz',         // TAR family
+  '.tar.bz2', '.tbz2',               // TAR + bzip2
+  '.tar.xz', '.txz',                 // TAR + xz
+  '.tar.lz4', '.tar.lzma',           // TAR + LZ4/LZMA
+  '.gz', '.bz2', '.xz', '.lz4', '.lzma', '.Z'  // Individual compression
 ]);
 
 const ARCHIVE_MAGIC_NUMBERS = new Map([
@@ -107,6 +95,8 @@ async function isArchiveByMagicNumber(
 ): Promise<{ isArchive: boolean; format?: string }> {
   try {
     const absolutePath = path.resolve(filePath);
+
+    // Check magic numbers (extension filtering now done in isArchiveFile)
     const fd = await fsp.open(absolutePath, 'r');
     const buffer = Buffer.alloc(16);
     const { bytesRead } = await fd.read(buffer, 0, 16, 0);
@@ -136,32 +126,63 @@ async function isArchiveByMagicNumber(
 }
 
 /**
- * Comprehensive archive detection combining extension and magic number checks
+ * Unified archive detection - single source of truth
+ * Uses existing ARCHIVE_EXTENSIONS Set for consistent filtering
  */
-export async function isArchiveFile(
-  filePath: string
+async function detectArchive(
+  filePath: string,
+  allowMagicNumbers: boolean = true
 ): Promise<{ isArchive: boolean; format?: string }> {
-  // Quick check by extension first
-  if (isArchiveByExtension(filePath)) {
-    const ext = path.extname(filePath).toLowerCase().slice(1); // Remove dot
+  // STAGE 1: Use existing extension check - if NOT in our Set, skip entirely
+  if (!isArchiveByExtension(filePath)) {
+    return { isArchive: false };
+  }
 
-    // For common extensions, trust the extension
-    if (['zip', 'jar', 'war', 'ear', 'apk', '7z', 'rar', 'tar'].includes(ext)) {
-      return { isArchive: true, format: ext };
-    }
+  // STAGE 2: Extension is in our allowed Set, get format
+  const ext = path.extname(filePath).toLowerCase();
+  const extWithoutDot = ext.slice(1);
 
-    // For compressed files, verify with magic number
+  // Trust common extensions immediately
+  const trustedExtensions = ['zip', 'jar', 'war', 'ear', '7z', 'rar', 'tar'];
+  if (trustedExtensions.includes(extWithoutDot)) {
+    return { isArchive: true, format: extWithoutDot };
+  }
+
+  // For compression formats, verify with magic number if allowed
+  if (allowMagicNumbers) {
     const magicCheck = await isArchiveByMagicNumber(filePath);
     if (magicCheck.isArchive) {
       return magicCheck;
     }
-
-    // Extension suggests archive but magic number doesn't confirm - trust extension
-    return { isArchive: true, format: ext };
   }
 
-  // Extension doesn't suggest archive, but check magic number for misnamed files
-  return await isArchiveByMagicNumber(filePath);
+  // Extension is in our Set, trust it
+  return { isArchive: true, format: extWithoutDot };
+}
+
+/**
+ * Archive detection for top-level files (with magic number verification)
+ */
+export async function isArchiveFile(
+  filePath: string
+): Promise<{ isArchive: boolean; format?: string }> {
+  return await detectArchive(filePath, true);
+}
+
+/**
+ * Archive detection for nested files (extension-only, no file system access)
+ */
+function isArchiveByExtensionOnly(filePath: string): { isArchive: boolean; format?: string } {
+  // Synchronous version - can't use await in this context
+  const ext = path.extname(filePath).toLowerCase();
+
+  // Use same logic - if NOT in Set, skip
+  if (!ARCHIVE_EXTENSIONS.has(ext)) {
+    return { isArchive: false };
+  }
+
+  const extWithoutDot = ext.slice(1);
+  return { isArchive: true, format: extWithoutDot };
 }
 
 // Archive Processing Configuration
@@ -241,7 +262,7 @@ async function processArchiveEntries(
     const archiveBuffer = await fsp.readFile(absolutePath);
 
     // Initialize libarchive WASM
-    const mod = await libarchiveWasm();
+    const mod = await initializeLibarchiveWasm();
     const reader = new ArchiveReader(mod, new Int8Array(archiveBuffer));
 
     let entryCount = 0;
@@ -288,7 +309,7 @@ async function processArchiveEntries(
 
           // If this entry is also an archive and nesting is enabled, process it recursively
           if (!isDirectory && config.enableNesting && entry.archiveDepth + 1 < config.maxDepth) {
-            const archiveCheck = await isArchiveFile(entryPath);
+            const archiveCheck = isArchiveByExtensionOnly(entryPath);
             if (archiveCheck.isArchive) {
               // Note: We can't process nested archives from memory easily with libarchive-wasm
               // So we'll just mark them as archive containers but not process their contents

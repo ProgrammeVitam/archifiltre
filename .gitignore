@@ -95,3 +95,9 @@ archifiltre.sbom
 
 # === Security Reports ===
 security-reports/
+
+# Test folder
+testfolder-*
+
+# WASM binaries (copied from node_modules)
+wasm_binaries/

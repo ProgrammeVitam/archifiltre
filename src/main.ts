@@ -29,32 +29,57 @@ const COMMANDS: Record<string, typeof Command> = {
 };
 
 /**
- * Minimal Config implementation that avoids file system reads
+ * Standalone Config for Compiled Executables
+ *
+ * IMPORTANT: This class solves a critical problem for bundled executables:
+ * - PGlite (our database) extracts WebAssembly files to the current working directory
+ * - When users run the binary from anywhere, those files would go to random locations
+ * - We change the working directory to a platform-specific app data folder
+ * - This ensures consistent, clean file organization across all platforms
+ *
+ * Side effect: User-provided relative paths need special handling (see commands)
  */
 class StandaloneConfig extends Config {
+  /**
+   * Original working directory where the user ran the binary.
+   * Commands use this to resolve user-provided relative paths correctly.
+   */
+  public readonly originalCwd: string;
+
   constructor() {
-    // In standalone mode, set working directory to platform-specific app data directory
-    // This ensures all runtime files (including PGlite WASM files) are stored in the
-    // correct user data location instead of wherever the binary was executed from
+    // STEP 1: Capture where the user actually ran the binary
+    // (before we change directories for internal file management)
+    const originalCwd = process.cwd();
+
+    // STEP 2: Determine platform-specific app data directory
+    // Linux: ~/.local/share/archifiltre/
+    // macOS: ~/Library/Application Support/archifiltre/
+    // Windows: %LOCALAPPDATA%\archifiltre\
     const appDataDir = getAppDataDir();
 
-    // Ensure app data directory exists before changing to it
+    // STEP 3: Ensure the app data directory exists
     if (!fs.existsSync(appDataDir)) {
       fs.mkdirSync(appDataDir, { recursive: true });
     }
 
-    // Change working directory - this makes ALL runtime files go to the right place:
+    // STEP 4: Change working directory to app data directory
+    // This is the KEY SOLUTION: All runtime files now go to the right place:
     // - PGlite WebAssembly files → ~/.local/share/archifiltre/pglite/
     // - Temp files → ~/.local/share/archifiltre/temp/
-    // - Any other runtime artifacts → ~/.local/share/archifiltre/
-    // (Paths automatically adapt to Windows/macOS conventions via getAppDataDir())
+    // - Log files → ~/.local/share/archifiltre/logs/
+    // - Database files → ~/.local/share/archifiltre/databases/
     process.chdir(appDataDir);
 
+    // STEP 5: Initialize parent class with app data directory as root
     super({ root: appDataDir });
+
+    // STEP 6: Store original directory for commands to use
+    // (TypeScript requires this assignment AFTER super() call)
+    this.originalCwd = originalCwd;
 
     const dataPath = path.join(appDataDir, '.archifiltre');
 
-    // Use Object.defineProperty to override readonly properties
+    // Configure oclif paths to use our app data directory structure
     Object.defineProperty(this, 'name', { value: 'archifiltre', writable: false });
     Object.defineProperty(this, 'version', { value: '5.0.0-dev', writable: false });
     Object.defineProperty(this, 'bin', { value: 'archifiltre', writable: false });

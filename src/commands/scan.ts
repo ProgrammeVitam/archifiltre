@@ -7,6 +7,7 @@
  */
 
 import { Command, Args, Flags, ux } from '@oclif/core';
+import path from 'node:path';
 import { setupOclifContext, logger } from '@lib/logging.ts';
 import { formatDuration } from '@lib/helpers.ts';
 import { createScanDatabase, closeScanDatabase, type DatabaseConnection } from '@lib/database.ts';
@@ -104,8 +105,11 @@ export default class Scan extends Command {
     let database: DatabaseConnection | undefined;
 
     try {
+      // Resolve directory relative to where the user ran the command
+      const resolvedDirectory = path.resolve(this.config.originalCwd, directory);
+
       // Validate scan target
-      const pathValidation = await validateScanPath(directory);
+      const pathValidation = await validateScanPath(resolvedDirectory);
       if (!pathValidation.valid) {
         this.error(`Invalid scan target: ${pathValidation.error}`, { exit: 1 });
       }
