@@ -4,6 +4,10 @@
  *
  * Self-contained entry point that bypasses oclif's file-based command discovery
  * while maintaining compatibility with oclif Command classes.
+ *
+ * Commands are registered from two sources:
+ * 1. Core commands - always available (version, health, scan, etc.)
+ * 2. Extension commands - auto-discovered from extensions that declare COMMAND
  */
 
 import { Command, Config, Interfaces } from '@oclif/core';
@@ -11,7 +15,7 @@ import { initializeLogging, logger, shutdownLogging } from '@lib/logging.ts';
 import path from 'node:path';
 import fs from 'node:fs';
 
-// Import commands directly
+// Import core commands directly
 import Version from './commands/version.ts';
 import Health from './commands/health.ts';
 import Sbom from './commands/sbom.ts';
@@ -19,13 +23,22 @@ import Scan from './commands/scan.ts';
 import ExposeDb from './commands/expose-db.ts';
 import { getAppDataDir } from '@lib/platform-paths.ts';
 
-// Command registry
-const COMMANDS: Record<string, typeof Command> = {
+// Import extension-declared commands
+import { EXTENSION_COMMANDS } from '@extensions/index.ts';
+
+// Core commands - always available
+const CORE_COMMANDS: Record<string, typeof Command> = {
   version: Version,
   health: Health,
   sbom: Sbom,
   scan: Scan,
   'expose-db': ExposeDb,
+};
+
+// Merged command registry: core + extension-declared commands
+const COMMANDS: Record<string, typeof Command> = {
+  ...CORE_COMMANDS,
+  ...EXTENSION_COMMANDS,
 };
 
 /**
