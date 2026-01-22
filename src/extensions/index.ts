@@ -20,6 +20,7 @@ import type { Command } from '@oclif/core';
 // Import all extensions here. Extensions with commands will be auto-discovered.
 
 import * as summary from './summary.ts';
+import * as csvExport from './csv-export.ts';
 
 // === Extension Registry ===
 
@@ -29,8 +30,8 @@ import * as summary from './summary.ts';
  */
 const EXTENSIONS: Record<string, unknown>[] = [
   summary,
+  csvExport,
   // Future extensions go here:
-  // csvExport,
   // jsonExport,
   // etc.
 ];
@@ -81,4 +82,4 @@ export const EXTENSION_COMMAND_NAMES: string[] = Object.keys(EXTENSION_COMMANDS)
 // === Re-export Extension Functions ===
 // Export individual extensions for direct use by other commands
 
-export { summary };
+export { summary, csvExport };

@@ -10,8 +10,9 @@ import { promises as fs } from 'node:fs';
 import { file } from 'bun';
 import { getDatabasePath } from './platform-paths.ts';
 import type { Observable } from 'rxjs';
-import { from, of, defer, EMPTY } from 'rxjs';
+import { from, of, defer, EMPTY, concat } from 'rxjs';
 import { map, catchError, tap, switchMap } from 'rxjs/operators';
+import { gt } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/pglite';
 import { PGlite } from '@electric-sql/pglite';
 import { pgTable, text, integer, index, primaryKey, boolean } from 'drizzle-orm/pg-core';
@@ -540,6 +541,90 @@ export function getAllFiles(
 }
 
 /**
+ * Get the most recent run_id from the database.
+ * Uses descending lexicographic order which works because run_id format
+ * is scan-{timestamp}-{random} and timestamps are monotonically increasing.
+ */
+export function getLatestRunId(connection: DatabaseConnection): Observable<string | null> {
+  return defer(() => {
+    return from(
+      connection.db
+        .selectDistinct({ run_id: files.run_id })
+        .from(files)
+        .orderBy(sql`${files.run_id} DESC`)
+        .limit(1)
+    ).pipe(
+      map(results => (results.length > 0 ? results[0].run_id : null)),
+      tap(runId => logger.debug('Retrieved latest run_id', { runId })),
+      catchError(error => {
+        logger.error('Failed to get latest run_id', error as Error);
+        return of(null);
+      })
+    );
+  });
+}
+
+/**
+ * Get files in batches using keyset pagination.
+ * Emits batches of files as an Observable stream for memory-efficient processing.
+ *
+ * @param connection Database connection
+ * @param runId The scan run to retrieve files from
+ * @param batchSize Number of files per batch (default: 5000)
+ * @returns Observable that emits FileSelect[] batches
+ */
+export function getFilesBatched(
+  connection: DatabaseConnection,
+  runId: string,
+  batchSize: number = 5000
+): Observable<FileSelect[]> {
+  return defer(() => {
+    logger.debug('Starting batched file retrieval', { runId, batchSize });
+
+    const fetchBatch = (lastPath: string | null): Observable<FileSelect[]> => {
+      const query = lastPath
+        ? connection.db
+            .select()
+            .from(files)
+            .where(and(eq(files.run_id, runId), gt(files.path, lastPath)))
+            .orderBy(files.path)
+            .limit(batchSize)
+        : connection.db
+            .select()
+            .from(files)
+            .where(eq(files.run_id, runId))
+            .orderBy(files.path)
+            .limit(batchSize);
+
+      return from(query).pipe(
+        switchMap(batch => {
+          if (batch.length === 0) {
+            logger.debug('Batched retrieval complete', { runId });
+            return EMPTY;
+          }
+
+          const newLastPath = batch[batch.length - 1].path;
+          logger.debug('Retrieved batch', {
+            runId,
+            batchSize: batch.length,
+            lastPath: newLastPath,
+          });
+
+          // Emit this batch, then recursively fetch next
+          return concat(of(batch), fetchBatch(newLastPath));
+        }),
+        catchError(error => {
+          logger.error('Failed to fetch file batch', error as Error, { runId, lastPath });
+          return EMPTY;
+        })
+      );
+    };
+
+    return fetchBatch(null);
+  });
+}
+
+/**
  * Database health check
  */
 export function checkHealth(connection: DatabaseConnection): Observable<boolean> {
@@ -570,5 +655,7 @@ export const dbOperations = {
   countRealDuplicates: countRealDuplicateGroups,
   getStats: getScanStats,
   getAllFiles,
+  getLatestRunId,
+  getFilesBatched,
   healthCheck: checkHealth,
 };

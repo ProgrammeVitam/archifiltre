@@ -1,0 +1,285 @@
+/**
+ * CSV Export Extension
+ *
+ * Exports scan results to CSV format using RxJS streaming pipeline.
+ * Handles large datasets efficiently with batched queries and streaming file writes.
+ */
+
+import { Command, Args, ux } from '@oclif/core';
+import { promises as fsp } from 'node:fs';
+import type { FileHandle } from 'node:fs/promises';
+import path from 'node:path';
+import type { Observable } from 'rxjs';
+import { defer, from } from 'rxjs';
+import {
+  concatMap,
+  finalize,
+  map,
+  scan,
+  tap,
+  catchError,
+  last,
+  defaultIfEmpty,
+} from 'rxjs/operators';
+import { setupOclifContext, logger } from '@lib/logging.ts';
+import {
+  createScanDatabase,
+  closeScanDatabase,
+  getLatestRunId,
+  getFilesBatched,
+  type DatabaseConnection,
+  type FileSelect,
+} from '@lib/database.ts';
+
+// === CSV Formatting ===
+
+/**
+ * CSV column definitions
+ */
+const CSV_COLUMNS = [
+  'path',
+  'type',
+  'physical_size',
+  'content_size',
+  'modified',
+  'hash',
+  'is_hidden',
+  'is_archive',
+  'archive_format',
+  'archive_parent',
+  'archive_depth',
+] as const;
+
+/**
+ * Get CSV header row
+ */
+function getCsvHeader(delimiter: string): string {
+  return CSV_COLUMNS.join(delimiter);
+}
+
+/**
+ * Escape a value for CSV format.
+ * Wraps in quotes if contains delimiter, quotes, or newlines.
+ */
+function escapeCsvValue(
+  value: string | number | boolean | null | undefined,
+  delimiter: string
+): string {
+  if (value === null || value === undefined) {
+    return '';
+  }
+
+  const stringValue = String(value);
+
+  // Check if quoting is needed
+  if (
+    stringValue.includes(delimiter) ||
+    stringValue.includes('"') ||
+    stringValue.includes('\n') ||
+    stringValue.includes('\r')
+  ) {
+    // Escape quotes by doubling them and wrap in quotes
+    return `"${stringValue.replace(/"/g, '""')}"`;
+  }
+
+  return stringValue;
+}
+
+/**
+ * Format a file row as a CSV line
+ */
+function formatCsvRow(file: FileSelect, delimiter: string): string {
+  const values = [
+    file.path,
+    file.is_directory ? 'directory' : 'file',
+    file.physical_size,
+    file.content_size,
+    file.mtime ? new Date(file.mtime * 1000).toISOString() : '',
+    file.hash,
+    file.is_hidden,
+    file.is_archive_container,
+    file.archive_format,
+    file.archive_parent_path,
+    file.archive_depth,
+  ];
+
+  return values.map(v => escapeCsvValue(v, delimiter)).join(delimiter);
+}
+
+// === File Writing ===
+
+/**
+ * Write lines to file handle
+ */
+function writeLines(fileHandle: FileHandle, lines: string[]): Observable<number> {
+  return defer(() => {
+    const content = `${lines.join('\n')}\n`;
+    return from(fileHandle.write(content)).pipe(map(() => lines.length));
+  });
+}
+
+// === Export Pipeline ===
+
+export interface CsvExportOptions {
+  delimiter?: string;
+  batchSize?: number;
+}
+
+/**
+ * Export scan results to CSV using streaming RxJS pipeline.
+ *
+ * @param database Database connection
+ * @param runId Scan run to export
+ * @param outputPath Output CSV file path
+ * @param options Export options
+ * @returns Observable that completes when export is done, emitting total count
+ */
+export function exportToCsv(
+  database: DatabaseConnection,
+  runId: string,
+  outputPath: string,
+  options: CsvExportOptions = {}
+): Observable<number> {
+  const { delimiter = ',', batchSize = 5000 } = options;
+
+  let fileHandle: FileHandle | null = null;
+
+  return defer(() => {
+    logger.debug('Starting CSV export', { runId, outputPath, batchSize });
+
+    // Open file and write header
+    return from(fsp.open(outputPath, 'w')).pipe(
+      tap(handle => {
+        fileHandle = handle;
+      }),
+      // Write header
+      concatMap(handle =>
+        from(handle.write(`${getCsvHeader(delimiter)}\n`)).pipe(map(() => handle))
+      ),
+      // Start streaming batches
+      concatMap(() =>
+        getFilesBatched(database, runId, batchSize).pipe(
+          // Format batch to CSV lines
+          map(batch => batch.map(file => formatCsvRow(file, delimiter))),
+          // Write batch to file with backpressure
+          concatMap(lines => {
+            if (!fileHandle) {
+              throw new Error('File handle not initialized');
+            }
+            return writeLines(fileHandle, lines);
+          }),
+          // Accumulate total count
+          scan((total, batchCount) => total + batchCount, 0),
+          // Emit 0 if no files found
+          defaultIfEmpty(0)
+        )
+      ),
+      // Get final count
+      last(),
+      // Cleanup: close file handle
+      finalize(async () => {
+        if (fileHandle) {
+          await fileHandle.close();
+          logger.debug('Closed CSV file handle', { outputPath });
+        }
+      }),
+      catchError(error => {
+        logger.error('CSV export failed', error as Error, { runId, outputPath });
+        throw error;
+      })
+    );
+  });
+}
+
+// === Command Declaration ===
+
+/**
+ * Export command - auto-registered via extension registry
+ */
+export const COMMAND = {
+  name: 'export',
+  command: class Export extends Command {
+    static override description = 'Export scan results to CSV';
+
+    static override examples = [
+      '<%= config.bin %> <%= command.id %> inventory.csv',
+      '<%= config.bin %> <%= command.id %> ./output/scan-results.csv',
+    ];
+
+    static override args = {
+      output: Args.string({
+        description: 'Output CSV file path',
+        required: true,
+      }),
+    };
+
+    async run(): Promise<void> {
+      const { args } = await this.parse(Export);
+      const outputPath = args.output as string;
+
+      // Cast config to access custom originalCwd property from StandaloneConfig
+      const config = this.config as typeof this.config & { originalCwd: string };
+      const cleanupLogging = setupOclifContext(
+        this as unknown as Parameters<typeof setupOclifContext>[0]
+      );
+      let database: DatabaseConnection | undefined;
+
+      try {
+        // Resolve output path relative to where user ran the command
+        const resolvedOutput = path.resolve(config.originalCwd, outputPath);
+
+        // Ensure output directory exists
+        const outputDir = path.dirname(resolvedOutput);
+        await fsp.mkdir(outputDir, { recursive: true });
+
+        // Connect to database
+        database = await createScanDatabase('main');
+
+        // Get latest run_id
+        ux.action.start('Finding latest scan');
+        const runId = await getLatestRunId(database).toPromise();
+
+        if (!runId) {
+          ux.action.stop('failed');
+          this.error(
+            'No scans found in database. Run a scan first with: archifiltre scan <directory>',
+            {
+              exit: 1,
+            }
+          );
+        }
+
+        ux.action.stop(runId);
+
+        // Export to CSV
+        ux.action.start(`Exporting to ${resolvedOutput}`);
+
+        const totalFiles = await exportToCsv(database, runId, resolvedOutput).toPromise();
+
+        ux.action.stop(`${totalFiles?.toLocaleString() ?? 0} files`);
+
+        this.log('');
+        this.log(`Export completed: ${resolvedOutput}`);
+
+        logger.debug('CSV export completed successfully', {
+          runId,
+          outputPath: resolvedOutput,
+          totalFiles,
+        });
+      } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+
+        logger.error('Export command failed', error instanceof Error ? error : undefined, {
+          outputPath,
+        });
+
+        this.error(`Export failed: ${errorMessage}`, { exit: 1 });
+      } finally {
+        if (database) {
+          await closeScanDatabase(database);
+        }
+        cleanupLogging();
+      }
+    }
+  },
+};
