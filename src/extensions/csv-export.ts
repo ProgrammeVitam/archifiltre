@@ -3,6 +3,7 @@
  *
  * Exports scan results to CSV format using RxJS streaming pipeline.
  * Handles large datasets efficiently with batched queries and streaming file writes.
+ * Joins with file_hashes table to include cryptographic hashes when available.
  */
 
 import { Command, Args, ux } from '@oclif/core';
@@ -10,7 +11,7 @@ import { promises as fsp } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import type { Observable } from 'rxjs';
-import { defer, from } from 'rxjs';
+import { defer, from, EMPTY, concat, of } from 'rxjs';
 import {
   concatMap,
   finalize,
@@ -21,15 +22,28 @@ import {
   last,
   defaultIfEmpty,
 } from 'rxjs/operators';
+import { eq, and, gt } from 'drizzle-orm';
 import { setupOclifContext, logger } from '@lib/logging.ts';
 import {
   createScanDatabase,
   closeScanDatabase,
   getLatestRunId,
-  getFilesBatched,
+  files,
   type DatabaseConnection,
   type FileSelect,
 } from '@lib/database.ts';
+import { fileHashes } from '@extensions/hash/schema.ts';
+
+// === Types ===
+
+/**
+ * File with optional hash data from JOIN
+ */
+interface FileWithHashes extends FileSelect {
+  md5: string | null;
+  sha256: string | null;
+  sha512: string | null;
+}
 
 // === CSV Formatting ===
 
@@ -43,6 +57,9 @@ const CSV_COLUMNS = [
   'content_size',
   'modified',
   'hash',
+  'md5',
+  'sha256',
+  'sha512',
   'is_hidden',
   'is_archive',
   'archive_format',
@@ -88,7 +105,7 @@ function escapeCsvValue(
 /**
  * Format a file row as a CSV line
  */
-function formatCsvRow(file: FileSelect, delimiter: string): string {
+function formatCsvRow(file: FileWithHashes, delimiter: string): string {
   const values = [
     file.path,
     file.is_directory ? 'directory' : 'file',
@@ -96,6 +113,9 @@ function formatCsvRow(file: FileSelect, delimiter: string): string {
     file.content_size,
     file.mtime ? new Date(file.mtime * 1000).toISOString() : '',
     file.hash,
+    file.md5,
+    file.sha256,
+    file.sha512,
     file.is_hidden,
     file.is_archive_container,
     file.archive_format,
@@ -104,6 +124,90 @@ function formatCsvRow(file: FileSelect, delimiter: string): string {
   ];
 
   return values.map(v => escapeCsvValue(v, delimiter)).join(delimiter);
+}
+
+// === Batched Query with JOIN ===
+
+/**
+ * Get files with hashes in batches using keyset pagination.
+ * LEFT JOINs file_hashes to include crypto hashes when available.
+ */
+function getFilesWithHashesBatched(
+  connection: DatabaseConnection,
+  runId: string,
+  batchSize: number = 5000
+): Observable<FileWithHashes[]> {
+  return defer(() => {
+    logger.debug('Starting batched file retrieval with hashes', { runId, batchSize });
+
+    const fetchBatch = (lastPath: string | null): Observable<FileWithHashes[]> => {
+      const conditions = [eq(files.run_id, runId)];
+      if (lastPath) {
+        conditions.push(gt(files.path, lastPath));
+      }
+
+      const query = connection.db
+        .select({
+          // File columns
+          run_id: files.run_id,
+          path: files.path,
+          physical_size: files.physical_size,
+          content_size: files.content_size,
+          mtime: files.mtime,
+          is_directory: files.is_directory,
+          is_hidden: files.is_hidden,
+          is_system: files.is_system,
+          hash: files.hash,
+          is_archive_container: files.is_archive_container,
+          archive_parent_path: files.archive_parent_path,
+          archive_depth: files.archive_depth,
+          archive_format: files.archive_format,
+          extraction_error: files.extraction_error,
+          // Hash columns from JOIN
+          md5: fileHashes.md5,
+          sha256: fileHashes.sha256,
+          sha512: fileHashes.sha512,
+        })
+        .from(files)
+        .leftJoin(
+          fileHashes,
+          and(eq(files.run_id, fileHashes.run_id), eq(files.path, fileHashes.path))
+        )
+        .where(and(...conditions))
+        .orderBy(files.path)
+        .limit(batchSize);
+
+      return from(query).pipe(
+        concatMap(batch => {
+          if (batch.length === 0) {
+            logger.debug('Batched retrieval with hashes complete', { runId });
+            return EMPTY;
+          }
+
+          const newLastPath = batch[batch.length - 1].path;
+          logger.debug('Retrieved batch with hashes', {
+            runId,
+            batchSize: batch.length,
+            lastPath: newLastPath,
+          });
+
+          // Cast to FileWithHashes (the query result matches this shape)
+          const filesWithHashes = batch as unknown as FileWithHashes[];
+
+          return concat(of(filesWithHashes), fetchBatch(newLastPath));
+        }),
+        catchError(error => {
+          logger.error('Failed to fetch file batch with hashes', error as Error, {
+            runId,
+            lastPath,
+          });
+          return EMPTY;
+        })
+      );
+    };
+
+    return fetchBatch(null);
+  });
 }
 
 // === File Writing ===
@@ -127,6 +231,7 @@ export interface CsvExportOptions {
 
 /**
  * Export scan results to CSV using streaming RxJS pipeline.
+ * Includes cryptographic hashes from file_hashes table when available.
  *
  * @param database Database connection
  * @param runId Scan run to export
@@ -156,9 +261,9 @@ export function exportToCsv(
       concatMap(handle =>
         from(handle.write(`${getCsvHeader(delimiter)}\n`)).pipe(map(() => handle))
       ),
-      // Start streaming batches
+      // Start streaming batches with JOIN
       concatMap(() =>
-        getFilesBatched(database, runId, batchSize).pipe(
+        getFilesWithHashesBatched(database, runId, batchSize).pipe(
           // Format batch to CSV lines
           map(batch => batch.map(file => formatCsvRow(file, delimiter))),
           // Write batch to file with backpressure
