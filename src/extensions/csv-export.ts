@@ -6,7 +6,7 @@
  * Joins with file_hashes table to include cryptographic hashes when available.
  */
 
-import { Command, Args, ux } from '@oclif/core';
+import { Command, Args, Flags, ux } from '@oclif/core';
 import { promises as fsp } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
@@ -28,6 +28,7 @@ import {
   createScanDatabase,
   closeScanDatabase,
   getLatestRunId,
+  getScanMetadata,
   files,
   type DatabaseConnection,
   type FileSelect,
@@ -104,10 +105,14 @@ function escapeCsvValue(
 
 /**
  * Format a file row as a CSV line
+ * @param file File data
+ * @param delimiter CSV delimiter
+ * @param rootPath Optional root path to prepend for full paths
  */
-function formatCsvRow(file: FileWithHashes, delimiter: string): string {
+function formatCsvRow(file: FileWithHashes, delimiter: string, rootPath?: string): string {
+  const filePath = rootPath ? path.join(rootPath, file.path) : file.path;
   const values = [
-    file.path,
+    filePath,
     file.is_directory ? 'directory' : 'file',
     file.physical_size,
     file.content_size,
@@ -227,6 +232,7 @@ function writeLines(fileHandle: FileHandle, lines: string[]): Observable<number>
 export interface CsvExportOptions {
   delimiter?: string;
   batchSize?: number;
+  rootPath?: string; // When provided, paths will be full paths
 }
 
 /**
@@ -245,7 +251,7 @@ export function exportToCsv(
   outputPath: string,
   options: CsvExportOptions = {}
 ): Observable<number> {
-  const { delimiter = ',', batchSize = 5000 } = options;
+  const { delimiter = ',', batchSize = 5000, rootPath } = options;
 
   let fileHandle: FileHandle | null = null;
 
@@ -265,7 +271,7 @@ export function exportToCsv(
       concatMap(() =>
         getFilesWithHashesBatched(database, runId, batchSize).pipe(
           // Format batch to CSV lines
-          map(batch => batch.map(file => formatCsvRow(file, delimiter))),
+          map(batch => batch.map(file => formatCsvRow(file, delimiter, rootPath))),
           // Write batch to file with backpressure
           concatMap(lines => {
             if (!fileHandle) {
@@ -309,6 +315,7 @@ export const COMMAND = {
     static override examples = [
       '<%= config.bin %> <%= command.id %> inventory.csv',
       '<%= config.bin %> <%= command.id %> ./output/scan-results.csv',
+      '<%= config.bin %> <%= command.id %> inventory.csv --full-paths',
     ];
 
     static override args = {
@@ -318,9 +325,17 @@ export const COMMAND = {
       }),
     };
 
+    static override flags = {
+      'full-paths': Flags.boolean({
+        description: 'Export full absolute paths instead of relative paths',
+        default: false,
+      }),
+    };
+
     async run(): Promise<void> {
-      const { args } = await this.parse(Export);
+      const { args, flags } = await this.parse(Export);
       const outputPath = args.output as string;
+      const fullPaths = flags['full-paths'];
 
       // Cast config to access custom originalCwd property from StandaloneConfig
       const config = this.config as typeof this.config & { originalCwd: string };
@@ -356,10 +371,26 @@ export const COMMAND = {
 
         ux.action.stop(runId);
 
+        // Get root path if full paths requested
+        let rootPath: string | undefined;
+        if (fullPaths) {
+          ux.action.start('Loading scan metadata');
+          const metadata = await getScanMetadata(database, runId).toPromise();
+          if (metadata) {
+            rootPath = metadata.root_path;
+            ux.action.stop(rootPath);
+          } else {
+            ux.action.stop('not found (using relative paths)');
+            this.warn('Scan metadata not found. Falling back to relative paths.');
+          }
+        }
+
         // Export to CSV
         ux.action.start(`Exporting to ${resolvedOutput}`);
 
-        const totalFiles = await exportToCsv(database, runId, resolvedOutput).toPromise();
+        const totalFiles = await exportToCsv(database, runId, resolvedOutput, {
+          rootPath,
+        }).toPromise();
 
         ux.action.stop(`${totalFiles?.toLocaleString() ?? 0} files`);
 

@@ -7,7 +7,7 @@
  * Uses RxJS streaming to handle large datasets efficiently.
  */
 
-import { Command, Args, Flags, ux } from '@oclif/core';
+import { Command, Flags, ux } from '@oclif/core';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import path from 'node:path';
@@ -19,6 +19,7 @@ import {
   createScanDatabase,
   closeScanDatabase,
   getLatestRunId,
+  getScanMetadata,
   files,
   type DatabaseConnection,
   type FileSelect,
@@ -266,17 +267,11 @@ export const COMMAND = {
     static override description = 'Compute cryptographic hashes for scanned files';
 
     static override examples = [
-      '<%= config.bin %> <%= command.id %> /path/to/scanned/directory',
-      '<%= config.bin %> <%= command.id %> /path/to/scanned/directory --algorithm sha256',
-      '<%= config.bin %> <%= command.id %> /path/to/scanned/directory --algorithm md5',
+      '<%= config.bin %> <%= command.id %>',
+      '<%= config.bin %> <%= command.id %> --algorithm sha256',
+      '<%= config.bin %> <%= command.id %> --algorithm md5',
+      '<%= config.bin %> <%= command.id %> --algorithm sha512',
     ];
-
-    static override args = {
-      directory: Args.string({
-        description: 'Root directory that was scanned (for resolving file paths)',
-        required: true,
-      }),
-    };
 
     static override flags = {
       algorithm: Flags.string({
@@ -288,15 +283,9 @@ export const COMMAND = {
     };
 
     async run(): Promise<void> {
-      const { args, flags } = await this.parse(Hash);
+      const { flags } = await this.parse(Hash);
       const algorithm = flags.algorithm as HashAlgorithm;
-      const directory = args.directory as string;
 
-      // Cast config to access custom originalCwd property
-      const config = this.config as typeof this.config & { originalCwd: string };
-
-      // Resolve root path relative to where user ran the command
-      const rootPath = path.resolve(config.originalCwd, directory);
       const cleanupLogging = setupOclifContext(
         this as unknown as Parameters<typeof setupOclifContext>[0]
       );
@@ -323,7 +312,20 @@ export const COMMAND = {
 
         ux.action.stop(runId);
 
-        this.log(`Root directory: ${rootPath}`);
+        // Get scan metadata to find root_path
+        ux.action.start('Loading scan metadata');
+        const metadata = await getScanMetadata(database, runId).toPromise();
+
+        if (!metadata) {
+          ux.action.stop('failed');
+          this.error(
+            'Scan metadata not found. This scan may have been created with an older version.',
+            { exit: 1 }
+          );
+        }
+
+        const rootPath = metadata.root_path;
+        ux.action.stop(rootPath);
 
         // Count files to hash first
         const fileCountResult = await database.db

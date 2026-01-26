@@ -10,7 +10,13 @@ import { Command, Args, Flags, ux } from '@oclif/core';
 import path from 'node:path';
 import { setupOclifContext, logger } from '@lib/logging.ts';
 import { formatDuration } from '@lib/helpers.ts';
-import { createScanDatabase, closeScanDatabase, type DatabaseConnection } from '@lib/database.ts';
+import {
+  createScanDatabase,
+  closeScanDatabase,
+  insertScanMetadata,
+  updateScanMetadata,
+  type DatabaseConnection,
+} from '@lib/database.ts';
 import { summary } from '@extensions/summary.ts';
 import {
   scanDirectory,
@@ -170,6 +176,10 @@ export default class Scan extends Command {
           },
         });
       });
+
+      // Store scan metadata (after scan completes, since scanner cleans the database)
+      await insertScanMetadata(database!, runId, rootPath).toPromise();
+      await updateScanMetadata(database!, runId, lastProgress.filesIngested).toPromise();
 
       // Display summary results
       await summary(database!, runId, this);

@@ -61,10 +61,26 @@ export const files = pgTable(
   })
 );
 
+// === Scan Metadata Table ===
+
+/**
+ * Scan metadata table - stores information about each scan run
+ * Includes root_path for resolving relative file paths
+ */
+export const scanMetadata = pgTable('scan_metadata', {
+  run_id: text('run_id').primaryKey(),
+  root_path: text('root_path').notNull(),
+  started_at: integer('started_at').notNull(),
+  completed_at: integer('completed_at'),
+  file_count: integer('file_count'),
+});
+
 // === Types ===
 
 export type FileRow = typeof files.$inferInsert;
 export type FileSelect = typeof files.$inferSelect;
+export type ScanMetadataRow = typeof scanMetadata.$inferInsert;
+export type ScanMetadataSelect = typeof scanMetadata.$inferSelect;
 
 export interface DatabaseConnection {
   pg: PGlite;
@@ -141,8 +157,19 @@ async function initializeSchema(db: ReturnType<typeof drizzle>): Promise<void> {
       sql`CREATE INDEX IF NOT EXISTS idx_files_archive_depth ON files (archive_depth)`
     );
 
+    // Create scan_metadata table - stores information about each scan run
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS scan_metadata (
+        run_id TEXT PRIMARY KEY,
+        root_path TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        completed_at INTEGER,
+        file_count INTEGER
+      )
+    `);
+
     logger.debug(
-      'Database schema initialized with physical_size, content_size, and archive preprocessing fields'
+      'Database schema initialized with physical_size, content_size, archive preprocessing fields, and scan_metadata'
     );
   } catch (error) {
     logger.error('Failed to initialize database schema', error as Error);
@@ -636,6 +663,82 @@ export function checkHealth(connection: DatabaseConnection): Observable<boolean>
   });
 }
 
+// === Scan Metadata Functions ===
+
+/**
+ * Insert scan metadata when a scan starts
+ */
+export function insertScanMetadata(
+  connection: DatabaseConnection,
+  runId: string,
+  rootPath: string
+): Observable<void> {
+  return defer(() => {
+    const startedAt = Math.floor(Date.now() / 1000);
+    return from(
+      connection.db.insert(scanMetadata).values({
+        run_id: runId,
+        root_path: rootPath,
+        started_at: startedAt,
+      })
+    ).pipe(
+      map(() => void 0),
+      tap(() => logger.debug('Scan metadata inserted', { runId, rootPath })),
+      catchError(error => {
+        logger.error('Failed to insert scan metadata', error as Error, { runId });
+        return of(void 0);
+      })
+    );
+  });
+}
+
+/**
+ * Update scan metadata when a scan completes
+ */
+export function updateScanMetadata(
+  connection: DatabaseConnection,
+  runId: string,
+  fileCount: number
+): Observable<void> {
+  return defer(() => {
+    const completedAt = Math.floor(Date.now() / 1000);
+    return from(
+      connection.db
+        .update(scanMetadata)
+        .set({ completed_at: completedAt, file_count: fileCount })
+        .where(eq(scanMetadata.run_id, runId))
+    ).pipe(
+      map(() => void 0),
+      tap(() => logger.debug('Scan metadata updated', { runId, fileCount })),
+      catchError(error => {
+        logger.error('Failed to update scan metadata', error as Error, { runId });
+        return of(void 0);
+      })
+    );
+  });
+}
+
+/**
+ * Get scan metadata for a run_id
+ */
+export function getScanMetadata(
+  connection: DatabaseConnection,
+  runId: string
+): Observable<ScanMetadataSelect | null> {
+  return defer(() => {
+    return from(
+      connection.db.select().from(scanMetadata).where(eq(scanMetadata.run_id, runId)).limit(1)
+    ).pipe(
+      map(results => (results.length > 0 ? results[0] : null)),
+      tap(metadata => logger.debug('Retrieved scan metadata', { runId, hasMetadata: !!metadata })),
+      catchError(error => {
+        logger.error('Failed to get scan metadata', error as Error, { runId });
+        return of(null);
+      })
+    );
+  });
+}
+
 // === Factory Functions ===
 
 export { createDatabase as createScanDatabase };
@@ -658,4 +761,7 @@ export const dbOperations = {
   getLatestRunId,
   getFilesBatched,
   healthCheck: checkHealth,
+  insertScanMetadata,
+  updateScanMetadata,
+  getScanMetadata,
 };
