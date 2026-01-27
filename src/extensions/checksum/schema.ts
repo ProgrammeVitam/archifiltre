@@ -12,7 +12,7 @@ import { pgTable, text, primaryKey, index } from 'drizzle-orm/pg-core';
  * One column per algorithm allows storing multiple checksum types per file.
  *
  * This table is designed to be LEFT JOINed with the core files table:
- *   SELECT f.*, c.md5, c.sha256, c.sha512
+ *   SELECT f.*, c.md5, c.sha256, c.sha512, c.xxhash64
  *   FROM files f
  *   LEFT JOIN file_checksums c ON f.run_id = c.run_id AND f.path = c.path
  */
@@ -24,6 +24,7 @@ export const fileChecksums = pgTable(
     md5: text('md5'),
     sha256: text('sha256'),
     sha512: text('sha512'),
+    xxhash64: text('xxhash64'),
   },
   table => ({
     pk: primaryKey({ columns: [table.run_id, table.path] }),
@@ -43,10 +44,12 @@ export type FileChecksumSelect = typeof fileChecksums.$inferSelect;
 
 /**
  * Supported checksum algorithms
+ * - md5, sha256, sha512: Cryptographic hashes (computed on demand)
+ * - xxhash64: Fast non-cryptographic hash (may already exist from duplicate detection)
  */
-export type ChecksumAlgorithm = 'md5' | 'sha256' | 'sha512';
+export type ChecksumAlgorithm = 'md5' | 'sha256' | 'sha512' | 'xxhash64';
 
 /**
  * List of supported algorithms (for CLI flag validation)
  */
-export const SUPPORTED_ALGORITHMS: ChecksumAlgorithm[] = ['md5', 'sha256', 'sha512'];
+export const SUPPORTED_ALGORITHMS: ChecksumAlgorithm[] = ['md5', 'sha256', 'sha512', 'xxhash64'];

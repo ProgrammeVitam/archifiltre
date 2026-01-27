@@ -15,9 +15,7 @@
  * - Database as source of truth for all operations
  */
 
-import * as path from 'node:path';
 import * as os from 'node:os';
-import { promises as fs } from 'node:fs';
 import type { Observable } from 'rxjs';
 import { from, of, defer, range } from 'rxjs';
 import {
@@ -32,18 +30,12 @@ import {
   scan,
   last,
 } from 'rxjs/operators';
-import { ArchiveReader } from 'libarchive-wasm';
-import { initializeLibarchiveWasm } from '@lib/libarchive-init.ts';
 import { logger } from '@lib/logging.ts';
 import type { DatabaseConnection } from '@lib/database.ts';
 import { findDuplicateSizes, files } from '@lib/database.ts';
 import { eq, and, count, isNull, inArray, sql } from 'drizzle-orm';
-import {
-  normalizePath,
-  toSystemPath,
-  getArchiveRelativePath,
-  pathEquals,
-} from '@lib/path-utils.ts';
+
+import { readFileContent, type FileEntry } from '@lib/file-reader.ts';
 
 // Hash calculation configuration
 export interface HashConfig {
@@ -88,71 +80,10 @@ export const DEFAULT_HASH_CONFIG: Required<Omit<HashConfig, 'onProgress'>> = {
  */
 function calculateBufferHash(buffer: Uint8Array): string {
   // Use Bun's native xxh64 - fastest and cross-platform!
-  const hash = Bun.hash(buffer, 'xxhash64');
+  // Cast to work around Bun's incomplete type definitions
+  const hash = Bun.hash(buffer, 'xxhash64' as unknown as undefined);
   // Convert BigInt to hex string with consistent 16-character padding
   return hash.toString(16).padStart(16, '0');
-}
-
-/**
- * Calculate xxhash64 for a regular filesystem file
- */
-async function calculateFileHash(filePath: string): Promise<string> {
-  const buffer = await fs.readFile(filePath);
-  return calculateBufferHash(buffer);
-}
-
-/**
- * Extract and hash a specific file from an archive with cross-platform path handling
- */
-async function extractAndHashFromArchive(
-  rootPath: string,
-  archiveParentPath: string,
-  relativePath: string
-): Promise<string> {
-  const archivePath = path.join(rootPath, toSystemPath(archiveParentPath));
-  const archiveBuffer = await fs.readFile(archivePath);
-
-  // Initialize libarchive WASM
-  const mod = await initializeLibarchiveWasm();
-  const reader = new ArchiveReader(mod, new Int8Array(archiveBuffer));
-
-  try {
-    // Get the path within the archive using proper normalization
-    const targetPath = getArchiveRelativePath(relativePath, archiveParentPath);
-
-    for (const entry of reader.entries()) {
-      if (entry && typeof entry.getPathname === 'function') {
-        const entryPath = normalizePath(entry.getPathname());
-        const normalizedTarget = normalizePath(targetPath);
-
-        if (pathEquals(entryPath, normalizedTarget)) {
-          const filetype = entry.getFiletype?.() || 'File';
-          if (filetype !== 'Directory' && !entryPath.endsWith('/')) {
-            // Hybrid approach: trust non-zero metadata, always verify 0-byte files
-            const reportedSize = entry.getSize() || 0;
-
-            if (reportedSize === 0) {
-              // Don't trust 0-byte metadata - always extract to verify
-              const content = entry.readData();
-              return calculateBufferHash(new Uint8Array(content || []));
-            } else {
-              // Trust non-zero metadata, extract and hash normally
-              const content = entry.readData();
-              if (content) {
-                return calculateBufferHash(new Uint8Array(content));
-              }
-              throw new Error(`Could not extract content for ${targetPath}`);
-            }
-          }
-          throw new Error(`Entry ${targetPath} is not a file`);
-        }
-      }
-    }
-
-    throw new Error(`File ${targetPath} not found in archive ${archiveParentPath}`);
-  } finally {
-    reader.free();
-  }
 }
 
 /**
@@ -161,27 +92,23 @@ async function extractAndHashFromArchive(
 function hashSingleFile(rootPath: string, fileEntry: FileHashEntry): Observable<HashUpdate | null> {
   return defer(async () => {
     try {
-      let hash: string;
+      // Use shared file-reader abstraction for both regular files and archive entries
+      const entry: FileEntry = {
+        path: fileEntry.path,
+        archiveParentPath: fileEntry.archiveParentPath,
+        archiveFormat: fileEntry.archiveFormat,
+      };
 
       if (fileEntry.archiveParentPath) {
-        // Archive entry - extract on-demand and hash
         logger.debug('Hashing archive entry', {
           path: fileEntry.path,
           archive: fileEntry.archiveParentPath,
           format: fileEntry.archiveFormat,
         });
-
-        hash = await extractAndHashFromArchive(
-          rootPath,
-          fileEntry.archiveParentPath,
-          fileEntry.path
-        );
-      } else {
-        // Regular filesystem file - use normalized path conversion
-        const systemPath = toSystemPath(fileEntry.path);
-        const fullPath = path.join(rootPath, systemPath);
-        hash = await calculateFileHash(fullPath);
       }
+
+      const buffer = await readFileContent(rootPath, entry);
+      const hash = calculateBufferHash(buffer);
 
       return {
         path: fileEntry.path,

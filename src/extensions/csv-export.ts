@@ -44,6 +44,7 @@ interface FileWithHashes extends FileSelect {
   md5: string | null;
   sha256: string | null;
   sha512: string | null;
+  xxhash64: string | null;
 }
 
 // === CSV Formatting ===
@@ -61,6 +62,7 @@ const CSV_COLUMNS = [
   'md5',
   'sha256',
   'sha512',
+  'xxhash64',
   'is_hidden',
   'is_archive',
   'archive_format',
@@ -121,6 +123,7 @@ function formatCsvRow(file: FileWithHashes, delimiter: string, rootPath?: string
     file.md5,
     file.sha256,
     file.sha512,
+    file.xxhash64,
     file.is_hidden,
     file.is_archive_container,
     file.archive_format,
@@ -172,6 +175,7 @@ function getFilesWithHashesBatched(
           md5: fileChecksums.md5,
           sha256: fileChecksums.sha256,
           sha512: fileChecksums.sha512,
+          xxhash64: fileChecksums.xxhash64,
         })
         .from(files)
         .leftJoin(
