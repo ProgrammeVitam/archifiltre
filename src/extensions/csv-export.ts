@@ -33,7 +33,7 @@ import {
   type DatabaseConnection,
   type FileSelect,
 } from '@lib/database.ts';
-import { fileHashes } from '@extensions/hash/schema.ts';
+import { fileChecksums } from '@extensions/checksum/schema.ts';
 
 // === Types ===
 
@@ -168,15 +168,15 @@ function getFilesWithHashesBatched(
           archive_depth: files.archive_depth,
           archive_format: files.archive_format,
           extraction_error: files.extraction_error,
-          // Hash columns from JOIN
-          md5: fileHashes.md5,
-          sha256: fileHashes.sha256,
-          sha512: fileHashes.sha512,
+          // Checksum columns from JOIN
+          md5: fileChecksums.md5,
+          sha256: fileChecksums.sha256,
+          sha512: fileChecksums.sha512,
         })
         .from(files)
         .leftJoin(
-          fileHashes,
-          and(eq(files.run_id, fileHashes.run_id), eq(files.path, fileHashes.path))
+          fileChecksums,
+          and(eq(files.run_id, fileChecksums.run_id), eq(files.path, fileChecksums.path))
         )
         .where(and(...conditions))
         .orderBy(files.path)
