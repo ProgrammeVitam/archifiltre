@@ -1,37 +1,49 @@
 {
-  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
-  "productName": "Archifiltre",
-  "version": "0.1.0",
-  "identifier": "com.tauri.dev",
-  "build": {
-    "frontendDist": "../public",
-    "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "bun dev",
-    "beforeBuildCommand": "bun build"
-  },
-  "app": {
-    "windows": [
-      {
-        "title": "Archifiltre",
-        "width": 800,
-        "height": 600,
-        "resizable": true,
-        "fullscreen": false
-      }
-    ],
-    "security": {
-      "csp": null
-    }
-  },
-  "bundle": {
-    "active": true,
-    "targets": "all",
-    "icon": [
-      "icons/32x32.png",
-      "icons/128x128.png",
-      "icons/128x128@2x.png",
-      "icons/icon.icns",
-      "icons/icon.ico"
-    ]
-  }
+	"$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+	"productName": "Archifiltre",
+	"version": "5.0.0",
+	"identifier": "fr.gouv.culture.archifiltre",
+	"build": {
+		"frontendDist": "../build",
+		"devUrl": "http://localhost:5173",
+		"beforeDevCommand": "bun run dev",
+		"beforeBuildCommand": "bun run build"
+	},
+	"app": {
+		"withGlobalTauri": true,
+		"windows": [
+			{
+				"title": "Archifiltre",
+				"width": 1200,
+				"height": 800,
+				"minWidth": 900,
+				"minHeight": 600,
+				"resizable": true,
+				"fullscreen": false,
+				"center": true
+			}
+		],
+		"security": {
+			"csp": null
+		}
+	},
+	"bundle": {
+		"active": true,
+		"targets": "all",
+		"icon": [
+			"icons/32x32.png",
+			"icons/128x128.png",
+			"icons/128x128@2x.png",
+			"icons/icon.icns",
+			"icons/icon.ico"
+		],
+		"externalBin": ["../../dist/archifiltre"],
+		"category": "Utility",
+		"shortDescription": "Privacy-first file scanning tool"
+	},
+	"plugins": {
+		"shell": {
+			"open": true
+		}
+	}
 }
