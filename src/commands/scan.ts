@@ -110,9 +110,14 @@ export default class Scan extends Command {
     const cleanupLogging = setupOclifContext(this);
     let database: DatabaseConnection | undefined;
 
+    // Cast config to access custom originalCwd property from StandaloneConfig
+    // Falls back to process.cwd() if not available (e.g., during development or if StandaloneConfig fails)
+    const config = this.config as typeof this.config & { originalCwd?: string };
+    const originalCwd = config.originalCwd || process.cwd();
+
     try {
       // Resolve directory relative to where the user ran the command
-      const resolvedDirectory = path.resolve(this.config.originalCwd, directory);
+      const resolvedDirectory = path.resolve(originalCwd, directory);
 
       // Validate scan target
       const pathValidation = await validateScanPath(resolvedDirectory);

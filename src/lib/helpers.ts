@@ -5,7 +5,10 @@
  * No side effects, framework-agnostic, and highly reusable.
  */
 
-import { homedir, freemem } from 'os';
+import { homedir, freemem, platform } from 'os';
+import { existsSync } from 'fs';
+import { access, constants } from 'fs/promises';
+import { getAppDataDir, getDatabasePath, isStandalone } from './platform-paths.ts';
 
 /**
  * Formats bytes as human-readable string
@@ -237,9 +240,23 @@ export interface VersionInfo {
 /**
  * Basic health report
  */
+export interface PathDiagnostics {
+  platform: string;
+  isStandalone: boolean;
+  currentWorkingDir: string;
+  appDataDir: string;
+  databaseDir: string;
+  appDataDirExists: boolean;
+  appDataDirWritable: boolean;
+  databaseDirExists: boolean;
+  databaseDirWritable: boolean;
+  environmentVars?: Record<string, string | undefined>;
+}
+
 export interface HealthReport {
   ok: boolean;
   checks: string[];
+  pathDiagnostics?: PathDiagnostics;
   timestamp?: string;
 }
 
@@ -261,7 +278,7 @@ export const api = {
   /**
    * Get basic health check
    */
-  async health(): Promise<HealthReport> {
+  async health(includePathDiagnostics = false): Promise<HealthReport> {
     // Simple health checks
     const nodeVersion = process.version;
     const majorVersion = parseInt(nodeVersion.substring(1).split('.')[0], 10);
@@ -279,9 +296,83 @@ export const api = {
         : `✗ Memory: ${memoryMB}MB available (minimum 100MB required)`,
     ];
 
+    // Path diagnostics (optional, for debugging)
+    let pathDiagnostics: PathDiagnostics | undefined;
+    if (includePathDiagnostics) {
+      const appDataDir = getAppDataDir();
+      const databaseDir = getDatabasePath('main');
+      const currentPlatform = platform();
+
+      // Check if directories exist
+      const appDataDirExists = existsSync(appDataDir);
+      const databaseDirExists = existsSync(databaseDir);
+
+      // Check if directories are writable
+      let appDataDirWritable = false;
+      let databaseDirWritable = false;
+
+      try {
+        if (appDataDirExists) {
+          await access(appDataDir, constants.W_OK);
+          appDataDirWritable = true;
+        }
+      } catch {
+        appDataDirWritable = false;
+      }
+
+      try {
+        if (databaseDirExists) {
+          await access(databaseDir, constants.W_OK);
+          databaseDirWritable = true;
+        }
+      } catch {
+        databaseDirWritable = false;
+      }
+
+      // Collect environment variables (especially useful on Windows)
+      const environmentVars: Record<string, string | undefined> = {};
+      if (currentPlatform === 'win32') {
+        environmentVars.LOCALAPPDATA = process.env.LOCALAPPDATA;
+        environmentVars.APPDATA = process.env.APPDATA;
+        environmentVars.USERPROFILE = process.env.USERPROFILE;
+      } else {
+        environmentVars.HOME = process.env.HOME;
+        environmentVars.XDG_DATA_HOME = process.env.XDG_DATA_HOME;
+      }
+
+      pathDiagnostics = {
+        platform: currentPlatform,
+        isStandalone: isStandalone(),
+        currentWorkingDir: process.cwd(),
+        appDataDir,
+        databaseDir,
+        appDataDirExists,
+        appDataDirWritable,
+        databaseDirExists,
+        databaseDirWritable,
+        environmentVars,
+      };
+
+      // Add path-related checks
+      checks.push(
+        appDataDirExists
+          ? `✓ App data directory: exists`
+          : `✗ App data directory: missing (${appDataDir})`
+      );
+
+      if (appDataDirExists) {
+        checks.push(
+          appDataDirWritable
+            ? `✓ App data directory: writable`
+            : `✗ App data directory: not writable`
+        );
+      }
+    }
+
     return {
       ok: nodeOk && memoryOk,
       checks,
+      pathDiagnostics,
       timestamp: new Date().toISOString(),
     };
   },

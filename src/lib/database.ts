@@ -83,6 +83,7 @@ export type ScanMetadataRow = typeof scanMetadata.$inferInsert;
 export type ScanMetadataSelect = typeof scanMetadata.$inferSelect;
 
 export interface DatabaseConnection {
+  name: string;
   pg: PGlite;
   db: ReturnType<typeof drizzle>;
 }
@@ -211,7 +212,7 @@ export async function createDatabase(name: string): Promise<DatabaseConnection> 
 
     logger.debug('Database created successfully', { path: resolvedPath });
 
-    return { pg, db };
+    return { name, pg, db };
   } catch (error) {
     logger.error('Failed to create database', error as Error, {
       name,
@@ -241,7 +242,7 @@ export async function closeDatabase(connection: DatabaseConnection): Promise<voi
  */
 export function cleanDatabase(connection: DatabaseConnection, runId: string): Observable<void> {
   return defer(async () => {
-    logger.debug('Recreating database for fresh schema', { runId });
+    logger.debug('Recreating database for fresh schema', { runId, dbName: connection.name });
 
     try {
       // Close current connection
@@ -249,7 +250,7 @@ export function cleanDatabase(connection: DatabaseConnection, runId: string): Ob
       logger.debug('Closed existing database connection');
 
       // Recreate database with fresh schema
-      const dbPath = createDatabasePath('main');
+      const dbPath = createDatabasePath(connection.name);
 
       // Delete existing database directory
       try {
@@ -282,7 +283,7 @@ export function cleanDatabase(connection: DatabaseConnection, runId: string): Ob
       connection.pg = newPg;
       connection.db = newDb;
 
-      logger.debug('Database recreated with fresh schema', { runId });
+      logger.debug('Database recreated with fresh schema', { runId, dbName: connection.name });
       return void 0;
     } catch (error) {
       logger.error('Failed to recreate database', error as Error, { runId });

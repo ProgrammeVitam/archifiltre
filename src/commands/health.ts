@@ -5,7 +5,7 @@
  */
 
 import { Command, Flags } from '@oclif/core';
-import { api, formatters, type HealthReport } from '@lib/helpers.ts';
+import { api, formatters, type HealthReport, type PathDiagnostics } from '@lib/helpers.ts';
 
 export default class Health extends Command {
   static override description = 'Check system health and requirements';
@@ -43,6 +43,9 @@ export default class Health extends Command {
     reset: '\x1b[0m',
     red: '\x1b[31m',
     green: '\x1b[32m',
+    yellow: '\x1b[33m',
+    cyan: '\x1b[36m',
+    dim: '\x1b[2m',
   } as const;
 
   /**
@@ -55,15 +58,75 @@ export default class Health extends Command {
     return `${this.colors[color]}${text}${this.colors.reset}`;
   }
 
+  /**
+   * Format path diagnostics for display
+   */
+  private formatPathDiagnostics(diagnostics: PathDiagnostics, noColor: boolean): string {
+    const lines: string[] = [];
+
+    lines.push('');
+    lines.push(this.colorize('═══ Path Diagnostics ═══', 'cyan', noColor));
+    lines.push('');
+
+    // Platform info
+    lines.push(this.colorize('Platform:', 'yellow', noColor));
+    lines.push(`  OS: ${diagnostics.platform}`);
+    lines.push(`  Mode: ${diagnostics.isStandalone ? 'Standalone executable' : 'Development'}`);
+    lines.push('');
+
+    // Cast config to access custom originalCwd property from StandaloneConfig
+    const config = this.config as typeof this.config & { originalCwd?: string };
+    const originalCwd = config.originalCwd;
+
+    // Directory paths
+    lines.push(this.colorize('Directories:', 'yellow', noColor));
+    if (originalCwd) {
+      lines.push(`  Original CWD:    ${originalCwd}`);
+    } else {
+      lines.push(
+        `  Original CWD:    ${this.colorize('(not set - using fallback)', 'red', noColor)}`
+      );
+    }
+    lines.push(`  Current CWD:     ${diagnostics.currentWorkingDir}`);
+    lines.push(`  App Data:        ${diagnostics.appDataDir}`);
+    lines.push(`  Database:        ${diagnostics.databaseDir}`);
+    lines.push('');
+
+    // Directory status
+    lines.push(this.colorize('Directory Status:', 'yellow', noColor));
+    const appDataStatus = diagnostics.appDataDirExists
+      ? diagnostics.appDataDirWritable
+        ? this.colorize('✓ exists, writable', 'green', noColor)
+        : this.colorize('✗ exists, NOT writable', 'red', noColor)
+      : this.colorize('✗ does not exist', 'red', noColor);
+    lines.push(`  App Data:        ${appDataStatus}`);
+
+    const dbStatus = diagnostics.databaseDirExists
+      ? diagnostics.databaseDirWritable
+        ? this.colorize('✓ exists, writable', 'green', noColor)
+        : this.colorize('✗ exists, NOT writable', 'red', noColor)
+      : this.colorize('○ not created yet (normal on first run)', 'dim', noColor);
+    lines.push(`  Database:        ${dbStatus}`);
+    lines.push('');
+
+    // Environment variables
+    if (diagnostics.environmentVars) {
+      lines.push(this.colorize('Environment Variables:', 'yellow', noColor));
+      for (const [key, value] of Object.entries(diagnostics.environmentVars)) {
+        const displayValue = value || this.colorize('(not set)', 'dim', noColor);
+        lines.push(`  ${key}: ${displayValue}`);
+      }
+    }
+
+    return lines.join('\n');
+  }
+
   public async run(): Promise<void> {
     const { flags } = await this.parse(Health);
 
     try {
-      if (flags.verbose && flags['log-format'] !== 'json') {
-        this.log('[VERBOSE] Starting system health check...');
-      }
-
-      const healthReport: HealthReport = await api.health();
+      // Include path diagnostics when verbose mode is enabled
+      const healthReport: HealthReport = await api.health(flags.verbose);
 
       if (flags['log-format'] === 'json') {
         this.log(JSON.stringify(healthReport, null, 2));
@@ -74,12 +137,11 @@ export default class Health extends Command {
           : this.colorize(formattedHealth, 'red', flags['no-color']);
 
         this.log(colorizedHealth);
-      }
 
-      if (flags.verbose && flags['log-format'] !== 'json') {
-        this.log(
-          `[VERBOSE] Health check completed: ${healthReport.ok ? 'HEALTHY' : 'ISSUES DETECTED'}`
-        );
+        // Show path diagnostics in verbose mode
+        if (flags.verbose && healthReport.pathDiagnostics) {
+          this.log(this.formatPathDiagnostics(healthReport.pathDiagnostics, flags['no-color']));
+        }
       }
 
       // Exit with error code if health check failed
