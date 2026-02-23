@@ -25,6 +25,7 @@ import {
 } from 'rxjs/operators';
 import { eq, and, gt } from 'drizzle-orm';
 import { setupOclifContext, logger } from '@lib/logging.ts';
+import { generateExportFilename } from '@lib/helpers.ts';
 import {
   createScanDatabase,
   closeScanDatabase,
@@ -454,15 +455,16 @@ export const COMMAND = {
     static override description = 'Export scan results to CSV';
 
     static override examples = [
+      '<%= config.bin %> <%= command.id %>',
       '<%= config.bin %> <%= command.id %> inventory.csv',
       '<%= config.bin %> <%= command.id %> ./output/scan-results.csv',
-      '<%= config.bin %> <%= command.id %> inventory.csv --full-paths',
+      '<%= config.bin %> <%= command.id %> --full-paths',
     ];
 
     static override args = {
       output: Args.string({
-        description: 'Output CSV file path',
-        required: true,
+        description: 'Output CSV file path (auto-generated if not provided)',
+        required: false,
       }),
     };
 
@@ -475,7 +477,6 @@ export const COMMAND = {
 
     async run(): Promise<void> {
       const { args, flags } = await this.parse(Export);
-      const outputPath = args.output as string;
       const fullPaths = flags['full-paths'];
 
       // Cast config to access custom originalCwd property from StandaloneConfig
@@ -486,6 +487,10 @@ export const COMMAND = {
       let database: DatabaseConnection | undefined;
 
       try {
+        // Determine output path - use provided path or generate one
+        const outputPath =
+          args.output || generateExportFilename({ type: 'export', extension: 'csv' });
+
         // Resolve output path relative to where user ran the command
         const resolvedOutput = path.resolve(config.originalCwd, outputPath);
 
@@ -557,7 +562,7 @@ export const COMMAND = {
         const errorMessage = error instanceof Error ? error.message : String(error);
 
         logger.error('Export command failed', error instanceof Error ? error : undefined, {
-          outputPath,
+          outputPath: args.output || '(auto-generated)',
         });
 
         this.error(`Export failed: ${errorMessage}`, { exit: 1 });

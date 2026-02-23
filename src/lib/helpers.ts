@@ -123,6 +123,57 @@ export function generateRunId(prefix = 'run'): string {
 }
 
 /**
+ * Options for generating export filenames
+ */
+export interface ExportFilenameOptions {
+  /** Prefix for the filename (default: 'archifiltre') */
+  prefix?: string;
+  /** Type of export (e.g., 'logs', 'export', 'scan') */
+  type: string;
+  /** File extension without the dot (e.g., 'zip', 'csv') */
+  extension: string;
+  /** Date to use for the filename (default: current date) */
+  date?: Date;
+}
+
+/**
+ * Generates a consistent, cross-platform safe filename for exports
+ *
+ * Format: {prefix}-{type}-{YYYY-MM-DD}-{HHmmss}.{extension}
+ *
+ * @example
+ * generateExportFilename({ type: 'logs', extension: 'zip' })
+ * // → "archifiltre-logs-2026-02-23-143052.zip"
+ *
+ * @example
+ * generateExportFilename({ type: 'export', extension: 'csv', prefix: 'scan' })
+ * // → "scan-export-2026-02-23-143052.csv"
+ */
+export function generateExportFilename(options: ExportFilenameOptions): string {
+  const { prefix = 'archifiltre', type, extension, date = new Date() } = options;
+
+  // Format date as YYYY-MM-DD
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  const dateStr = `${year}-${month}-${day}`;
+
+  // Format time as HHmmss (no separators for filename safety)
+  const hours = String(date.getHours()).padStart(2, '0');
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  const seconds = String(date.getSeconds()).padStart(2, '0');
+  const timeStr = `${hours}${minutes}${seconds}`;
+
+  // Sanitize inputs to ensure cross-platform compatibility
+  const safePrefix = prefix.replace(/[^a-zA-Z0-9-_]/g, '-');
+  const safeType = type.replace(/[^a-zA-Z0-9-_]/g, '-');
+  // Allow dots in extension for compound extensions like tar.gz
+  const safeExtension = extension.replace(/[^a-zA-Z0-9.]/g, '');
+
+  return `${safePrefix}-${safeType}-${dateStr}-${timeStr}.${safeExtension}`;
+}
+
+/**
  * Calculates processing rate (items per second)
  */
 export function calculateRate(itemCount: number, durationMs: number): number {
