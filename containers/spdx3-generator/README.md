@@ -148,7 +148,7 @@ creation_info:
   created: "2024-01-XX T12:00:00Z"
   creators:
     - "Tool: archifiltre-spdx3-generator"
-    - "Organization: République française – Ministère de la Culture (SNUM)"
+    - "Organization: République française – Ministère de la Culture (SNUM/SIAF)"
 security_summary:
   total_vulnerabilities: 12
   severity_breakdown:
@@ -225,11 +225,11 @@ bun run scripts/generate-spdx3-sbom.ts --verbose --force-rebuild
 
 This tool is designed for French government compliance requirements:
 
-- **Organization**: République française – Ministère de la Culture (SNUM)
-- **Program**: VITAM (Programme interministériel)
+- **Organization**: République française – Ministère de la Culture (SNUM/SIAF)
+- **Program**: Vitam (Programme interministériel)
 - **License**: Apache-2.0
 - **Standard**: SPDX 3.0.1 (System Package Data Exchange)
-- **Contact**: archifiltre@programmevitam.fr
+- **Contact**: archifiltre@culture.gouv.fr
 
 ### Compliance Features
 - Government-specific metadata
@@ -269,8 +269,8 @@ Apache-2.0 - Compatible with French government requirements
 For issues related to:
 - **SPDX 3.0 Specification**: https://spdx.dev/
 - **Official SPDX Tools**: https://github.com/spdx/tools-python
-- **Archifiltre Project**: archifiltre@programmevitam.fr
-- **VITAM Program**: https://www.programmevitam.fr/
+- **Archifiltre Project**: archifiltre@culture.gouv.fr
+- **Vitam Program**: https://www.programmevitam.fr/
 
 ## Contributing
 

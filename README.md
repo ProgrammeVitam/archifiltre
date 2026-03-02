@@ -6,10 +6,10 @@
 
 **Official Project of the French Republic**
 
-- **Organization**: République française – Ministère de la Culture (SNUM) / CIAF / DINUM  
-- **Program**: Programme interministériel VITAM
-- **Contact**: archifiltre@programmevitam.fr
-- **Website**: https://archifiltre.fabrique.social.gouv.fr
+- **Organization**: République française – Ministère de la Culture (SNUM/SIAF)  
+- **Program**: Programme interministériel Vitam
+- **Contact**: archifiltre@culture.gouv.fr
+- **Website**: https://www.archifiltre.org
 
 ---
 
@@ -350,8 +350,8 @@ bun run smoke:cli
 ## Support
 
 - **Issues**: https://github.com/ProgrammeVitam/archifiltre/issues
-- **Email**: archifiltre@programmevitam.fr
-- **Documentation**: https://archifiltre.fabrique.social.gouv.fr
+- **Email**: archifiltre@culture.gouv.fr
+- **Documentation**: https://www.archifiltre.org
 
 ---
 

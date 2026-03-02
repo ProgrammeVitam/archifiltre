@@ -2,12 +2,12 @@
 # Official Python SPDX tools with System Package Data Exchange 3.0 support
 FROM python:3.13-slim
 
-LABEL maintainer="République française – Ministère de la Culture (SNUM) / CIAF / DINUM"
+LABEL maintainer="République française – Ministère de la Culture (SNUM/SIAF)"
 LABEL description="SPDX 3.0 SBOM Generator for Archifiltre with official Python spdx-tools"
 LABEL version="1.0.0"
 LABEL org.opencontainers.image.title="Archifiltre SPDX 3.0 Generator"
 LABEL org.opencontainers.image.description="Container for generating SPDX 3.0 SBOMs with security vulnerability integration"
-LABEL org.opencontainers.image.vendor="Programme interministériel VITAM"
+LABEL org.opencontainers.image.vendor="Programme interministériel Vitam"
 LABEL org.opencontainers.image.license="Apache-2.0"
 LABEL org.opencontainers.image.source="https://github.com/ProgrammeVitam/archifiltre"
 

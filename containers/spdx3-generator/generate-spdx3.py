@@ -8,55 +8,59 @@ enhanced vulnerability tracking.
 
 Usage: python generate-spdx3.py [options]
 
-Author: République française – Ministère de la Culture (SNUM) / CIAF / DINUM
+Author: République française – Ministère de la Culture (SNUM/SIAF)
 License: Apache-2.0
-Program: VITAM (Programme interministériel)
+Program: Vitam (Programme interministériel)
 """
 
+import argparse
+import glob
 import json
 import os
+import subprocess
 import sys
-import argparse
 import uuid
-import glob
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Any
-import subprocess
+from typing import Any, Dict, List, Optional
 
 # SPDX 3.0 imports
 try:
+    import yaml
+    from semantic_version import Version
     from spdx_tools.spdx3.model import (
-        SpdxDocument,
         CreationInfo,
-        Tool,
         Organization,
         Relationship,
         RelationshipType,
+        SpdxDocument,
+        Tool,
     )
-    from spdx_tools.spdx3.model.software import Package, SoftwarePurpose
+
     # from spdx_tools.spdx3.model.licensing import ListedLicense, NoAssertionLicense
     from spdx_tools.spdx3.model.profile_identifier import ProfileIdentifierType
+    from spdx_tools.spdx3.model.software import Package, SoftwarePurpose
     from spdx_tools.spdx3.payload import Payload
-    from semantic_version import Version
-    import yaml
 except ImportError as e:
     print(f"Error: SPDX 3.0 tools not available: {e}", file=sys.stderr)
     print("Please install spdx-tools: pip install spdx-tools", file=sys.stderr)
     sys.exit(1)
 
+
 class SecurityReport:
     """Container for security audit results"""
+
     def __init__(self):
         self.vulnerabilities = []
         self.findings = []
         self.summary = {
-            'total_issues': 0,
-            'critical': 0,
-            'high': 0,
-            'medium': 0,
-            'low': 0
+            "total_issues": 0,
+            "critical": 0,
+            "high": 0,
+            "medium": 0,
+            "low": 0,
         }
+
 
 class Spdx3Generator:
     """SPDX 3.0 SBOM Generator with Security Integration"""
@@ -66,7 +70,7 @@ class Spdx3Generator:
         self.workspace_dir = Path("/workspace")
         self.output_dir = Path("/output")
         self.security_reports_dir = Path("/security-reports")
-        self.base_namespace = "https://archifiltre.fabrique.social.gouv.fr"
+        self.base_namespace = "https://www.archifiltre.org"
         self.payload = Payload()
         self.security_data = SecurityReport()
 
@@ -83,7 +87,7 @@ class Spdx3Generator:
         if not package_json_path.exists():
             raise FileNotFoundError(f"package.json not found at {package_json_path}")
 
-        with open(package_json_path, 'r', encoding='utf-8') as f:
+        with open(package_json_path, "r", encoding="utf-8") as f:
             return json.load(f)
 
     def load_security_reports(self):
@@ -91,44 +95,56 @@ class Spdx3Generator:
         self.log("Loading security audit results...")
 
         if not self.security_reports_dir.exists():
-            self.log("Security reports directory not found, continuing without security data", "WARN")
+            self.log(
+                "Security reports directory not found, continuing without security data",
+                "WARN",
+            )
             return
 
         # Look for security audit result files
         report_files = list(self.security_reports_dir.glob("*.json"))
 
         if not report_files:
-            self.log("No security report files found, continuing without security data", "WARN")
+            self.log(
+                "No security report files found, continuing without security data",
+                "WARN",
+            )
             return
 
         for report_file in report_files:
             try:
-                with open(report_file, 'r', encoding='utf-8') as f:
+                with open(report_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
 
                 # Parse Trivy results
-                if 'trivy' in data and 'vulnerabilities' in data['trivy']:
-                    self.security_data.vulnerabilities.extend(data['trivy']['vulnerabilities'])
+                if "trivy" in data and "vulnerabilities" in data["trivy"]:
+                    self.security_data.vulnerabilities.extend(
+                        data["trivy"]["vulnerabilities"]
+                    )
 
                 # Parse Semgrep results
-                if 'semgrep' in data and 'findings' in data['semgrep']:
-                    self.security_data.findings.extend(data['semgrep']['findings'])
+                if "semgrep" in data and "findings" in data["semgrep"]:
+                    self.security_data.findings.extend(data["semgrep"]["findings"])
 
                 # Parse summary
-                if 'summary' in data:
-                    summary = data['summary']
-                    self.security_data.summary['total_issues'] += summary.get('totalIssues', 0)
-                    self.security_data.summary['critical'] += summary.get('critical', 0)
-                    self.security_data.summary['high'] += summary.get('high', 0)
-                    self.security_data.summary['medium'] += summary.get('medium', 0)
-                    self.security_data.summary['low'] += summary.get('low', 0)
+                if "summary" in data:
+                    summary = data["summary"]
+                    self.security_data.summary["total_issues"] += summary.get(
+                        "totalIssues", 0
+                    )
+                    self.security_data.summary["critical"] += summary.get("critical", 0)
+                    self.security_data.summary["high"] += summary.get("high", 0)
+                    self.security_data.summary["medium"] += summary.get("medium", 0)
+                    self.security_data.summary["low"] += summary.get("low", 0)
 
             except Exception as e:
                 self.log(f"Error reading security report {report_file}: {e}", "WARN")
 
         total_vulns = len(self.security_data.vulnerabilities)
         total_findings = len(self.security_data.findings)
-        self.log(f"Loaded {total_vulns} vulnerabilities and {total_findings} security findings")
+        self.log(
+            f"Loaded {total_vulns} vulnerabilities and {total_findings} security findings"
+        )
 
     def get_git_info(self) -> Dict[str, str]:
         """Get Git repository information"""
@@ -136,38 +152,38 @@ class Spdx3Generator:
             os.chdir(self.workspace_dir)
 
             git_sha = subprocess.check_output(
-                ['git', 'rev-parse', 'HEAD'],
-                stderr=subprocess.DEVNULL,
-                text=True
+                ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, text=True
             ).strip()
 
             git_branch = subprocess.check_output(
-                ['git', 'rev-parse', '--abbrev-ref', 'HEAD'],
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
                 stderr=subprocess.DEVNULL,
-                text=True
+                text=True,
             ).strip()
 
-            return {'sha': git_sha, 'branch': git_branch}
+            return {"sha": git_sha, "branch": git_branch}
         except (subprocess.CalledProcessError, FileNotFoundError):
-            return {'sha': 'unknown', 'branch': 'unknown'}
+            return {"sha": "unknown", "branch": "unknown"}
 
     def create_agents(self, package_info: Dict[str, Any]) -> tuple[Tool, Organization]:
         """Create agent elements (Tool and Organization)"""
         tool = Tool(
             spdx_id=f"{self.base_namespace}/spdxdocs/tools/spdx3-generator-v{package_info['version']}",
             name="archifiltre-spdx3-generator",
-            creation_info=None
+            creation_info=None,
         )
 
         organization = Organization(
             spdx_id=f"{self.base_namespace}/spdxdocs/agents/republic-french-ministry-culture",
-            name="République française – Ministère de la Culture (SNUM) / CIAF / DINUM",
-            creation_info=None
+            name="République française – Ministère de la Culture (SNUM/SIAF)",
+            creation_info=None,
         )
 
         return tool, organization
 
-    def create_creation_info(self, tool: Tool, organization: Organization) -> CreationInfo:
+    def create_creation_info(
+        self, tool: Tool, organization: Organization
+    ) -> CreationInfo:
         """Create SPDX 3.0 CreationInfo"""
         timestamp = datetime.now(timezone.utc)
 
@@ -177,63 +193,85 @@ class Spdx3Generator:
             created_by=[tool.spdx_id, organization.spdx_id],
             profile=[ProfileIdentifierType.SOFTWARE, ProfileIdentifierType.CORE],
             data_license="CC0-1.0",
-            comment="Generated by VITAM program with security vulnerability integration"
+            comment="Generated by Vitam program with security vulnerability integration",
         )
 
         return creation_info
 
-    def create_spdx_document(self, package_info: Dict[str, Any], creation_info: CreationInfo) -> SpdxDocument:
+    def create_spdx_document(
+        self, package_info: Dict[str, Any], creation_info: CreationInfo
+    ) -> SpdxDocument:
         """Create the main SPDX 3.0 document"""
         document = SpdxDocument(
             spdx_id=f"{self.base_namespace}/spdxdocs/archifiltre-v{package_info['version']}-{uuid.uuid4()}",
             name=f"Archifiltre v{package_info['version']} - SPDX 3.0 SBOM with Security Data",
             creation_info=creation_info,
             element=[],  # Will be populated with references to other elements
-            root_element=[]  # Will be set to main package
+            root_element=[],  # Will be set to main package
         )
 
         return document
 
-    def create_main_package(self, package_info: Dict[str, Any], creation_info: CreationInfo) -> Package:
+    def create_main_package(
+        self, package_info: Dict[str, Any], creation_info: CreationInfo
+    ) -> Package:
         """Create the main Archifiltre package element"""
         git_info = self.get_git_info()
 
         # Enhanced description with security summary
         security_summary = ""
-        if self.security_data.summary['total_issues'] > 0:
+        if self.security_data.summary["total_issues"] > 0:
             security_summary = f" Security: {self.security_data.summary['total_issues']} issues found ({self.security_data.summary['critical']} critical, {self.security_data.summary['high']} high, {self.security_data.summary['medium']} medium, {self.security_data.summary['low']} low)."
 
         description = f"{package_info.get('description', 'Privacy-friendly desktop archival tool')}.{security_summary}"
 
         main_package = Package(
             spdx_id=f"{self.base_namespace}/spdxdocs/packages/archifiltre-v{package_info['version']}",
-            name=package_info['name'],
+            name=package_info["name"],
             creation_info=creation_info,
-            package_version=package_info['version'],
-            download_location=package_info.get('repository', {}).get('url', 'https://github.com/ProgrammeVitam/archifiltre'),
-            homepage=package_info.get('homepage', 'https://archifiltre.fabrique.social.gouv.fr'),
-            copyright_text=f"Copyright République française – Ministère de la Culture (SNUM) / CIAF / DINUM - {datetime.now().year}",
+            package_version=package_info["version"],
+            download_location=package_info.get("repository", {}).get(
+                "url", "https://github.com/ProgrammeVitam/archifiltre"
+            ),
+            homepage=package_info.get("homepage", "https://www.archifiltre.org"),
+            copyright_text=f"Copyright République française – Ministère de la Culture (SNUM/SIAF) – {datetime.now().year}",
             # declared_license=None,  # TODO: Implement proper SPDX 3.0 license handling
             # concluded_license=None, # TODO: Implement proper SPDX 3.0 license handling
             primary_purpose=SoftwarePurpose.APPLICATION,
             source_info=f"Built from Git commit {git_info['sha']} on branch {git_info['branch']}",
             description=description,
-            summary="Desktop archival tool with integrated security scanning"
+            summary="Desktop archival tool with integrated security scanning",
         )
 
         return main_package
 
-    def create_dependency_package(self, name: str, version: str, creation_info: CreationInfo) -> Package:
+    def create_dependency_package(
+        self, name: str, version: str, creation_info: CreationInfo
+    ) -> Package:
         """Create a dependency package element with security data"""
         # Clean version string
-        clean_version = version.replace('^', '').replace('~', '').replace('>=', '').replace('<', '').split(' ')[0]
+        clean_version = (
+            version.replace("^", "")
+            .replace("~", "")
+            .replace(">=", "")
+            .replace("<", "")
+            .split(" ")[0]
+        )
 
         # Find vulnerabilities for this package
-        package_vulns = [v for v in self.security_data.vulnerabilities if v.get('package') == name]
+        package_vulns = [
+            v for v in self.security_data.vulnerabilities if v.get("package") == name
+        ]
         vuln_comment = ""
         if package_vulns:
             vuln_count = len(package_vulns)
-            high_vuln_count = len([v for v in package_vulns if v.get('severity', '').upper() in ['HIGH', 'CRITICAL']])
+            high_vuln_count = len(
+                [
+                    v
+                    for v in package_vulns
+                    if v.get("severity", "").upper() in ["HIGH", "CRITICAL"]
+                ]
+            )
             if high_vuln_count > 0:
                 vuln_comment = f" WARNING: {vuln_count} vulnerabilities found ({high_vuln_count} high/critical)."
             else:
@@ -252,13 +290,20 @@ class Spdx3Generator:
             # concluded_license=None, # TODO: Implement proper license detection
             copyright_text="NOASSERTION",
             primary_purpose=SoftwarePurpose.LIBRARY,
-            comment=f"NPM dependency.{vuln_comment}" if vuln_comment else "NPM dependency"
+            comment=f"NPM dependency.{vuln_comment}"
+            if vuln_comment
+            else "NPM dependency",
         )
 
         return dep_package
 
-    def create_relationships(self, document: SpdxDocument, main_package: Package,
-                           dependencies: List[Package], creation_info: CreationInfo) -> List[Relationship]:
+    def create_relationships(
+        self,
+        document: SpdxDocument,
+        main_package: Package,
+        dependencies: List[Package],
+        creation_info: CreationInfo,
+    ) -> List[Relationship]:
         """Create relationships between elements"""
         relationships = []
 
@@ -268,7 +313,7 @@ class Spdx3Generator:
             from_element=document.spdx_id,
             relationship_type=RelationshipType.DESCRIBES,
             to=[main_package.spdx_id],
-            creation_info=creation_info
+            creation_info=creation_info,
         )
         relationships.append(doc_describes)
 
@@ -279,7 +324,7 @@ class Spdx3Generator:
                 from_element=main_package.spdx_id,
                 relationship_type=RelationshipType.DEPENDS_ON,
                 to=[dep.spdx_id],
-                creation_info=creation_info
+                creation_info=creation_info,
             )
             relationships.append(depends_rel)
 
@@ -313,8 +358,12 @@ class Spdx3Generator:
         document.root_element = [main_package.spdx_id]
 
         # Create dependency packages
-        dependencies = package_info.get('dependencies', {})
-        dev_dependencies = package_info.get('devDependencies', {}) if self.args.include_dev_deps else {}
+        dependencies = package_info.get("dependencies", {})
+        dev_dependencies = (
+            package_info.get("devDependencies", {})
+            if self.args.include_dev_deps
+            else {}
+        )
 
         all_deps = {**dependencies, **dev_dependencies}
         dependency_packages = []
@@ -325,12 +374,18 @@ class Spdx3Generator:
             dependency_packages.append(dep_package)
 
         # Create relationships
-        relationships = self.create_relationships(document, main_package, dependency_packages, creation_info)
+        relationships = self.create_relationships(
+            document, main_package, dependency_packages, creation_info
+        )
         for rel in relationships:
             self.payload.add_element(rel)
 
         # Update document elements list
-        document.element = [elem.spdx_id for elem in self.payload.get_full_map().values() if elem != document]
+        document.element = [
+            elem.spdx_id
+            for elem in self.payload.get_full_map().values()
+            if elem != document
+        ]
 
         self.log(f"Created payload with {len(self.payload.get_full_map())} elements:")
         self.log(f"  - 1 SPDX Document")
@@ -362,55 +417,71 @@ class Spdx3Generator:
                 "created": datetime.now(timezone.utc).isoformat(),
                 "creators": [
                     "Tool: archifiltre-spdx3-generator",
-                    "Organization: République française – Ministère de la Culture (SNUM)"
+                    "Organization: République française – Ministère de la Culture (SNUM/SIAF)",
                 ],
-                "spec_version": "3.0.1"
+                "spec_version": "3.0.1",
             },
             "security_summary": {
                 "total_vulnerabilities": len(self.security_data.vulnerabilities),
                 "total_findings": len(self.security_data.findings),
-                "severity_breakdown": self.security_data.summary
+                "severity_breakdown": self.security_data.summary,
             },
-            "elements": {}
+            "elements": {},
         }
 
         # Add elements
         for spdx_id, element in payload.get_full_map().items():
-            element_data = {
-                "spdx_id": spdx_id,
-                "type": element.__class__.__name__
-            }
+            element_data = {"spdx_id": spdx_id, "type": element.__class__.__name__}
 
             # Add common fields
-            for field in ['name', 'package_version', 'download_location', 'homepage', 'description', 'comment']:
+            for field in [
+                "name",
+                "package_version",
+                "download_location",
+                "homepage",
+                "description",
+                "comment",
+            ]:
                 if hasattr(element, field) and getattr(element, field):
                     element_data[field] = getattr(element, field)
 
             # Add license fields
-            for field in ['declared_license', 'concluded_license']:
+            for field in ["declared_license", "concluded_license"]:
                 if hasattr(element, field) and getattr(element, field):
                     element_data[field] = str(getattr(element, field))
 
             # Add relationship fields
-            if hasattr(element, 'relationship_type') and element.relationship_type:
+            if hasattr(element, "relationship_type") and element.relationship_type:
                 element_data["relationship_type"] = str(element.relationship_type)
-            if hasattr(element, 'from_element') and element.from_element:
+            if hasattr(element, "from_element") and element.from_element:
                 element_data["from_element"] = element.from_element
-            if hasattr(element, 'to') and element.to:
+            if hasattr(element, "to") and element.to:
                 element_data["to"] = element.to
 
             yaml_data["elements"][spdx_id] = element_data
 
         # Write file
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write("# SPDX 3.0 Document - Generated by Archifiltre SPDX 3.0 Generator\n")
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(
+                "# SPDX 3.0 Document - Generated by Archifiltre SPDX 3.0 Generator\n"
+            )
             f.write(f"# Generated on: {datetime.now(timezone.utc).isoformat()}Z\n")
-            f.write("# Organization: République française – Ministère de la Culture (SNUM)\n")
-            f.write("# Program: VITAM (Programme interministériel)\n")
+            f.write(
+                "# Organization: République française – Ministère de la Culture (SNUM/SIAF)\n"
+            )
+            f.write("# Program: Vitam (Programme interministériel)\n")
             f.write("# Standard: System Package Data Exchange (SPDX) 3.0.1\n")
             f.write("# License: Apache-2.0\n")
-            f.write("# Security: Integrated vulnerability and security finding data\n\n")
-            yaml.dump(yaml_data, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+            f.write(
+                "# Security: Integrated vulnerability and security finding data\n\n"
+            )
+            yaml.dump(
+                yaml_data,
+                f,
+                default_flow_style=False,
+                allow_unicode=True,
+                sort_keys=False,
+            )
 
     def generate(self):
         """Main generation method"""
@@ -437,12 +508,16 @@ class Spdx3Generator:
             self.log(f"  SPDX Version: 3.0.1 (System Package Data Exchange)")
             self.log(f"  Total Elements: {len(payload.get_full_map())}")
             self.log(f"  Output File: {output_path}")
-            self.log(f"  Security Data: {len(self.security_data.vulnerabilities)} vulnerabilities, {len(self.security_data.findings)} findings")
+            self.log(
+                f"  Security Data: {len(self.security_data.vulnerabilities)} vulnerabilities, {len(self.security_data.findings)} findings"
+            )
 
             self.log("\nProject Information:")
             self.log("  Standard: SPDX 3.0.1 - System Package Data Exchange")
-            self.log("  Organization: République française – Ministère de la Culture (SNUM)")
-            self.log("  Program: VITAM (Programme interministériel)")
+            self.log(
+                "  Organization: République française – Ministère de la Culture (SNUM/SIAF)"
+            )
+            self.log("  Program: Vitam (Programme interministériel)")
             self.log("  License: Apache-2.0")
 
             self.log("\nSPDX 3.0 generation completed successfully!")
@@ -451,8 +526,10 @@ class Spdx3Generator:
             self.log(f"Error during generation: {e}", "ERROR")
             if not self.args.quiet:
                 import traceback
+
                 traceback.print_exc()
             sys.exit(1)
+
 
 def parse_args():
     """Parse command line arguments"""
@@ -466,21 +543,33 @@ Examples:
   python generate-spdx3.py --quiet           # Quiet mode
 
 SPDX 3.0 SBOM Generator
-Organization: République française – Ministère de la Culture (SNUM)
-Program: VITAM (Programme interministériel)
+Organization: République française – Ministère de la Culture (SNUM/SIAF)
+Program: Vitam (Programme interministériel)
 License: Apache-2.0
-        """
+        """,
     )
 
-    parser.add_argument("--include-dev-deps", action="store_true", default=True,
-                       help="Include development dependencies (default)")
-    parser.add_argument("--exclude-dev-deps", action="store_false", dest="include_dev_deps",
-                       help="Exclude development dependencies")
-    parser.add_argument("--quiet", "-q", action="store_true",
-                       help="Suppress output messages")
-    parser.add_argument("--version", action="version", version="Archifiltre SPDX 3.0 Generator v1.0.0")
+    parser.add_argument(
+        "--include-dev-deps",
+        action="store_true",
+        default=True,
+        help="Include development dependencies (default)",
+    )
+    parser.add_argument(
+        "--exclude-dev-deps",
+        action="store_false",
+        dest="include_dev_deps",
+        help="Exclude development dependencies",
+    )
+    parser.add_argument(
+        "--quiet", "-q", action="store_true", help="Suppress output messages"
+    )
+    parser.add_argument(
+        "--version", action="version", version="Archifiltre SPDX 3.0 Generator v1.0.0"
+    )
 
     return parser.parse_args()
+
 
 def main():
     """Main entry point"""
@@ -494,6 +583,7 @@ def main():
     except Exception as e:
         print(f"Fatal error: {e}", file=sys.stderr)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

@@ -184,8 +184,8 @@ Examples:
   bun run scripts/generate-spdx3-sbom.ts --exclude-dev-deps --quiet
 
 SPDX 3.0 SBOM Generator
-Organization: République française – Ministère de la Culture (SNUM)
-Program: VITAM (Programme interministériel)
+Organization: République française – Ministère de la Culture (SNUM/SIAF)
+Program: Vitam (Programme interministériel)
 License: Apache-2.0
 `);
   }

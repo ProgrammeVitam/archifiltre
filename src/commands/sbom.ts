@@ -90,8 +90,8 @@ export default class Sbom extends Command {
       const info: Partial<SbomInfo> = {
         format: 'SPDX-3.0',
         standard: 'System Package Data Exchange',
-        organization: 'République française – Ministère de la Culture (SNUM)',
-        program: 'VITAM (Programme interministériel)',
+        organization: 'République française – Ministère de la Culture (SNUM/SIAF)',
+        program: 'Vitam (Programme interministériel)',
       };
 
       // Extract version
@@ -107,7 +107,7 @@ export default class Sbom extends Command {
       // Extract element count
       const elementsSection = sbomContent.match(/elements:\s*\n([\s\S]*?)(?:\n\S|$)/);
       const elementCount = elementsSection
-        ? (sbomContent.match(/https:\/\/archifiltre\.fabrique\.social\.gouv\.fr/g) || []).length
+        ? (sbomContent.match(/https:\/\/www\.archifiltre\.org/g) || []).length
         : 0;
       info.totalElements = elementCount;
 
@@ -148,8 +148,8 @@ export default class Sbom extends Command {
     if (verbose) {
       output += `\nAdditional Information:\n`;
       output += `  License: Apache-2.0\n`;
-      output += `  Contact: archifiltre@programmevitam.fr\n`;
-      output += `  Website: https://archifiltre.fabrique.social.gouv.fr\n`;
+      output += `  Contact: archifiltre@culture.gouv.fr\n`;
+      output += `  Website: https://www.archifiltre.org\n`;
       output += `  Program: https://www.programmevitam.fr/\n\n`;
 
       output += `SPDX 3.0 Features:\n`;

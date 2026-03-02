@@ -60,12 +60,12 @@
     "sbom"
   ],
   "author": {
-    "name": "République française – Ministère de la Culture (SNUM) / CIAF / DINUM",
-    "email": "archifiltre@programmevitam.fr",
-    "url": "https://archifiltre.fabrique.social.gouv.fr"
+    "name": "République française – Ministère de la Culture (SNUM/SIAF)",
+    "email": "archifiltre@culture.gouv.fr",
+    "url": "https://www.archifiltre.org"
   },
   "license": "Apache-2.0",
-  "homepage": "https://archifiltre.fabrique.social.gouv.fr",
+  "homepage": "https://www.archifiltre.org",
   "engines": {
     "bun": ">=1.0.0"
   },
@@ -131,7 +131,7 @@
   },
   "bugs": {
     "url": "https://github.com/ProgrammeVitam/archifiltre/issues",
-    "email": "archifiltre@programmevitam.fr"
+    "email": "archifiltre@culture.gouv.fr"
   },
   "funding": {
     "type": "government",
