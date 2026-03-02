@@ -9,6 +9,7 @@ import * as path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { file } from 'bun';
 import { getDatabasePath } from './platform-paths.ts';
+import { ensureDirectory } from './helpers.ts';
 import type { Observable } from 'rxjs';
 import { from, of, defer, EMPTY, concat } from 'rxjs';
 import { map, catchError, tap, switchMap } from 'rxjs/operators';
@@ -189,7 +190,7 @@ export async function createDatabase(name: string): Promise<DatabaseConnection> 
     logger.debug('Creating database', { name, dbPath, resolvedPath });
 
     // Ensure directory exists
-    await fs.mkdir(resolvedPath, { recursive: true });
+    await ensureDirectory(resolvedPath);
 
     // Initialize PGlite with explicit dataDir for standalone compatibility
     const pg = new PGlite({
@@ -263,7 +264,7 @@ export function cleanDatabase(connection: DatabaseConnection, runId: string): Ob
 
       // Create fresh database
       const resolvedPath = path.resolve(dbPath);
-      await fs.mkdir(resolvedPath, { recursive: true });
+      await ensureDirectory(resolvedPath);
 
       const newPg = new PGlite({
         dataDir: resolvedPath,

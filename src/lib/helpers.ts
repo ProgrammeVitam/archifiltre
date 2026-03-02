@@ -7,7 +7,7 @@
 
 import { homedir, freemem, platform } from 'os';
 import { existsSync } from 'fs';
-import { access, constants } from 'fs/promises';
+import { access, constants, mkdir } from 'fs/promises';
 import { getAppDataDir, getDatabasePath, isStandalone } from './platform-paths.ts';
 
 /**
@@ -48,6 +48,29 @@ export function formatDuration(ms: number): string {
  */
 export function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Ensures a directory exists, creating it (and parent directories) if necessary.
+ *
+ * This function works around a Bun runtime bug on Windows where
+ * `fs.promises.mkdir(path, { recursive: true })` incorrectly throws
+ * `EEXIST` when the directory already exists. According to Node.js
+ * documentation, `recursive: true` should silently succeed if the
+ * directory exists.
+ *
+ * @param dirPath - The directory path to ensure exists
+ *
+ * @example
+ * // Ensure output directory exists before writing a file
+ * const outputDir = path.dirname(outputFilePath);
+ * await ensureDirectory(outputDir);
+ * await fs.writeFile(outputFilePath, content);
+ */
+export async function ensureDirectory(dirPath: string): Promise<void> {
+  if (!existsSync(dirPath)) {
+    await mkdir(dirPath, { recursive: true });
+  }
 }
 
 /**

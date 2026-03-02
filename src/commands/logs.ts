@@ -7,7 +7,7 @@
 
 import { Command, Flags } from '@oclif/core';
 import { getLogsDir } from '@lib/platform-paths.ts';
-import { generateExportFilename, formatBytes } from '@lib/helpers.ts';
+import { generateExportFilename, formatBytes, ensureDirectory } from '@lib/helpers.ts';
 import {
   createScanDatabase,
   closeScanDatabase,
@@ -509,7 +509,7 @@ export default class Logs extends Command {
     // Create a tar.gz archive (using built-in zlib for gzip)
     // We'll create a simple concatenated gzip of all log files
     const outputDir = path.dirname(resolvedOutput);
-    await fsp.mkdir(outputDir, { recursive: true });
+    await ensureDirectory(outputDir);
 
     // For simplicity, we'll create a .tar.gz using shell command if available,
     // otherwise fall back to copying files to a directory
@@ -586,9 +586,7 @@ export default class Logs extends Command {
    */
   private async openLogsDirectory(logsDir: string, noColor: boolean): Promise<void> {
     // Ensure directory exists
-    if (!fs.existsSync(logsDir)) {
-      await fsp.mkdir(logsDir, { recursive: true });
-    }
+    await ensureDirectory(logsDir);
 
     this.log(this.colorize('Opening log directory...', 'cyan', noColor));
 

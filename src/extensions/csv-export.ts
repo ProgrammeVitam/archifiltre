@@ -25,7 +25,7 @@ import {
 } from 'rxjs/operators';
 import { eq, and, gt } from 'drizzle-orm';
 import { setupOclifContext, logger } from '@lib/logging.ts';
-import { generateExportFilename } from '@lib/helpers.ts';
+import { generateExportFilename, ensureDirectory } from '@lib/helpers.ts';
 import {
   createScanDatabase,
   closeScanDatabase,
@@ -496,7 +496,7 @@ export const COMMAND = {
 
         // Ensure output directory exists
         const outputDir = path.dirname(resolvedOutput);
-        await fsp.mkdir(outputDir, { recursive: true });
+        await ensureDirectory(outputDir);
 
         // Connect to database
         database = await createScanDatabase('main');
