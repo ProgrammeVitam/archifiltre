@@ -127,6 +127,15 @@ export default class Scan extends Command {
 
       const rootPath = pathValidation.resolvedPath!;
       const runId = flags['run-id'] || generateRunId();
+      const startedAt = Math.floor(Date.now() / 1000);
+
+      logger.info('Scan started', {
+        runId,
+        directory: rootPath,
+        db: flags.db,
+        includeHidden: flags['include-hidden'],
+        archivesEnabled: !flags['disable-archives'],
+      });
 
       // Create database connection
       database = await createScanDatabase(flags.db);
@@ -183,18 +192,19 @@ export default class Scan extends Command {
       });
 
       // Store scan metadata (after scan completes, since scanner cleans the database)
-      await insertScanMetadata(database!, runId, rootPath).toPromise();
+      await insertScanMetadata(database!, runId, rootPath, startedAt).toPromise();
       await updateScanMetadata(database!, runId, lastProgress.filesIngested).toPromise();
 
       // Display summary results
       await summary(database!, runId, this);
 
       const finalDuration = Date.now() - startTime;
-      logger.debug('Scan completed successfully', {
+      logger.info('Scan completed', {
         runId,
         rootPath,
-        duration: finalDuration,
+        durationMs: finalDuration,
         filesDiscovered: lastProgress.filesDiscovered,
+        filesIngested: lastProgress.filesIngested,
         duplicateGroups: lastProgress.duplicateGroups,
       });
     } catch (error) {

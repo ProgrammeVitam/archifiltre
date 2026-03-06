@@ -389,7 +389,7 @@ export function exportToCsv(
   let fileHandle: FileHandle | null = null;
 
   return defer(() => {
-    logger.debug('Starting CSV export', {
+    logger.info('CSV export started', {
       runId,
       outputPath,
       batchSize,
@@ -553,7 +553,7 @@ export const COMMAND = {
         this.log('');
         this.log(`Export completed: ${resolvedOutput}`);
 
-        logger.debug('CSV export completed successfully', {
+        logger.info('CSV export completed', {
           runId,
           outputPath: resolvedOutput,
           totalFiles,

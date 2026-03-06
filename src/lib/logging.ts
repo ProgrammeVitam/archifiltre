@@ -314,11 +314,15 @@ export function setupOclifContext(command: OclifCommandContext): () => void {
 
 // === Initialization Functions ===
 
-export async function initializeLogging(config?: Partial<LoggingConfig>): Promise<void> {
+export async function initializeLogging(
+  config?: Partial<LoggingConfig>,
+  command?: string
+): Promise<void> {
   const logger = createLogger(config);
   setGlobalLogger(logger);
 
   logger.info('Logging system initialized', {
+    command: command || 'unknown',
     logDirectory: logger['config'].logDirectory,
     level: logger['config'].level,
     fileLogging: logger['config'].enableFileLogging,

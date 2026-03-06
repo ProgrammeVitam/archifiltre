@@ -284,11 +284,14 @@ async function main() {
     const { command, args, globalFlags, isHelp, isVersion } = parseArgs(process.argv.slice(2));
 
     // Initialize logging
-    await initializeLogging({
-      level: globalFlags.verbose ? 'debug' : 'info',
-      enableConsoleLogging: false,
-      enableFileLogging: true,
-    });
+    await initializeLogging(
+      {
+        level: globalFlags.verbose ? 'debug' : 'info',
+        enableConsoleLogging: false,
+        enableFileLogging: true,
+      },
+      command
+    );
 
     const config = new StandaloneConfig();
 

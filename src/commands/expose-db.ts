@@ -132,7 +132,7 @@ export default class ExposeDb extends Command {
 
       this.log('Press Ctrl+C to stop\n');
 
-      logger.debug('Database expose server started successfully', {
+      logger.info('Database expose server started', {
         port: flags.port,
         database: flags.database,
         dbPath: databasePath,

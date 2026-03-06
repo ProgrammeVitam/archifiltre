@@ -211,7 +211,7 @@ export async function createDatabase(name: string): Promise<DatabaseConnection> 
 
     await initializeSchema(db);
 
-    logger.debug('Database created successfully', { path: resolvedPath });
+    logger.info('Database created', { name, path: resolvedPath });
 
     return { name, pg, db };
   } catch (error) {
@@ -673,10 +673,10 @@ export function checkHealth(connection: DatabaseConnection): Observable<boolean>
 export function insertScanMetadata(
   connection: DatabaseConnection,
   runId: string,
-  rootPath: string
+  rootPath: string,
+  startedAt: number
 ): Observable<void> {
   return defer(() => {
-    const startedAt = Math.floor(Date.now() / 1000);
     return from(
       connection.db.insert(scanMetadata).values({
         run_id: runId,

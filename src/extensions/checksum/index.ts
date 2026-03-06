@@ -783,7 +783,7 @@ export function computeChecksums(
   const { algorithm, batchSize = 5000, concurrency = 4, eachFile = false } = options;
 
   return defer(() => {
-    logger.debug('Starting checksum computation', {
+    logger.info('Checksum computation started', {
       runId,
       algorithm,
       batchSize,
@@ -1167,7 +1167,7 @@ export const COMMAND = {
           this.log(`  (${lastProgress.filesSkipped.toLocaleString()} files skipped due to errors)`);
         }
 
-        logger.debug('Checksum computation completed', {
+        logger.info('Checksum computation completed', {
           runId,
           algorithm,
           eachFile,
