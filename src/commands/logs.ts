@@ -23,6 +23,7 @@ import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createGzip } from 'node:zlib';
 import { pipeline } from 'node:stream/promises';
+import * as tar from 'tar-stream';
 
 const execAsync = promisify(exec);
 
@@ -506,78 +507,66 @@ export default class Logs extends Command {
       this.error('No log files found. Nothing to export.', { exit: 1 });
     }
 
-    // Create a tar.gz archive (using built-in zlib for gzip)
-    // We'll create a simple concatenated gzip of all log files
+    // Create a tar.gz archive using tar-stream (pure JS, cross-platform)
     const outputDir = path.dirname(resolvedOutput);
     await ensureDirectory(outputDir);
 
-    // For simplicity, we'll create a .tar.gz using shell command if available,
-    // otherwise fall back to copying files to a directory
-    try {
-      if (scanFilter) {
-        // When filtering by scan, create a filtered log file first
-        const filteredLogPath = path.join(logsDir, `filtered-${scanFilter.runId}.log`);
-        const mostRecent = logFiles[0];
-        const filteredLines = await this.readLinesAfterTime(mostRecent.path, scanFilter.startTime);
+    // Create tar pack stream and pipe through gzip to output file
+    const pack = tar.pack();
+    const gzip = createGzip();
+    const output = fs.createWriteStream(resolvedOutput);
 
-        if (filteredLines.length === 0) {
-          this.error('No log entries found for this scan. Nothing to export.', { exit: 1 });
-        }
+    // Set up the pipeline: tar -> gzip -> file
+    const pipelinePromise = pipeline(pack, gzip, output);
 
-        await fsp.writeFile(filteredLogPath, `${filteredLines.join('\n')}\n`);
-
-        try {
-          await execAsync(`tar -czf "${resolvedOutput}" "filtered-${scanFilter.runId}.log"`, {
-            cwd: logsDir,
-          });
-        } finally {
-          // Clean up temporary filtered file
-          await fsp.unlink(filteredLogPath).catch(() => {});
-        }
-
-        this.log('');
-        this.log(this.colorize('✓ Scan logs exported successfully!', 'green', noColor));
-        this.log(`  ${this.colorize('Location:', 'bold', noColor)} ${resolvedOutput}`);
-        this.log(`  ${this.colorize('Scan:', 'bold', noColor)} ${scanFilter.runId}`);
-        this.log(`  ${this.colorize('Log entries:', 'bold', noColor)} ${filteredLines.length}`);
-
-        const stats = await fsp.stat(resolvedOutput);
-        this.log(`  ${this.colorize('Size:', 'bold', noColor)} ${formatBytes(stats.size)}`);
-      } else {
-        // Export all log files
-        const fileList = logFiles.map(f => f.name).join(' ');
-
-        await execAsync(`tar -czf "${resolvedOutput}" ${fileList}`, { cwd: logsDir });
-
-        this.log('');
-        this.log(this.colorize('✓ Logs exported successfully!', 'green', noColor));
-        this.log(`  ${this.colorize('Location:', 'bold', noColor)} ${resolvedOutput}`);
-        this.log(`  ${this.colorize('Files:', 'bold', noColor)} ${logFiles.length} log file(s)`);
-
-        const stats = await fsp.stat(resolvedOutput);
-        this.log(`  ${this.colorize('Size:', 'bold', noColor)} ${formatBytes(stats.size)}`);
-      }
-    } catch {
-      // Fallback: create a gzipped copy of the most recent log
-      const gzPath = resolvedOutput.replace('.zip', '.log.gz');
+    if (scanFilter) {
+      // When filtering by scan, create a filtered log entry
       const mostRecent = logFiles[0];
+      const filteredLines = await this.readLinesAfterTime(mostRecent.path, scanFilter.startTime);
 
-      const source = fs.createReadStream(mostRecent.path);
-      const destination = fs.createWriteStream(gzPath);
-      const gzip = createGzip();
+      if (filteredLines.length === 0) {
+        pack.finalize();
+        await pipelinePromise;
+        // Clean up empty file
+        await fsp.unlink(resolvedOutput).catch(() => {});
+        this.error('No log entries found for this scan. Nothing to export.', { exit: 1 });
+      }
 
-      await pipeline(source, gzip, destination);
+      const filteredContent = `${filteredLines.join('\n')}\n`;
+      const filteredBuffer = Buffer.from(filteredContent, 'utf-8');
+      const filteredName = `filtered-${scanFilter.runId}.log`;
+
+      // Add filtered log to tar archive
+      pack.entry({ name: filteredName, size: filteredBuffer.length }, filteredBuffer);
+      pack.finalize();
+
+      await pipelinePromise;
 
       this.log('');
-      this.log(this.colorize('✓ Log exported successfully!', 'green', noColor));
-      this.log(`  ${this.colorize('Location:', 'bold', noColor)} ${gzPath}`);
-      this.log(
-        this.colorize(
-          '  (Note: Only most recent log file exported. Install tar for full export.)',
-          'dim',
-          noColor
-        )
-      );
+      this.log(this.colorize('✓ Scan logs exported successfully!', 'green', noColor));
+      this.log(`  ${this.colorize('Location:', 'bold', noColor)} ${resolvedOutput}`);
+      this.log(`  ${this.colorize('Scan:', 'bold', noColor)} ${scanFilter.runId}`);
+      this.log(`  ${this.colorize('Log entries:', 'bold', noColor)} ${filteredLines.length}`);
+
+      const stats = await fsp.stat(resolvedOutput);
+      this.log(`  ${this.colorize('Size:', 'bold', noColor)} ${formatBytes(stats.size)}`);
+    } else {
+      // Export all log files
+      for (const logFile of logFiles) {
+        const content = await fsp.readFile(logFile.path);
+        pack.entry({ name: logFile.name, size: content.length, mtime: logFile.mtime }, content);
+      }
+      pack.finalize();
+
+      await pipelinePromise;
+
+      this.log('');
+      this.log(this.colorize('✓ Logs exported successfully!', 'green', noColor));
+      this.log(`  ${this.colorize('Location:', 'bold', noColor)} ${resolvedOutput}`);
+      this.log(`  ${this.colorize('Files:', 'bold', noColor)} ${logFiles.length} log file(s)`);
+
+      const stats = await fsp.stat(resolvedOutput);
+      this.log(`  ${this.colorize('Size:', 'bold', noColor)} ${formatBytes(stats.size)}`);
     }
   }
 
