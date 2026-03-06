@@ -472,7 +472,7 @@ export const formatters = {
     return `archifiltre v${info.appVersion} (${info.commitHash}, ${info.buildDate})
 
 © République française – Ministère de la Culture (SNUM/SIAF)
-Programme interministériel VITAM
+Programme interministériel Vitam
 Contact: archifiltre@culture.gouv.fr
 Website: https://www.archifiltre.org`;
   },

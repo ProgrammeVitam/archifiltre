@@ -274,4 +274,4 @@ For issues related to:
 
 ## Contributing
 
-This tool is part of the French government VITAM program. Contributions should align with government compliance requirements and follow existing code patterns.
+This tool is part of the French government Vitam program. Contributions should align with government compliance requirements and follow existing code patterns.
