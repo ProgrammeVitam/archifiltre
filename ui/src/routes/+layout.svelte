@@ -1,85 +1,43 @@
 <script lang="ts">
 	import './layout.css';
-	import { currentStep, completedSteps, isRunning, cliVersion, healthStatus } from '$lib/stores';
+	import { appState, cliVersion, healthStatus, isRunning } from '$lib/stores';
 	import { Badge } from '$lib/components/ui/badge';
-	import { Separator } from '$lib/components/ui/separator';
-	import type { WorkflowStep } from '$lib/stores';
 
 	let { children } = $props();
-
-	const steps: { id: WorkflowStep; label: string; icon: string }[] = [
-		{ id: 'select', label: 'Select', icon: '📁' },
-		{ id: 'scan', label: 'Scan', icon: '🔍' },
-		{ id: 'checksum', label: 'Checksum', icon: '🔐' },
-		{ id: 'export', label: 'Export', icon: '📤' }
-	];
-
-	function getStepState(stepId: WorkflowStep): 'completed' | 'active' | 'pending' {
-		if ($completedSteps.includes(stepId)) return 'completed';
-		if ($currentStep === stepId) return 'active';
-		return 'pending';
-	}
 </script>
 
 <div class="flex min-h-screen flex-col bg-background">
 	<!-- Header -->
 	<header class="sticky top-0 z-50 border-b bg-card">
-		<div class="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
+		<div class="mx-auto flex max-w-7xl items-center justify-between px-4 py-3">
 			<!-- Logo -->
 			<div class="flex items-center gap-3">
 				<div class="flex items-center gap-2">
-					<span class="text-2xl">📂</span>
+					<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 101 78" class="h-8 w-auto">
+						<rect x="0" y="0" width="101" height="25" fill="#FCBF40" />
+						<rect x="0" y="27" width="41" height="26" fill="#FCBF40" />
+						<rect x="43" y="27" width="14" height="26" fill="#FC5745" />
+						<rect x="59" y="27" width="12" height="26" fill="#FCBF40" />
+						<rect x="73" y="27" width="10" height="26" fill="#BA77EB" />
+						<rect x="85" y="27" width="6" height="26" fill="#477BE2" />
+						<rect x="93" y="27" width="5" height="26" fill="#FB4B36" />
+						<rect x="100" y="27" width="1" height="26" fill="#3BD041" />
+						<rect x="0" y="55" width="19" height="23" fill="#40D145" />
+						<rect x="21" y="55" width="12" height="23" fill="#00D8F0" />
+						<rect x="35" y="55" width="10" height="23" fill="#FC5745" />
+						<rect x="59" y="55" width="12" height="23" fill="#477BE2" />
+					</svg>
 					<span class="text-xl font-bold text-primary">Archifiltre</span>
 				</div>
 				<Badge variant="secondary">v5</Badge>
 			</div>
 
-			<!-- Steps Navigation -->
-			<nav class="hidden items-center gap-1 md:flex">
-				{#each steps as step, index}
-					{@const state = getStepState(step.id)}
-					<div class="flex items-center gap-2 px-3 py-1.5">
-						<div
-							class="flex h-7 w-7 items-center justify-center rounded-full text-sm font-semibold transition-colors
-								{state === 'completed' ? 'bg-green-500 text-white' : ''}
-								{state === 'active' ? 'bg-primary text-primary-foreground' : ''}
-								{state === 'pending' ? 'bg-muted text-muted-foreground' : ''}"
-						>
-							{#if state === 'completed'}
-								✓
-							{:else}
-								{index + 1}
-							{/if}
-						</div>
-						<span
-							class="text-sm font-medium
-								{state === 'active' ? 'text-primary' : ''}
-								{state === 'completed' ? 'text-foreground' : ''}
-								{state === 'pending' ? 'text-muted-foreground' : ''}"
-						>
-							{step.label}
-						</span>
-					</div>
-					{#if index < steps.length - 1}
-						<div
-							class="h-0.5 w-8 transition-colors
-								{state === 'completed' ? 'bg-green-500' : 'bg-border'}"
-						></div>
-					{/if}
-				{/each}
-			</nav>
-
-			<!-- Status -->
-			<div class="flex items-center gap-2">
-				{#if $isRunning}
+			<!-- Status (only show when scanning or error) -->
+			<div class="flex items-center gap-3">
+				{#if $appState === 'scanning'}
 					<Badge variant="outline" class="gap-1.5">
 						<span class="h-2 w-2 animate-pulse rounded-full bg-blue-500"></span>
-						Processing...
-					</Badge>
-				{:else if $healthStatus === 'healthy'}
-					<Badge variant="outline" class="gap-1.5 text-green-600">
-						<span class="h-2 w-2 rounded-full bg-green-500"></span>
-						Ready
+						Scanning...
 					</Badge>
 				{:else if $healthStatus === 'unhealthy'}
 					<Badge variant="destructive" class="gap-1.5">
@@ -92,22 +50,7 @@
 	</header>
 
 	<!-- Main Content -->
-	<main class="flex-1 px-6 py-8">
-		<div class="mx-auto max-w-4xl">
-			{@render children()}
-		</div>
+	<main class="flex-1 pt-8">
+		{@render children()}
 	</main>
-
-	<!-- Footer -->
-	<footer class="border-t bg-card">
-		<div class="mx-auto flex max-w-6xl items-center justify-center gap-2 px-6 py-4 text-sm text-muted-foreground">
-			<span>République française – Ministère de la Culture</span>
-			<Separator orientation="vertical" class="h-4" />
-			<span>Programme VITAM</span>
-			{#if $cliVersion}
-				<Separator orientation="vertical" class="h-4" />
-				<span class="font-mono">{$cliVersion}</span>
-			{/if}
-		</div>
-	</footer>
 </div>

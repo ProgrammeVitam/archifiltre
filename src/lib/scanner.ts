@@ -440,7 +440,7 @@ export interface ScanResult {
 }
 
 /**
- * Main scanning function - consolidated streaming approach like ArchiScan
+ * Main scanning function
  */
 export function scanDirectory(
   connection: DatabaseConnection,
@@ -476,7 +476,7 @@ export function scanDirectory(
           }
         }),
 
-        // NEW: Archive preprocessing step (only if enabled)
+        // Archive preprocessing step (only if enabled)
         mergeMap(entry => {
           if (config.enableArchiveProcessing !== false) {
             // Default to enabled
