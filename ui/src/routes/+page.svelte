@@ -14,7 +14,9 @@
 		finishScanning,
 		resetApp,
 		addTerminalLine,
-		parseScanOutput
+		parseScanOutput,
+		tryParseScanProgressEvent,
+		handleScanProgressEvent
 	} from '$lib/stores';
 	import {
 		healthCheck,
@@ -23,8 +25,7 @@
 		getOperationState,
 		onScanProgress,
 		onScanError,
-		onScanComplete,
-		formatBytes
+		onScanComplete
 	} from '$lib/tauri';
 	import { Button } from '$lib/components/ui/button';
 	import { Alert, AlertDescription, AlertTitle } from '$lib/components/ui/alert';
@@ -50,14 +51,24 @@
 			// Setup event listeners for scan progress
 			unlisteners.push(
 				await onScanProgress((line) => {
-					addTerminalLine(line, 'stdout');
-					parseScanOutput(line);
+					// Try to parse as structured JSON progress event
+					const progressEvent = tryParseScanProgressEvent(line);
+					if (progressEvent) {
+						// Handle structured progress event
+						handleScanProgressEvent(progressEvent);
+						// Add a cleaner terminal line for JSON events
+						addTerminalLine(progressEvent.status, 'info');
+					} else {
+						// Legacy: plain text output
+						addTerminalLine(line, 'stdout');
+						parseScanOutput(line);
 
-					// Update progress message
-					if (line.includes('ingested')) {
-						scanProgress.set(line.trim());
-					} else if (line.includes('found')) {
-						scanProgress.set(line.trim());
+						// Update progress message for legacy format
+						if (line.includes('ingested')) {
+							scanProgress.set(line.trim());
+						} else if (line.includes('found')) {
+							scanProgress.set(line.trim());
+						}
 					}
 				}),
 				await onScanError((line) => {

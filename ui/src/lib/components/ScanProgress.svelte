@@ -1,9 +1,5 @@
 <script lang="ts">
-	import { scanResult, terminalOutput, scanProgress } from '$lib/stores';
-	import { formatBytes } from '$lib/tauri';
-	import { Progress } from '$lib/components/ui/progress';
-	import { ScrollArea } from '$lib/components/ui/scroll-area';
-	import { Card, CardContent, CardHeader, CardTitle } from '$lib/components/ui/card';
+	import { scanResult, scanPhase } from '$lib/stores';
 	import { LoaderCircle } from '@lucide/svelte';
 
 	// ================================
@@ -22,97 +18,91 @@
 	// ================================
 
 	let folderName = $derived(path.split('/').pop() || path.split('\\').pop() || path);
+
+	let phaseLabel = $derived(() => {
+		switch ($scanPhase) {
+			case 'discovery':
+				return 'Discovering files';
+			case 'ingestion':
+				return 'Discovering files';
+			case 'prefilter':
+				return 'Analyzing sizes';
+			case 'hashing':
+				return 'Finding duplicates';
+			case 'duplicate-detection':
+				return 'Finding duplicates';
+			case 'complete':
+				return 'Complete';
+			default:
+				return 'Scanning';
+		}
+	});
+
+	let showHashingProgress = $derived(
+		($scanPhase === 'hashing' || $scanPhase === 'duplicate-detection') &&
+			$scanResult.filesToHash > 0
+	);
+	let hashingPercentage = $derived(
+		$scanResult.filesToHash > 0
+			? Math.round(($scanResult.filesHashed / $scanResult.filesToHash) * 100)
+			: 0
+	);
 </script>
 
-<div class="flex h-full w-full flex-col items-center justify-center p-8 {className}">
-	<Card class="w-full max-w-2xl">
-		<CardHeader class="space-y-1">
-			<div class="flex items-center gap-3">
-				<div class="flex h-10 w-10 items-center justify-center rounded-full bg-primary/10">
-					<LoaderCircle size={24} class="animate-spin text-primary" />
-				</div>
-				<div>
-					<CardTitle class="text-xl">Scanning in progress</CardTitle>
-					<p class="text-sm text-muted-foreground">Analyzing {folderName}</p>
-				</div>
-			</div>
-		</CardHeader>
+<div class="flex h-full w-full flex-col items-center justify-center {className}">
+	<!-- Main content - centered -->
+	<div class="flex flex-col items-center justify-center space-y-8">
+		<!-- Spinner -->
+		<div class="relative">
+			<div
+				class="absolute inset-0 animate-pulse rounded-full bg-primary/20 blur-xl"
+				style="transform: scale(1.5);"
+			></div>
+			<LoaderCircle size={48} class="relative animate-spin text-primary" strokeWidth={1.5} />
+		</div>
 
-		<CardContent class="space-y-6">
-			<!-- Progress bar -->
-			<div class="space-y-2">
-				<Progress value={100} class="h-2 animate-pulse" />
-				<p class="text-center text-xs text-muted-foreground">
-					{$scanProgress || 'Discovering files...'}
-				</p>
+		<!-- File count - large and prominent -->
+		<div class="text-center">
+			<div
+				class="text-8xl font-bold tracking-tight text-foreground tabular-nums transition-all duration-150"
+			>
+				{$scanResult.filesDiscovered.toLocaleString()}
 			</div>
+			<div class="mt-2 text-xl text-muted-foreground">
+				{$scanResult.filesDiscovered === 1 ? 'file' : 'files'} discovered
+			</div>
+		</div>
 
-			<!-- Stats grid -->
-			<div class="grid grid-cols-2 gap-4 sm:grid-cols-4">
-				<div class="rounded-lg border bg-card p-3 text-center">
-					<div class="text-2xl font-bold text-foreground">
-						{$scanResult.filesDiscovered.toLocaleString()}
-					</div>
-					<div class="text-xs text-muted-foreground">Files</div>
-				</div>
-				<div class="rounded-lg border bg-card p-3 text-center">
-					<div class="text-2xl font-bold text-foreground">
-						{$scanResult.folders.toLocaleString()}
-					</div>
-					<div class="text-xs text-muted-foreground">Folders</div>
-				</div>
-				<div class="rounded-lg border bg-card p-3 text-center">
-					<div class="text-2xl font-bold text-foreground">
-						{$scanResult.duplicateGroups.toLocaleString()}
-					</div>
-					<div class="text-xs text-muted-foreground">Duplicates</div>
-				</div>
-				<div class="rounded-lg border bg-card p-3 text-center">
-					<div class="text-2xl font-bold text-foreground">
-						{formatBytes($scanResult.totalSize)}
-					</div>
-					<div class="text-xs text-muted-foreground">Size</div>
-				</div>
+		<!-- Phase indicator -->
+		<div class="flex flex-col items-center space-y-3">
+			<div class="flex items-center gap-2 text-sm text-muted-foreground">
+				<span class="inline-block h-2 w-2 animate-pulse rounded-full bg-primary"></span>
+				<span>{phaseLabel()}</span>
 			</div>
 
-			<!-- Terminal output -->
-			<div class="space-y-2">
-				<div class="flex items-center justify-between">
-					<p class="text-sm font-medium text-foreground">Output</p>
-					<span class="text-xs text-muted-foreground">
-						{$terminalOutput.length} lines
-					</span>
-				</div>
-				<ScrollArea class="h-48 rounded-md border bg-zinc-950 p-4">
-					<div class="font-mono text-xs">
-						{#each $terminalOutput as line (line.id)}
-							<div
-								class="py-0.5 break-all whitespace-pre-wrap
-									{line.stream === 'success' ? 'text-green-400' : ''}
-									{line.stream === 'error' ? 'text-red-400' : ''}
-									{line.stream === 'info' ? 'text-blue-400' : 'text-zinc-300'}"
-							>
-								{line.text}
-							</div>
-						{/each}
-						<!-- Blinking cursor -->
-						<span class="inline-block h-4 w-2 animate-pulse bg-zinc-400"></span>
+			<!-- Hashing progress bar (only shown during hashing phase) -->
+			{#if showHashingProgress}
+				<div class="w-64 space-y-1">
+					<div class="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+						<div
+							class="h-full bg-primary transition-all duration-300 ease-out"
+							style="width: {hashingPercentage}%"
+						></div>
 					</div>
-				</ScrollArea>
-			</div>
+					<div class="text-center text-xs text-muted-foreground">
+						{$scanResult.filesHashed.toLocaleString()} / {$scanResult.filesToHash.toLocaleString()}
+						checksums ({hashingPercentage}%)
+					</div>
+				</div>
+			{/if}
+		</div>
+	</div>
 
-			<!-- Path info -->
-			<div class="rounded-lg bg-muted/50 p-3">
-				<p class="text-xs text-muted-foreground">Scanning path</p>
-				<p class="truncate font-mono text-sm text-foreground" title={path}>
-					{path}
-				</p>
-			</div>
-
-			<!-- Hint -->
-			<p class="text-center text-xs text-muted-foreground">
-				This may take a while for large directories. The scan runs entirely on your machine.
-			</p>
-		</CardContent>
-	</Card>
+	<!-- Folder path - bottom -->
+	<div class="absolute right-0 bottom-8 left-0 text-center">
+		<p class="text-xs text-muted-foreground/60">Scanning</p>
+		<p class="mx-auto max-w-md truncate px-4 font-mono text-sm text-muted-foreground" title={path}>
+			{folderName}
+		</p>
+	</div>
 </div>

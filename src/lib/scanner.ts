@@ -440,16 +440,54 @@ export interface ScanResult {
 }
 
 /**
+ * Structured progress event for real-time UI updates
+ */
+export type ScanPhase =
+  | 'discovery'
+  | 'ingestion'
+  | 'prefilter'
+  | 'hashing'
+  | 'duplicate-detection'
+  | 'complete';
+
+export interface ScanProgressEvent {
+  type: 'scan-progress';
+  phase: ScanPhase;
+  filesDiscovered: number;
+  filesIngested: number;
+  filesHashed?: number;
+  filesToHash?: number;
+  hashErrors?: number;
+  duplicateSizes?: number;
+  duplicateGroups: number;
+  status: string;
+}
+
+/**
  * Main scanning function
  */
 export function scanDirectory(
   connection: DatabaseConnection,
   config: ScanConfig,
-  progressCallback?: (status: string) => void
+  progressCallback?: (event: ScanProgressEvent) => void
 ): Observable<ScanResult> {
   let filesDiscovered = 0;
   let filesIngested = 0;
   let duplicateGroups = 0;
+  let duplicateSizesCount = 0;
+
+  // Helper to emit structured progress
+  const emitProgress = (phase: ScanPhase, status: string, extra?: Partial<ScanProgressEvent>) => {
+    progressCallback?.({
+      type: 'scan-progress',
+      phase,
+      filesDiscovered,
+      filesIngested,
+      duplicateGroups,
+      status,
+      ...extra,
+    });
+  };
 
   // Phase 1: Clean database first (hot observable, no defer)
   return cleanDatabase(connection, config.runId).pipe(
@@ -472,7 +510,7 @@ export function scanDirectory(
               filesDiscovered,
               runId: config.runId,
             });
-            progressCallback?.(`found ${filesDiscovered.toLocaleString()} files`);
+            emitProgress('discovery', `found ${filesDiscovered.toLocaleString()} files`);
           }
         }),
 
@@ -502,7 +540,8 @@ export function scanDirectory(
                 archiveEntry: entry.path,
                 runId: config.runId,
               });
-              progressCallback?.(
+              emitProgress(
+                'discovery',
                 `found ${filesDiscovered.toLocaleString()} files (including archive contents)`
               );
             }
@@ -530,7 +569,7 @@ export function scanDirectory(
                   filesIngested,
                   runId: config.runId,
                 });
-                progressCallback?.(`ingested ${filesIngested.toLocaleString()} files`);
+                emitProgress('ingestion', `ingested ${filesIngested.toLocaleString()} files`);
               }
             }),
             catchError(error => {
@@ -550,7 +589,7 @@ export function scanDirectory(
             filesDiscovered,
             filesIngested,
           });
-          progressCallback?.(`ingested ${filesIngested.toLocaleString()} files`);
+          emitProgress('ingestion', `ingested ${filesIngested.toLocaleString()} files`);
         })
       )
     ),
@@ -559,11 +598,14 @@ export function scanDirectory(
     last(), // Wait for ingestion to complete
     switchMap(() => findDuplicateSizes(connection, config.runId)),
     tap(duplicateSizes => {
+      duplicateSizesCount = duplicateSizes.length;
       logger.debug('Prefilter found potential duplicate sizes', {
         duplicateSizeCount: duplicateSizes.length,
         runId: config.runId,
       });
-      progressCallback?.(`found ${duplicateSizes.length} sizes with potential duplicates`);
+      emitProgress('prefilter', `found ${duplicateSizes.length} sizes with potential duplicates`, {
+        duplicateSizes: duplicateSizes.length,
+      });
     }),
 
     // Phase 5: Hash calculation for files with duplicate content_size
@@ -572,7 +614,12 @@ export function scanDirectory(
         if (processed % 100 === 0 || processed === total) {
           const percentage = total > 0 ? ((processed / total) * 100).toFixed(1) : '0.0';
           const status = `hashed ${processed.toLocaleString()}/${total.toLocaleString()} files (${percentage}%)`;
-          progressCallback?.(errors > 0 ? `${status}, ${errors} errors` : status);
+          emitProgress('hashing', errors > 0 ? `${status}, ${errors} errors` : status, {
+            filesHashed: processed,
+            filesToHash: total,
+            hashErrors: errors,
+            duplicateSizes: duplicateSizesCount,
+          });
         }
       })
     ),
@@ -585,7 +632,9 @@ export function scanDirectory(
         duplicateGroups: realDuplicateGroups,
         runId: config.runId,
       });
-      progressCallback?.(`found ${realDuplicateGroups} real duplicate groups`);
+      emitProgress('duplicate-detection', `found ${realDuplicateGroups} real duplicate groups`, {
+        duplicateSizes: duplicateSizesCount,
+      });
     }),
     map(() => ({
       phase: 'complete' as const,

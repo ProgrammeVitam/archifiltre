@@ -29,6 +29,8 @@ export interface ScanResult {
 	archives: number;
 	archiveEntries: number;
 	totalSize: number;
+	filesHashed: number;
+	filesToHash: number;
 }
 
 export interface TerminalLine {
@@ -36,6 +38,27 @@ export interface TerminalLine {
 	text: string;
 	stream: 'stdout' | 'stderr' | 'info' | 'success' | 'error';
 	timestamp: Date;
+}
+
+export type ScanPhase =
+	| 'discovery'
+	| 'ingestion'
+	| 'prefilter'
+	| 'hashing'
+	| 'duplicate-detection'
+	| 'complete';
+
+export interface ScanProgressEvent {
+	type: 'scan-progress';
+	phase: ScanPhase;
+	filesDiscovered: number;
+	filesIngested: number;
+	filesHashed?: number;
+	filesToHash?: number;
+	hashErrors?: number;
+	duplicateSizes?: number;
+	duplicateGroups: number;
+	status: string;
 }
 
 // ================================
@@ -59,7 +82,9 @@ const defaultScanResult: ScanResult = {
 	hiddenFiles: 0,
 	archives: 0,
 	archiveEntries: 0,
-	totalSize: 0
+	totalSize: 0,
+	filesHashed: 0,
+	filesToHash: 0
 };
 
 // ================================
@@ -97,6 +122,9 @@ export const terminalOutput = writable<TerminalLine[]>([]);
 /** Current scan progress message */
 export const scanProgress = writable<string>('');
 
+/** Current scan phase */
+export const scanPhase = writable<ScanPhase>('discovery');
+
 // ================================
 // Derived Stores
 // ================================
@@ -128,7 +156,55 @@ export function clearTerminal(): void {
 }
 
 // ================================
-// Scan Output Parsing
+// Scan Progress Event Parsing
+// ================================
+
+/**
+ * Try to parse a line as a JSON ScanProgressEvent.
+ * Returns the parsed event if successful, null otherwise.
+ */
+export function tryParseScanProgressEvent(line: string): ScanProgressEvent | null {
+	try {
+		const parsed = JSON.parse(line);
+		if (parsed && parsed.type === 'scan-progress') {
+			return parsed as ScanProgressEvent;
+		}
+	} catch {
+		// Not JSON, ignore
+	}
+	return null;
+}
+
+/**
+ * Handle a structured ScanProgressEvent and update stores accordingly.
+ */
+export function handleScanProgressEvent(event: ScanProgressEvent): void {
+	// Update current phase
+	scanPhase.set(event.phase);
+
+	// Update progress message
+	scanProgress.set(event.status);
+
+	// Update scan result with all available data
+	scanResult.update((r) => ({
+		...r,
+		filesDiscovered: event.filesDiscovered,
+		filesHashed: event.filesHashed ?? r.filesHashed,
+		filesToHash: event.filesToHash ?? r.filesToHash,
+		duplicateGroups: event.duplicateGroups
+	}));
+
+	// Update files ingested if in ingestion phase or later
+	if (event.filesIngested > 0) {
+		scanResult.update((r) => ({
+			...r,
+			filesDiscovered: Math.max(r.filesDiscovered, event.filesIngested)
+		}));
+	}
+}
+
+// ================================
+// Scan Output Parsing (Legacy - for non-JSON output)
 // ================================
 
 export function parseScanOutput(line: string): void {
@@ -261,4 +337,5 @@ export function resetApp(): void {
 	scanResult.set(defaultScanResult);
 	terminalOutput.set([]);
 	scanProgress.set('');
+	scanPhase.set('discovery');
 }
