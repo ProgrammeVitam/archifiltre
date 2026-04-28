@@ -125,6 +125,13 @@
 	* {
 		@apply border-border outline-ring/50;
 	}
+	html,
+	body {
+		height: 100%;
+		margin: 0;
+		padding: 0;
+		overflow: hidden;
+	}
 	body {
 		@apply bg-transparent text-foreground;
 		background: transparent !important;
@@ -142,8 +149,11 @@
 .window-container {
 	display: flex;
 	flex-direction: column;
-	min-height: 100vh;
+	height: 100vh;
+	max-height: 100vh;
 	background: transparent;
+	box-sizing: border-box;
+	overflow: hidden;
 }
 
 /* Linux: Add padding for CSS shadow space */
