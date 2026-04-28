@@ -11,6 +11,8 @@ import { writable, derived } from 'svelte/store';
 
 export type AppState = 'idle' | 'scanning' | 'complete' | 'error';
 
+export type Platform = 'windows' | 'macos' | 'gnome';
+
 export interface ScanOptions {
 	path: string;
 	includeHidden: boolean;
@@ -105,6 +107,9 @@ export const healthStatus = writable<'unknown' | 'healthy' | 'unhealthy'>('unkno
 
 /** Whether an operation is running */
 export const isRunning = writable(false);
+
+/** Detected platform for window controls */
+export const platform = writable<Platform | undefined>(undefined);
 
 // ================================
 // Scan Stores
@@ -338,4 +343,39 @@ export function resetApp(): void {
 	terminalOutput.set([]);
 	scanProgress.set('');
 	scanPhase.set('discovery');
+}
+
+// ================================
+// Platform Detection
+// ================================
+
+/**
+ * Detect the current platform for window controls.
+ * This is a workaround for @tauri-controls/svelte not properly
+ * awaiting the async OS detection from @tauri-apps/plugin-os.
+ */
+export async function detectPlatform(): Promise<Platform> {
+	try {
+		const { type } = await import('@tauri-apps/plugin-os');
+		const osType = await type();
+
+		let detectedPlatform: Platform;
+		switch (osType) {
+			case 'macos':
+				detectedPlatform = 'macos';
+				break;
+			case 'linux':
+				detectedPlatform = 'gnome';
+				break;
+			default:
+				detectedPlatform = 'windows';
+		}
+
+		platform.set(detectedPlatform);
+		return detectedPlatform;
+	} catch {
+		// Fallback to windows if detection fails (e.g., running in browser)
+		platform.set('windows');
+		return 'windows';
+	}
 }
