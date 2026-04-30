@@ -1,31 +1,25 @@
 <script lang="ts">
 	import { onMount, onDestroy } from 'svelte';
 	import {
-		appState,
-		errorMessage,
-		scanOptions,
-		scanResult,
+		activeTab,
+		tabsStore,
 		cliVersion,
 		healthStatus,
-		scanProgress,
-		isRunning,
-		setError,
-		startScanning,
-		finishScanning,
-		resetApp,
-		addTerminalLine,
-		parseScanOutput,
-		tryParseScanProgressEvent,
-		handleScanProgressEvent
+		addTerminalLineToTab,
+		parseScanOutputForTab,
+		startScanningTab,
+		finishScanningTab,
+		setErrorForTab,
+		resetTab
 	} from '$lib/stores';
 	import {
 		healthCheck,
 		getVersion,
 		scanDirectory,
-		getOperationState,
 		onScanProgress,
 		onScanError,
-		onScanComplete
+		onScanComplete,
+		generateId
 	} from '$lib/tauri';
 	import { Button } from '$lib/components/ui/button';
 	import { Alert, AlertDescription, AlertTitle } from '$lib/components/ui/alert';
@@ -49,50 +43,41 @@
 	onMount(async () => {
 		try {
 			// Setup event listeners for scan progress
+			// Events include scanId - route to the correct tab
 			unlisteners.push(
-				await onScanProgress((line) => {
-					// Try to parse as structured JSON progress event
-					const progressEvent = tryParseScanProgressEvent(line);
-					if (progressEvent) {
-						// Handle structured progress event
-						handleScanProgressEvent(progressEvent);
-						// Add a cleaner terminal line for JSON events
-						addTerminalLine(progressEvent.status, 'info');
-					} else {
-						// Legacy: plain text output
-						addTerminalLine(line, 'stdout');
-						parseScanOutput(line);
+				await onScanProgress((event) => {
+					// Find the tab with this scanId
+					const tab = tabsStore.findTabByScanId(event.scanId);
+					if (!tab) return;
 
-						// Update progress message for legacy format
-						if (line.includes('ingested')) {
-							scanProgress.set(line.trim());
-						} else if (line.includes('found')) {
-							scanProgress.set(line.trim());
-						}
+					addTerminalLineToTab(tab.id, event.line, 'stdout');
+					parseScanOutputForTab(tab.id, event.line);
+
+					// Update progress message
+					if (event.line.includes('ingested') || event.line.includes('found')) {
+						tabsStore.updateTab(tab.id, { scanProgress: event.line.trim() });
 					}
 				}),
-				await onScanError((line) => {
-					addTerminalLine(line, 'stderr');
+				await onScanError((event) => {
+					// Find the tab with this scanId
+					const tab = tabsStore.findTabByScanId(event.scanId);
+					if (!tab) return;
+
+					addTerminalLineToTab(tab.id, event.line, 'stderr');
 				}),
-				await onScanComplete(async (success) => {
-					addTerminalLine(
-						success ? '✓ Scan completed successfully' : '✗ Scan failed',
-						success ? 'success' : 'error'
+				await onScanComplete((event) => {
+					// Find the tab with this scanId
+					const tab = tabsStore.findTabByScanId(event.scanId);
+					if (!tab) return;
+
+					addTerminalLineToTab(
+						tab.id,
+						event.success ? '✓ Scan completed successfully' : '✗ Scan failed',
+						event.success ? 'success' : 'error'
 					);
-					finishScanning(success);
+					finishScanningTab(tab.id, event.success);
 				})
 			);
-
-			// Check if there's already an operation running
-			try {
-				const opState = await getOperationState();
-				if (opState.running) {
-					initError = 'An analysis is already in progress. Please wait for it to complete.';
-					return;
-				}
-			} catch {
-				// Ignore - operation state check is optional
-			}
 
 			// Check CLI health
 			const health = await healthCheck();
@@ -117,7 +102,7 @@
 		}
 	});
 
-	onDestroy(async () => {
+	onDestroy(() => {
 		// Cleanup event listeners
 		for (const unlisten of unlisteners) {
 			unlisten();
@@ -129,41 +114,52 @@
 	// ================================
 
 	async function handleStartAnalysis(path: string): Promise<void> {
-		// Prevent concurrent analyses
-		if ($isRunning) {
-			setError('An analysis is already in progress. Please wait for it to complete.');
+		const tab = $activeTab;
+		if (!tab) return;
+
+		// Prevent starting another scan if this tab is already scanning
+		if (tab.state === 'scanning') {
+			setErrorForTab(tab.id, 'This scan is already running. Please wait or start a new scan.');
 			return;
 		}
 
-		startScanning(path);
+		// Generate unique IDs for this scan
+		const scanId = generateId();
+
+		// Start scanning - this updates the tab state
+		startScanningTab(tab.id, path, scanId);
 
 		try {
 			const result = await scanDirectory({
+				scanId,
+				dbName: tab.dbName,
 				path,
-				include_hidden: $scanOptions.includeHidden,
-				batch_size: $scanOptions.batchSize,
-				disable_archives: $scanOptions.disableArchives
+				includeHidden: tab.scanOptions.includeHidden,
+				batchSize: tab.scanOptions.batchSize,
+				disableArchives: tab.scanOptions.disableArchives
 			});
 
 			if (!result.success) {
-				setError(result.error ?? 'Analysis failed. Please check the folder and try again.');
+				setErrorForTab(
+					tab.id,
+					result.error ?? 'Analysis failed. Please check the folder and try again.'
+				);
 			}
 		} catch (error) {
-			if (error instanceof Error && error.message.includes('Another operation')) {
-				setError('An analysis is already in progress. Please wait for it to complete.');
-			} else {
-				setError(`Analysis error: ${error}`);
-			}
+			setErrorForTab(tab.id, `Analysis error: ${error}`);
 		}
 	}
 
 	function handleReset(): void {
-		resetApp();
+		const tab = $activeTab;
+		if (tab) {
+			resetTab(tab.id);
+		}
 	}
 </script>
 
 <!-- Main Container -->
-<div class="flex h-[calc(100vh-140px)] flex-col">
+<div class="flex h-full flex-col">
 	{#if !isInitialized && !initError}
 		<!-- Loading State -->
 		<div class="flex h-full items-center justify-center">
@@ -180,15 +176,15 @@
 				<AlertDescription>{initError}</AlertDescription>
 			</Alert>
 		</div>
-	{:else if $appState === 'idle'}
+	{:else if $activeTab?.state === 'idle'}
 		<!-- Drop Zone State  -->
 		<div class="flex h-full items-center justify-center p-8">
-			<DropZone onStartAnalysis={handleStartAnalysis} disabled={$isRunning} class="max-w-3xl" />
+			<DropZone onStartAnalysis={handleStartAnalysis} disabled={false} class="max-w-3xl" />
 		</div>
-	{:else if $appState === 'scanning'}
+	{:else if $activeTab?.state === 'scanning'}
 		<!-- Scanning State  -->
-		<ScanProgress path={$scanOptions.path} class="h-full" />
-	{:else if $appState === 'complete'}
+		<ScanProgress path={$activeTab?.path ?? ''} class="h-full" />
+	{:else if $activeTab?.state === 'complete'}
 		<!-- Analysis Complete State -->
 		<div class="flex h-full flex-col items-center justify-center gap-6 p-8">
 			<div
@@ -207,25 +203,25 @@
 			<div class="grid grid-cols-2 gap-4 sm:grid-cols-4">
 				<div class="rounded-lg border bg-card p-4 text-center">
 					<div class="text-3xl font-bold text-foreground">
-						{$scanResult.filesDiscovered.toLocaleString()}
+						{$activeTab?.scanResult.filesDiscovered.toLocaleString()}
 					</div>
 					<div class="text-sm text-muted-foreground">Files</div>
 				</div>
 				<div class="rounded-lg border bg-card p-4 text-center">
 					<div class="text-3xl font-bold text-foreground">
-						{$scanResult.folders.toLocaleString()}
+						{$activeTab?.scanResult.folders.toLocaleString()}
 					</div>
 					<div class="text-sm text-muted-foreground">Folders</div>
 				</div>
 				<div class="rounded-lg border bg-card p-4 text-center">
 					<div class="text-3xl font-bold text-foreground">
-						{$scanResult.duplicateFiles.toLocaleString()}
+						{$activeTab?.scanResult.duplicateFiles.toLocaleString()}
 					</div>
 					<div class="text-sm text-muted-foreground">Duplicates</div>
 				</div>
 				<div class="rounded-lg border bg-card p-4 text-center">
 					<div class="text-3xl font-bold text-foreground">
-						{$scanResult.archives.toLocaleString()}
+						{$activeTab?.scanResult.archives.toLocaleString()}
 					</div>
 					<div class="text-sm text-muted-foreground">Archives</div>
 				</div>
@@ -234,7 +230,7 @@
 			<!-- Scanned path -->
 			<div class="rounded-lg bg-muted/50 px-4 py-2 text-center">
 				<span class="text-sm text-muted-foreground">Scanned: </span>
-				<span class="font-mono text-sm text-foreground">{$scanOptions.path}</span>
+				<span class="font-mono text-sm text-foreground">{$activeTab?.path}</span>
 			</div>
 
 			<Button size="lg" onclick={handleReset}>
@@ -242,7 +238,7 @@
 				Analyze another folder
 			</Button>
 		</div>
-	{:else if $appState === 'error'}
+	{:else if $activeTab?.state === 'error'}
 		<!-- Error State -->
 		<div class="flex h-full flex-col items-center justify-center gap-6 p-8">
 			<div
@@ -253,7 +249,8 @@
 			<Alert variant="destructive" class="max-w-lg">
 				<AlertTitle>Analysis Error</AlertTitle>
 				<AlertDescription
-					>{$errorMessage ?? 'An unknown error occurred during analysis'}</AlertDescription
+					>{$activeTab?.errorMessage ??
+						'An unknown error occurred during analysis'}</AlertDescription
 				>
 			</Alert>
 			<Button variant="outline" size="lg" onclick={handleReset}>

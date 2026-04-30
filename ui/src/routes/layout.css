@@ -29,7 +29,7 @@
 	--chart-3: oklch(0.398 0.07 227.392);
 	--chart-4: oklch(0.828 0.189 84.429);
 	--chart-5: oklch(0.769 0.188 70.08);
-	--sidebar: oklch(0.984 0.003 247.858);
+	--sidebar: rgba(250, 250, 252, 0.85);
 	--sidebar-foreground: oklch(0.129 0.042 264.695);
 	--sidebar-primary: oklch(0.208 0.042 265.755);
 	--sidebar-primary-foreground: oklch(0.984 0.003 247.858);
@@ -70,7 +70,7 @@
 	--chart-3: oklch(0.769 0.188 70.08);
 	--chart-4: oklch(0.627 0.265 303.9);
 	--chart-5: oklch(0.645 0.246 16.439);
-	--sidebar: oklch(0.208 0.042 265.755);
+	--sidebar: rgba(30, 30, 35, 0.85);
 	--sidebar-foreground: oklch(0.984 0.003 247.858);
 	--sidebar-primary: oklch(0.488 0.243 264.376);
 	--sidebar-primary-foreground: oklch(0.984 0.003 247.858);
@@ -135,6 +135,7 @@
 	body {
 		@apply bg-transparent text-foreground;
 		background: transparent !important;
+		user-select: none;
 	}
 	html {
 		background: transparent !important;
@@ -145,7 +146,6 @@
    Window Container Styles
    ================================ */
 
-/* Base container - no padding (macOS/Windows use native shadows) */
 .window-container {
 	display: flex;
 	flex-direction: column;
@@ -156,24 +156,23 @@
 	overflow: hidden;
 }
 
-/* Linux: Add padding for CSS shadow space */
 .window-container-linux {
 	padding: var(--window-padding);
 }
 
-/* Base frame - the visible window */
 .window-frame {
 	display: flex;
 	flex-direction: column;
 	flex: 1;
-	background-color: var(--background);
+	min-height: 0;
+	height: 100%;
+	background-color: transparent;
 	border-radius: var(--window-radius);
 	overflow: hidden;
 	border: 1px solid var(--border);
 	position: relative;
 }
 
-/* Linux: Add CSS shadow (native shadow not reliable on Linux) */
 .window-frame-linux {
 	box-shadow: var(--window-shadow);
 }
@@ -185,47 +184,153 @@
 .titlebar {
 	display: flex;
 	align-items: center;
-	justify-content: space-between;
-	height: 44px;
-	padding: 0;
+	height: 48px;
+	padding: 0 12px;
 	background-color: var(--card);
-	border-bottom: 1px solid var(--border);
 	user-select: none;
+	gap: 12px;
 }
 
-/* Linux: Rounded top corners to match window frame */
 .titlebar-linux {
-	border-radius: var(--window-radius) var(--window-radius) 0 0;
+	/* Only round top-right corner since sidebar handles top-left */
+	border-radius: 0 var(--window-radius) 0 0;
 }
 
-/* macOS style: controls on left */
 .titlebar-macos {
-	flex-direction: row;
+	padding-left: 8px;
 }
 
-.titlebar-macos .window-controls {
-	order: -1;
-	padding-left: 12px;
-	padding-right: 8px;
+.titlebar-content {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+}
+
+.titlebar-status {
+	flex: 1;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.logo-area {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+
+.logo-svg {
+	width: 24px;
+	height: auto;
+}
+
+.app-title {
+	font-size: 15px;
+	font-weight: 600;
+	color: var(--foreground);
+}
+
+.app-version {
+	font-size: 11px;
+	font-weight: 500;
+	color: var(--muted-foreground);
+	padding: 2px 6px;
+	background-color: var(--secondary);
+	border-radius: 4px;
 }
 
 /* ================================
-   Window Controls Styles
+   Window Controls
    ================================ */
 
 .window-controls {
 	display: flex;
 	align-items: center;
-	padding-right: 8px;
+	gap: 8px;
 }
 
-.window-controls :global(div) {
+.window-controls.macos {
+	gap: 8px;
+}
+
+.control-btn {
+	width: 14px;
+	height: 14px;
+	border-radius: 50%;
+	border: none;
+	cursor: pointer;
 	display: flex;
-	gap: 0.5rem;
+	align-items: center;
+	justify-content: center;
+	transition: all 0.15s ease;
+	padding: 0;
 }
 
-.window-controls :global(button) {
-	margin: 0 2px;
+.control-icon {
+	font-size: 10px;
+	font-weight: bold;
+	line-height: 1;
+	opacity: 0;
+	transition: opacity 0.15s ease;
+	color: rgba(0, 0, 0, 0.6);
+}
+
+.control-btn:hover .control-icon {
+	opacity: 1;
+}
+
+.control-close {
+	background-color: #ff5f57;
+}
+
+.control-close:hover {
+	background-color: #ff4439;
+}
+
+.control-maximize {
+	background-color: #28c840;
+}
+
+.control-maximize:hover {
+	background-color: #1fb636;
+}
+
+.control-minimize {
+	background-color: #ffbd2e;
+}
+
+.control-minimize:hover {
+	background-color: #f5a623;
+}
+
+/* Windows/GNOME style controls */
+.window-controls:not(.macos) .control-btn {
+	width: 32px;
+	height: 32px;
+	border-radius: 6px;
+	background-color: transparent;
+}
+
+.window-controls:not(.macos) .control-btn:hover {
+	background-color: var(--accent);
+}
+
+.window-controls:not(.macos) .control-close:hover {
+	background-color: #ff5f57;
+}
+
+.window-controls:not(.macos) .control-icon {
+	opacity: 0.7;
+	font-size: 14px;
+	color: var(--foreground);
+}
+
+.window-controls:not(.macos) .control-btn:hover .control-icon {
+	opacity: 1;
+}
+
+.window-controls:not(.macos) .control-close:hover .control-icon {
+	color: white;
 }
 
 /* ================================
@@ -237,7 +342,6 @@
 	z-index: 100;
 }
 
-/* Edge handles */
 .resize-n {
 	top: 0;
 	left: var(--resize-corner-size);
@@ -270,7 +374,6 @@
 	cursor: w-resize;
 }
 
-/* Corner handles */
 .resize-ne {
 	top: 0;
 	right: 0;

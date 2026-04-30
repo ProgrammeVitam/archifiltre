@@ -1,0 +1,31 @@
+<script lang="ts">
+	import type { SVGAttributes } from 'svelte/elements';
+
+	interface Props extends SVGAttributes<SVGSVGElement> {
+		size?: number;
+	}
+
+	let { size = 24, class: className = '', ...restProps }: Props = $props();
+</script>
+
+<svg
+	xmlns="http://www.w3.org/2000/svg"
+	viewBox="0 0 101 78"
+	width={size}
+	class={className}
+	style="height: auto;"
+	{...restProps}
+>
+	<rect x="0" y="0" width="101" height="25" fill="#FCBF40" />
+	<rect x="0" y="27" width="41" height="26" fill="#FCBF40" />
+	<rect x="43" y="27" width="14" height="26" fill="#FC5745" />
+	<rect x="59" y="27" width="12" height="26" fill="#FCBF40" />
+	<rect x="73" y="27" width="10" height="26" fill="#BA77EB" />
+	<rect x="85" y="27" width="6" height="26" fill="#477BE2" />
+	<rect x="93" y="27" width="5" height="26" fill="#FB4B36" />
+	<rect x="100" y="27" width="1" height="26" fill="#3BD041" />
+	<rect x="0" y="55" width="19" height="23" fill="#40D145" />
+	<rect x="21" y="55" width="12" height="23" fill="#00D8F0" />
+	<rect x="35" y="55" width="10" height="23" fill="#FC5745" />
+	<rect x="59" y="55" width="12" height="23" fill="#477BE2" />
+</svg>

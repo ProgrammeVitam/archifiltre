@@ -1,15 +1,22 @@
 <script lang="ts">
 	import './layout.css';
 	import { onMount } from 'svelte';
-	import { appState, healthStatus, platform, detectPlatform, type Platform } from '$lib/stores';
+	import { platform, detectPlatform, activeTab, hasActiveScans, type Platform } from '$lib/stores';
 	import { Badge } from '$lib/components/ui/badge';
-	import { WindowControls } from '@tauri-controls/svelte';
+	import Sidebar from '$lib/components/Sidebar.svelte';
+	import ArchifiltreLogo from '$lib/components/ArchifiltreLogo.svelte';
+	import {
+		Loader2 as Loader2Icon,
+		CheckCircle2 as CheckCircle2Icon,
+		AlertCircle as AlertCircleIcon,
+		PanelLeft as PanelLeftIcon
+	} from '@lucide/svelte';
 
 	let { children } = $props();
 
-	let titlebar: HTMLElement;
 	let showDevTools = $state(false);
 	let devPlatformOverride = $state<Platform | null>(null);
+	let sidebarCollapsed = $state(false);
 
 	// Use dev override if set, otherwise use detected platform
 	let effectivePlatform = $derived(devPlatformOverride ?? $platform);
@@ -34,43 +41,68 @@
 		await appWindow.startResizeDragging(direction);
 	}
 
+	// Window control actions
+	async function closeWindow() {
+		const { getCurrentWindow } = await import('@tauri-apps/api/window');
+		const appWindow = getCurrentWindow();
+		await appWindow.close();
+	}
+
+	async function toggleMaximize() {
+		const { getCurrentWindow } = await import('@tauri-apps/api/window');
+		const appWindow = getCurrentWindow();
+		const isMaximized = await appWindow.isMaximized();
+		if (isMaximized) {
+			await appWindow.unmaximize();
+		} else {
+			await appWindow.maximize();
+		}
+	}
+
+	async function minimizeWindow() {
+		const { getCurrentWindow } = await import('@tauri-apps/api/window');
+		const appWindow = getCurrentWindow();
+		await appWindow.minimize();
+	}
+
+	async function startDrag(e: MouseEvent) {
+		// Only drag if not clicking on interactive elements
+		if ((e.target as HTMLElement).closest('button, a, input, [data-no-drag]')) {
+			return;
+		}
+		const { getCurrentWindow } = await import('@tauri-apps/api/window');
+		const appWindow = getCurrentWindow();
+		await appWindow.startDragging();
+	}
+
+	async function handleDoubleClick(e: MouseEvent) {
+		// Only toggle maximize if not clicking on interactive elements
+		if ((e.target as HTMLElement).closest('button, a, input, [data-no-drag]')) {
+			return;
+		}
+		await toggleMaximize();
+	}
+
 	onMount(() => {
-		// Dev tools toggle: Ctrl+Shift+P
 		const handleKeydown = (e: KeyboardEvent) => {
+			// Dev tools toggle: Ctrl+Shift+P
 			if (e.ctrlKey && e.shiftKey && e.key === 'P') {
 				e.preventDefault();
 				showDevTools = !showDevTools;
 			}
+
+			// Toggle sidebar: Ctrl+B
+			if (e.ctrlKey && !e.shiftKey && e.key === 'b') {
+				e.preventDefault();
+				sidebarCollapsed = !sidebarCollapsed;
+			}
 		};
+
 		window.addEventListener('keydown', handleKeydown);
 
 		// Async initialization
 		(async () => {
-			// Detect platform for window controls (workaround for @tauri-controls/svelte bug)
 			await detectPlatform();
-
-			const { getCurrentWindow } = await import('@tauri-apps/api/window');
-			const appWindow = getCurrentWindow();
-
-			if (titlebar) {
-				titlebar.addEventListener('mousedown', async (e) => {
-					// Only drag if not clicking on interactive elements
-					if ((e.target as HTMLElement).closest('button, a, [data-no-drag]')) {
-						return;
-					}
-					await appWindow.startDragging();
-				});
-
-				// Double-click to maximize/restore
-				titlebar.addEventListener('dblclick', async () => {
-					const isMaximized = await appWindow.isMaximized();
-					if (isMaximized) {
-						await appWindow.unmaximize();
-					} else {
-						await appWindow.maximize();
-					}
-				});
-			}
 		})();
 
 		return () => {
@@ -131,104 +163,236 @@
 			></div>
 		{/if}
 
-		<!-- Dev tools panel -->
-		{#if showDevTools}
-			<div class="dev-tools" data-no-drag>
-				<span class="dev-tools-label">Platform:</span>
-				<button
-					class="dev-tools-btn"
-					class:active={devPlatformOverride === null}
-					onclick={() => setDevPlatform(null)}
-				>
-					Auto ({$platform ?? '...'})
-				</button>
-				<button
-					class="dev-tools-btn"
-					class:active={devPlatformOverride === 'windows'}
-					onclick={() => setDevPlatform('windows')}
-				>
-					Windows
-				</button>
-				<button
-					class="dev-tools-btn"
-					class:active={devPlatformOverride === 'macos'}
-					onclick={() => setDevPlatform('macos')}
-				>
-					macOS
-				</button>
-				<button
-					class="dev-tools-btn"
-					class:active={devPlatformOverride === 'gnome'}
-					onclick={() => setDevPlatform('gnome')}
-				>
-					GNOME
-				</button>
-				<span class="dev-tools-hint">Ctrl+Shift+P to toggle</span>
-			</div>
-		{/if}
+		<!-- App Layout: Sidebar + Main Content Wrapper -->
+		<div class="app-layout">
+			<!-- Collapsible Sidebar (full height) -->
+			<Sidebar bind:collapsed={sidebarCollapsed} {isLinux} />
 
-		<!-- Title bar with window controls -->
-		<header
-			bind:this={titlebar}
-			class="titlebar"
-			class:titlebar-macos={effectivePlatform === 'macos'}
-			class:titlebar-linux={isLinux}
-		>
-			<!-- macOS: controls on left -->
-			{#if effectivePlatform === 'macos'}
-				<div data-no-drag class="window-controls">
-					<WindowControls platform="macos" class="gap-2" />
-				</div>
-			{/if}
-
-			<!-- Logo and content -->
-			<div class="flex items-center gap-3 px-4">
-				<div class="flex items-center gap-2" data-no-drag>
-					<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 101 78" class="h-6 w-auto">
-						<rect x="0" y="0" width="101" height="25" fill="#FCBF40" />
-						<rect x="0" y="27" width="41" height="26" fill="#FCBF40" />
-						<rect x="43" y="27" width="14" height="26" fill="#FC5745" />
-						<rect x="59" y="27" width="12" height="26" fill="#FCBF40" />
-						<rect x="73" y="27" width="10" height="26" fill="#BA77EB" />
-						<rect x="85" y="27" width="6" height="26" fill="#477BE2" />
-						<rect x="93" y="27" width="5" height="26" fill="#FB4B36" />
-						<rect x="100" y="27" width="1" height="26" fill="#3BD041" />
-						<rect x="0" y="55" width="19" height="23" fill="#40D145" />
-						<rect x="21" y="55" width="12" height="23" fill="#00D8F0" />
-						<rect x="35" y="55" width="10" height="23" fill="#FC5745" />
-						<rect x="59" y="55" width="12" height="23" fill="#477BE2" />
-					</svg>
-					<span class="text-lg font-bold text-primary">Archifiltre</span>
-				</div>
-				<Badge variant="secondary" class="text-xs">v5</Badge>
-			</div>
-
-			<!-- Status badges (center area is draggable) -->
-			<div class="flex flex-1 items-center justify-center">
-				{#if $appState === 'scanning'}
-					<Badge variant="outline" class="gap-1.5" data-no-drag>
-						<span class="h-2 w-2 animate-pulse rounded-full bg-blue-500"></span>
-						Scanning...
-					</Badge>
-				{:else if $healthStatus === 'unhealthy'}
-					<Badge variant="destructive" class="gap-1.5" data-no-drag>
-						<span class="h-2 w-2 rounded-full bg-red-500"></span>
-						Error
-					</Badge>
+			<!-- Main Content Wrapper (titlebar + content) -->
+			<div class="main-content-wrapper">
+				<!-- Dev tools panel -->
+				{#if showDevTools}
+					<div class="dev-tools" data-no-drag>
+						<span class="dev-tools-label">Platform:</span>
+						<button
+							class="dev-tools-btn"
+							class:active={devPlatformOverride === null}
+							onclick={() => setDevPlatform(null)}
+						>
+							Auto ({$platform ?? '...'})
+						</button>
+						<button
+							class="dev-tools-btn"
+							class:active={devPlatformOverride === 'windows'}
+							onclick={() => setDevPlatform('windows')}
+						>
+							Windows
+						</button>
+						<button
+							class="dev-tools-btn"
+							class:active={devPlatformOverride === 'macos'}
+							onclick={() => setDevPlatform('macos')}
+						>
+							macOS
+						</button>
+						<button
+							class="dev-tools-btn"
+							class:active={devPlatformOverride === 'gnome'}
+							onclick={() => setDevPlatform('gnome')}
+						>
+							GNOME
+						</button>
+						<span class="dev-tools-hint">Ctrl+Shift+P to toggle</span>
+					</div>
 				{/if}
+
+				<!-- Title bar -->
+				<!-- svelte-ignore a11y_no_static_element_interactions -->
+				<header
+					class="titlebar"
+					class:titlebar-macos={effectivePlatform === 'macos'}
+					class:titlebar-linux={isLinux}
+					onmousedown={startDrag}
+					ondblclick={handleDoubleClick}
+				>
+					<!-- Sidebar toggle (when collapsed) -->
+					{#if sidebarCollapsed}
+						<button
+							class="sidebar-toggle-btn"
+							onclick={() => (sidebarCollapsed = false)}
+							title="Open sidebar"
+							data-no-drag
+						>
+							<span class="sidebar-toggle-icon">
+								<ArchifiltreLogo size={20} class="toggle-logo" />
+								<PanelLeftIcon size={18} class="toggle-panel-icon" />
+							</span>
+							{#if $activeTab?.path}
+								{#if $activeTab.state === 'scanning'}
+									<Loader2Icon size={14} class="animate-spin text-blue-500" />
+								{:else if $activeTab.state === 'complete'}
+									<CheckCircle2Icon size={14} class="text-green-500" />
+								{:else if $activeTab.state === 'error'}
+									<AlertCircleIcon size={14} class="text-red-500" />
+								{/if}
+								<span class="sidebar-toggle-scan-name">{$activeTab.name}</span>
+							{/if}
+						</button>
+					{/if}
+
+					<!-- macOS: controls on left -->
+					{#if effectivePlatform === 'macos'}
+						<div class="window-controls macos" data-no-drag>
+							<button class="control-btn control-close" onclick={closeWindow} title="Close">
+								<span class="control-icon">×</span>
+							</button>
+							<button
+								class="control-btn control-minimize"
+								onclick={minimizeWindow}
+								title="Minimize"
+							>
+								<span class="control-icon">−</span>
+							</button>
+							<button
+								class="control-btn control-maximize"
+								onclick={toggleMaximize}
+								title="Maximize"
+							>
+								<span class="control-icon">+</span>
+							</button>
+						</div>
+					{/if}
+
+					<!-- Status (center area is draggable) -->
+					<div class="titlebar-status">
+						{#if $hasActiveScans}
+							<Badge variant="outline" class="gap-1.5" data-no-drag>
+								<span class="h-2 w-2 animate-pulse rounded-full bg-blue-500"></span>
+								Scanning...
+							</Badge>
+						{:else if $activeTab?.state === 'error'}
+							<Badge variant="destructive" class="gap-1.5" data-no-drag>
+								<span class="h-2 w-2 rounded-full bg-red-500"></span>
+								Error
+							</Badge>
+						{/if}
+					</div>
+
+					<!-- Windows/GNOME: controls on right -->
+					{#if effectivePlatform && effectivePlatform !== 'macos'}
+						<div class="window-controls" data-no-drag>
+							<button
+								class="control-btn control-minimize"
+								onclick={minimizeWindow}
+								title="Minimize"
+							>
+								<span class="control-icon">−</span>
+							</button>
+							<button
+								class="control-btn control-maximize"
+								onclick={toggleMaximize}
+								title="Maximize"
+							>
+								<span class="control-icon">□</span>
+							</button>
+							<button class="control-btn control-close" onclick={closeWindow} title="Close">
+								<span class="control-icon">×</span>
+							</button>
+						</div>
+					{/if}
+				</header>
+
+				<!-- Main Content -->
+				<main class="content-area">
+					{@render children()}
+				</main>
 			</div>
-
-			<!-- Windows/GNOME: controls on right -->
-			{#if effectivePlatform && effectivePlatform !== 'macos'}
-				<div data-no-drag class="window-controls">
-					<WindowControls platform={effectivePlatform} class="gap-2" />
-				</div>
-			{/if}
-		</header>
-
-		<!-- Main Content -->
-		<main class="flex-1 overflow-auto pt-8">
-			{@render children()}
-		</main>
+		</div>
 	</div>
 </div>
+
+<style>
+	.app-layout {
+		display: flex;
+		flex: 1;
+		height: 100%;
+		min-height: 0;
+		overflow: hidden;
+	}
+
+	.main-content-wrapper {
+		display: flex;
+		flex-direction: column;
+		flex: 1;
+		min-height: 0;
+		overflow: hidden;
+		background-color: var(--background);
+		border-radius: 0 var(--window-radius) var(--window-radius) 0;
+	}
+
+	.content-area {
+		flex: 1;
+		overflow: auto;
+		background-color: var(--background);
+	}
+
+	/* Sidebar toggle button in titlebar */
+	.sidebar-toggle-btn {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 6px 10px;
+		border-radius: 6px;
+		background-color: transparent;
+		border: none;
+		cursor: pointer;
+		color: var(--muted-foreground);
+		font-size: 13px;
+		transition: all 0.15s ease;
+	}
+
+	.sidebar-toggle-btn:hover {
+		background-color: var(--accent);
+		color: var(--foreground);
+	}
+
+	.sidebar-toggle-icon {
+		position: relative;
+		width: 20px;
+		height: 20px;
+		display: flex;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.sidebar-toggle-icon :global(.toggle-logo) {
+		width: 20px;
+		height: auto;
+		transition: opacity 0.15s ease;
+	}
+
+	.sidebar-toggle-icon :global(.toggle-panel-icon) {
+		position: absolute;
+		top: 50%;
+		left: 50%;
+		transform: translate(-50%, -50%);
+		opacity: 0;
+		transition: opacity 0.15s ease;
+	}
+
+	.sidebar-toggle-btn:hover .sidebar-toggle-icon :global(.toggle-logo) {
+		opacity: 0;
+	}
+
+	.sidebar-toggle-btn:hover .sidebar-toggle-icon :global(.toggle-panel-icon) {
+		opacity: 1;
+	}
+
+	.sidebar-toggle-scan-name {
+		max-width: 150px;
+		overflow: hidden;
+		text-overflow: ellipsis;
+		white-space: nowrap;
+		color: var(--foreground);
+	}
+</style>
