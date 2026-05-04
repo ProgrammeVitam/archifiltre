@@ -54,10 +54,13 @@ fn default_algorithm() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExportOptions {
     pub output_path: String,
     #[serde(default)]
     pub full_paths: bool,
+    /// Database name to export from
+    pub db_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,22 +183,72 @@ impl Default for AppState {
 }
 
 // ============================================================================
+// Binary Resolution Helper
+// ============================================================================
+
+fn resolve_binary_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager;
+
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("Failed to get resource dir: {}", e))?;
+
+    let possible_names = if cfg!(target_os = "windows") {
+        vec!["archifiltre-windows.exe"]
+    } else if cfg!(target_os = "macos") {
+        #[cfg(target_arch = "aarch64")]
+        let names = vec!["archifiltre-macos-arm64"];
+        #[cfg(target_arch = "x86_64")]
+        let names = vec!["archifiltre-macos"];
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let names = vec!["archifiltre-macos"];
+        names
+    } else {
+        vec!["archifiltre-linux"]
+    };
+
+    // Check resource directory
+    for name in &possible_names {
+        let path = resource_dir.join(name);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+
+    // Check in the app's directory (for development)
+    for name in &possible_names {
+        let dev_path = std::path::PathBuf::from("../../dist").join(name);
+        if dev_path.exists() {
+            return Ok(dev_path);
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            let cwd_path = cwd.join("dist").join(name);
+            if cwd_path.exists() {
+                return Ok(cwd_path);
+            }
+        }
+    }
+
+    Err(format!(
+        "Sidecar binary not found. Looked in: {:?} and ./dist/",
+        resource_dir
+    ))
+}
+
+// ============================================================================
 // Commands - Health & Version
 // ============================================================================
 
 #[tauri::command]
 async fn health_check(app: tauri::AppHandle) -> Result<CommandResult, String> {
-    use tauri_plugin_shell::ShellExt;
+    use std::process::Command;
 
-    let sidecar = app
-        .shell()
-        .sidecar("archifiltre")
-        .map_err(|e| format!("Failed to create sidecar: {}", e))?
-        .args(["health", "--verbose"]);
+    let binary_path = resolve_binary_path(&app)?;
 
-    let output = sidecar
+    let output = Command::new(&binary_path)
+        .args(["health", "--verbose"])
         .output()
-        .await
         .map_err(|e| format!("Failed to execute health check: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -214,17 +267,13 @@ async fn health_check(app: tauri::AppHandle) -> Result<CommandResult, String> {
 
 #[tauri::command]
 async fn get_version(app: tauri::AppHandle) -> Result<CommandResult, String> {
-    use tauri_plugin_shell::ShellExt;
+    use std::process::Command;
 
-    let sidecar = app
-        .shell()
-        .sidecar("archifiltre")
-        .map_err(|e| format!("Failed to create sidecar: {}", e))?
-        .args(["version"]);
+    let binary_path = resolve_binary_path(&app)?;
 
-    let output = sidecar
+    let output = Command::new(&binary_path)
+        .args(["version"])
         .output()
-        .await
         .map_err(|e| format!("Failed to get version: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -250,10 +299,11 @@ async fn scan_directory(
     app: tauri::AppHandle,
     options: ScanOptions,
 ) -> Result<CommandResult, String> {
-    use tauri_plugin_shell::process::CommandEvent;
-    use tauri_plugin_shell::ShellExt;
+    use std::io::BufRead;
+    use std::process::Command;
 
     let scan_id = options.scan_id.clone();
+    let binary_path = resolve_binary_path(&app)?;
 
     // Build CLI arguments
     let mut args = vec![
@@ -272,60 +322,69 @@ async fn scan_directory(
         args.push("--disable-archives".to_string());
     }
 
-    let sidecar = app
-        .shell()
-        .sidecar("archifiltre")
-        .map_err(|e| format!("Failed to create sidecar: {}", e))?
-        .args(&args);
-
-    let (mut rx, _child) = sidecar
+    let mut child = Command::new(&binary_path)
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to spawn scan process: {}", e))?;
 
-    let mut full_output = String::new();
-    let mut error_output = String::new();
-    let mut exit_success = false;
+    let stdout = child.stdout.take().ok_or("Failed to get stdout")?;
+    let stderr = child.stderr.take().ok_or("Failed to get stderr")?;
 
-    while let Some(event) = rx.recv().await {
-        match event {
-            CommandEvent::Stdout(line) => {
-                let line_str = String::from_utf8_lossy(&line).to_string();
-                full_output.push_str(&line_str);
-                full_output.push('\n');
-                let _ = app.emit(
-                    "scan-progress",
-                    ScanProgressEvent {
-                        scan_id: scan_id.clone(),
-                        line: line_str,
-                    },
-                );
-            }
-            CommandEvent::Stderr(line) => {
-                let line_str = String::from_utf8_lossy(&line).to_string();
+    // Read stderr in a separate thread to avoid deadlock
+    let scan_id_err = scan_id.clone();
+    let app_err = app.clone();
+    let stderr_handle = std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        let mut error_output = String::new();
+        for line in reader.lines() {
+            if let Ok(line_str) = line {
                 error_output.push_str(&line_str);
                 error_output.push('\n');
-                let _ = app.emit(
+                let _ = app_err.emit(
                     "scan-error",
                     ScanErrorEvent {
-                        scan_id: scan_id.clone(),
+                        scan_id: scan_id_err.clone(),
                         line: line_str,
                     },
                 );
             }
-            CommandEvent::Terminated(status) => {
-                exit_success = status.code == Some(0);
-                let _ = app.emit(
-                    "scan-complete",
-                    ScanCompleteEvent {
-                        scan_id: scan_id.clone(),
-                        success: exit_success,
-                    },
-                );
-                break;
-            }
-            _ => {}
+        }
+        error_output
+    });
+
+    // Read stdout lines and emit progress events
+    let mut full_output = String::new();
+    let reader = std::io::BufReader::new(stdout);
+    for line in reader.lines() {
+        if let Ok(line_str) = line {
+            full_output.push_str(&line_str);
+            full_output.push('\n');
+            let _ = app.emit(
+                "scan-progress",
+                ScanProgressEvent {
+                    scan_id: scan_id.clone(),
+                    line: line_str,
+                },
+            );
         }
     }
+
+    let error_output = stderr_handle.join().unwrap_or_default();
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait for scan process: {}", e))?;
+    let exit_success = status.success();
+
+    let _ = app.emit(
+        "scan-complete",
+        ScanCompleteEvent {
+            scan_id: scan_id.clone(),
+            success: exit_success,
+        },
+    );
 
     Ok(CommandResult {
         success: exit_success,
@@ -347,8 +406,10 @@ async fn compute_checksums(
     app: tauri::AppHandle,
     options: ChecksumOptions,
 ) -> Result<CommandResult, String> {
-    use tauri_plugin_shell::process::CommandEvent;
-    use tauri_plugin_shell::ShellExt;
+    use std::io::BufRead;
+    use std::process::Command;
+
+    let binary_path = resolve_binary_path(&app)?;
 
     let mut args = vec![
         "checksum".to_string(),
@@ -359,43 +420,51 @@ async fn compute_checksums(
         args.push("--each-file".to_string());
     }
 
-    let sidecar = app
-        .shell()
-        .sidecar("archifiltre")
-        .map_err(|e| format!("Failed to create sidecar: {}", e))?
-        .args(&args);
-
-    let (mut rx, _child) = sidecar
+    let mut child = Command::new(&binary_path)
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to spawn checksum process: {}", e))?;
 
-    let mut full_output = String::new();
-    let mut error_output = String::new();
+    let stdout = child.stdout.take().ok_or("Failed to get stdout")?;
+    let stderr = child.stderr.take().ok_or("Failed to get stderr")?;
 
-    while let Some(event) = rx.recv().await {
-        match event {
-            CommandEvent::Stdout(line) => {
-                let line_str = String::from_utf8_lossy(&line);
-                full_output.push_str(&line_str);
-                full_output.push('\n');
-                let _ = app.emit("checksum-progress", &line_str.to_string());
-            }
-            CommandEvent::Stderr(line) => {
-                let line_str = String::from_utf8_lossy(&line);
+    // Read stderr in a separate thread to avoid deadlock
+    let app_err = app.clone();
+    let stderr_handle = std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        let mut error_output = String::new();
+        for line in reader.lines() {
+            if let Ok(line_str) = line {
                 error_output.push_str(&line_str);
                 error_output.push('\n');
-                let _ = app.emit("checksum-error", &line_str.to_string());
+                let _ = app_err.emit("checksum-error", &line_str);
             }
-            CommandEvent::Terminated(status) => {
-                let _ = app.emit("checksum-complete", status.code == Some(0));
-                break;
-            }
-            _ => {}
+        }
+        error_output
+    });
+
+    // Read stdout lines and emit progress events
+    let mut full_output = String::new();
+    let reader = std::io::BufReader::new(stdout);
+    for line in reader.lines() {
+        if let Ok(line_str) = line {
+            full_output.push_str(&line_str);
+            full_output.push('\n');
+            let _ = app.emit("checksum-progress", &line_str);
         }
     }
 
+    let error_output = stderr_handle.join().unwrap_or_default();
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait for checksum process: {}", e))?;
+    let _ = app.emit("checksum-complete", status.success());
+
     Ok(CommandResult {
-        success: error_output.is_empty(),
+        success: error_output.is_empty() && status.success(),
         output: full_output,
         error: if error_output.is_empty() {
             None
@@ -414,51 +483,62 @@ async fn export_csv(
     app: tauri::AppHandle,
     options: ExportOptions,
 ) -> Result<CommandResult, String> {
-    use tauri_plugin_shell::process::CommandEvent;
-    use tauri_plugin_shell::ShellExt;
+    use std::io::{BufRead, BufReader};
+    use std::process::Command;
 
     let mut args = vec!["export".to_string(), options.output_path.clone()];
     if options.full_paths {
         args.push("--full-paths".to_string());
     }
+    if let Some(ref db) = options.db_name {
+        args.push("--db".to_string());
+        args.push(db.clone());
+    }
 
-    let sidecar = app
-        .shell()
-        .sidecar("archifiltre")
-        .map_err(|e| format!("Failed to create sidecar: {}", e))?
-        .args(&args);
+    let binary_path = resolve_binary_path(&app)?;
 
-    let (mut rx, _child) = sidecar
+    // Spawn the process
+    let mut child = Command::new(&binary_path)
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to spawn export process: {}", e))?;
+
+    let stdout = child.stdout.take().ok_or("Failed to get stdout")?;
+    let stderr = child.stderr.take().ok_or("Failed to get stderr")?;
 
     let mut full_output = String::new();
     let mut error_output = String::new();
 
-    while let Some(event) = rx.recv().await {
-        match event {
-            CommandEvent::Stdout(line) => {
-                let line_str = String::from_utf8_lossy(&line);
-                full_output.push_str(&line_str);
-                full_output.push('\n');
-                let _ = app.emit("export-progress", &line_str.to_string());
-            }
-            CommandEvent::Stderr(line) => {
-                let line_str = String::from_utf8_lossy(&line);
-                error_output.push_str(&line_str);
-                error_output.push('\n');
-                let _ = app.emit("export-error", &line_str.to_string());
-            }
-            CommandEvent::Terminated(status) => {
-                let _ = app.emit("export-complete", status.code == Some(0));
-                break;
-            }
-            _ => {}
+    // Read stdout
+    let stdout_reader = BufReader::new(stdout);
+    for line in stdout_reader.lines() {
+        if let Ok(line_str) = line {
+            full_output.push_str(&line_str);
+            full_output.push('\n');
+            let _ = app.emit("export-progress", &line_str);
         }
     }
 
+    // Read stderr
+    let stderr_reader = BufReader::new(stderr);
+    for line in stderr_reader.lines() {
+        if let Ok(line_str) = line {
+            error_output.push_str(&line_str);
+            error_output.push('\n');
+            let _ = app.emit("export-error", &line_str);
+        }
+    }
+
+    // Wait for the process to finish
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait for process: {}", e))?;
+    let _ = app.emit("export-complete", status.success());
+
     Ok(CommandResult {
-        success: error_output.is_empty(),
+        success: error_output.is_empty() && status.success(),
         output: full_output,
         error: if error_output.is_empty() {
             None
@@ -479,7 +559,6 @@ async fn start_query_session(
     db_name: Option<String>,
 ) -> Result<String, String> {
     use std::process::Command;
-    use tauri::Manager;
 
     let mut session_guard = state.query_session.lock().await;
 
@@ -489,25 +568,13 @@ async fn start_query_session(
     }
 
     // Build args
-    let mut args = vec!["query".to_string(), "--json".to_string()];
+    let mut args = vec!["query".to_string()];
     if let Some(ref db) = db_name {
         args.push("--db".to_string());
         args.push(db.clone());
     }
 
-    // Get the program path from the sidecar command
-    // We need to spawn it ourselves to get stdin/stdout handles
-    let resource_path = app
-        .path()
-        .resource_dir()
-        .map_err(|e| format!("Failed to get resource dir: {}", e))?;
-
-    #[cfg(target_os = "windows")]
-    let binary_name = "archifiltre.exe";
-    #[cfg(not(target_os = "windows"))]
-    let binary_name = "archifiltre";
-
-    let binary_path = resource_path.join("binaries").join(binary_name);
+    let binary_path = resolve_binary_path(&app)?;
 
     // Spawn the process with piped stdin/stdout
     let mut process = Command::new(&binary_path)
@@ -524,7 +591,7 @@ async fn start_query_session(
 
     let stdout_reader = BufReader::new(stdout);
 
-    // Create session
+    // Create session (run_id will be set after reading __ready__ message)
     let mut session = QuerySession {
         process,
         stdin,
@@ -532,27 +599,40 @@ async fn start_query_session(
         run_id: String::new(),
     };
 
-    // Get the run_id by sending a metadata query
-    let metadata_request = QueryRequest {
-        id: "init".to_string(),
-        action: "getMetadata".to_string(),
-        params: serde_json::Map::new(),
-    };
+    // Read the ready message from the query process
+    // Format: { "id": "__ready__", "ok": true, "data": { "run_id": "...", "status": "ready" } }
+    let mut ready_line = String::new();
+    session
+        .stdout
+        .read_line(&mut ready_line)
+        .map_err(|e| format!("Failed to read ready message: {}", e))?;
 
-    let response = session.query(&metadata_request)?;
-
-    if !response.ok {
+    if ready_line.is_empty() {
         let _ = session.kill();
-        return Err(response
-            .error
-            .unwrap_or_else(|| "Failed to get metadata".to_string()));
+        return Err("Query process closed before sending ready message".to_string());
     }
 
-    // Extract run_id from metadata response
-    let run_id = response
+    // Parse the ready message as QueryResponse
+    let ready_response: QueryResponse = serde_json::from_str(&ready_line).map_err(|e| {
+        format!(
+            "Failed to parse ready message: {} - raw: {}",
+            e,
+            ready_line.trim()
+        )
+    })?;
+
+    if !ready_response.ok {
+        let _ = session.kill();
+        return Err(ready_response
+            .error
+            .unwrap_or_else(|| "Unknown error starting query session".to_string()));
+    }
+
+    // Extract run_id from the ready response data
+    let run_id = ready_response
         .data
         .as_ref()
-        .and_then(|d| d.get("runId"))
+        .and_then(|d| d.get("run_id"))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
