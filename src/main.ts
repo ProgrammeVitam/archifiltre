@@ -22,6 +22,7 @@ import Sbom from './commands/sbom.ts';
 import Scan from './commands/scan.ts';
 import ExposeDb from './commands/expose-db.ts';
 import Logs from './commands/logs.ts';
+import Query from './commands/query.ts';
 import { getAppDataDir } from '@lib/platform-paths.ts';
 
 // Import extension-declared commands
@@ -35,6 +36,7 @@ const CORE_COMMANDS: Record<string, typeof Command> = {
   scan: Scan,
   'expose-db': ExposeDb,
   logs: Logs,
+  query: Query,
 };
 
 // Merged command registry: core + extension-declared commands

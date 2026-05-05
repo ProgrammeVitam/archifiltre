@@ -16,6 +16,8 @@ import Health from './health.ts';
 import Sbom from './sbom.ts';
 import Scan from './scan.ts';
 import ExposeDb from './expose-db.ts';
+import Logs from './logs.ts';
+import Query from './query.ts';
 
 // Import extension-declared commands
 import { EXTENSION_COMMANDS } from '@extensions/index.ts';
@@ -29,6 +31,8 @@ const CORE_COMMANDS = {
   sbom: Sbom,
   scan: Scan,
   'expose-db': ExposeDb,
+  logs: Logs,
+  query: Query,
 } as const;
 
 /**
@@ -43,4 +47,4 @@ export const COMMANDS = {
 /**
  * Export individual commands for direct access if needed
  */
-export { Version, Health, Sbom, Scan, ExposeDb };
+export { Version, Health, Sbom, Scan, ExposeDb, Logs, Query };

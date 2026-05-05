@@ -473,6 +473,10 @@ export const COMMAND = {
         description: 'Export full absolute paths instead of relative paths',
         default: false,
       }),
+      db: Flags.string({
+        description: 'Database name to export from',
+        default: 'main',
+      }),
     };
 
     async run(): Promise<void> {
@@ -499,7 +503,7 @@ export const COMMAND = {
         await ensureDirectory(outputDir);
 
         // Connect to database
-        database = await createScanDatabase('main');
+        database = await createScanDatabase(flags.db);
 
         // Get latest run_id
         ux.action.start('Finding latest scan');

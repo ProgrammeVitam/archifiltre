@@ -190,6 +190,60 @@ export interface QueryResponse {
 }
 
 // ================================
+// Tree Types (matching query command output)
+// ================================
+
+/** Directory node from get_tree query - flat structure */
+export interface DirectoryNode {
+	path: string;
+	name: string;
+	depth: number;
+	total_size: number;
+	file_count: number;
+	dir_count: number;
+}
+
+/** Tree data from get_tree query */
+export interface TreeData {
+	root: string | null;
+	directories: DirectoryNode[];
+}
+
+/** Stats data from get_stats query */
+export interface ScanStats {
+	totalFiles: number;
+	totalPhysicalSize: number;
+	totalContentSize: number;
+	duplicateGroups: number;
+	duplicateFiles: number;
+	totalArchives: number;
+	totalArchiveEntries: number;
+	archiveFormats: string[];
+}
+
+/** File node from get_files query */
+export interface FileNode {
+	path: string;
+	name: string;
+	size: number;
+	content_size: number | null;
+	mtime: number;
+	is_directory: boolean;
+	is_hidden: boolean;
+	hash: string | null;
+	is_archive: boolean;
+	archive_format: string | null;
+}
+
+/** Files data from get_files query */
+export interface FilesData {
+	files: FileNode[];
+	total: number;
+	has_more: boolean;
+	cursor: string | null;
+}
+
+// ================================
 // Command Functions - Query Session
 // ================================
 
@@ -228,6 +282,188 @@ export async function isQuerySessionActive(): Promise<boolean> {
  */
 export async function getQueryRunId(): Promise<string> {
 	return await invoke<string>('get_query_run_id');
+}
+
+// ================================
+// Query Helper Functions
+// ================================
+
+/**
+ * Query the file tree structure for visualization.
+ * Returns a flat list of directories that can be built into a hierarchy.
+ * Requires an active query session.
+ */
+export async function queryTree(): Promise<TreeData | null> {
+	const response = await sendQuery({
+		id: `get_tree_${Date.now()}`,
+		action: 'get_tree'
+	});
+
+	if (!response.ok) {
+		console.error('Failed to get tree:', response.error);
+		return null;
+	}
+
+	return response.data as TreeData;
+}
+
+/**
+ * Query scan statistics.
+ * Requires an active query session.
+ */
+export async function queryStats(): Promise<ScanStats | null> {
+	const response = await sendQuery({
+		id: `get_stats_${Date.now()}`,
+		action: 'get_stats'
+	});
+
+	if (!response.ok) {
+		console.error('Failed to get stats:', response.error);
+		return null;
+	}
+
+	return response.data as ScanStats;
+}
+
+/**
+ * Ping the query session to check if it's alive.
+ */
+export async function pingQuerySession(): Promise<boolean> {
+	try {
+		const response = await sendQuery({
+			id: `ping_${Date.now()}`,
+			action: 'ping'
+		});
+		return response.ok;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Query files in a specific directory.
+ * Use empty string for root directory.
+ * Requires an active query session.
+ */
+export async function queryFiles(
+	dirPath: string = '',
+	limit: number = 1000
+): Promise<FilesData | null> {
+	const response = await sendQuery({
+		id: `get_files_${Date.now()}`,
+		action: 'get_files',
+		path: dirPath,
+		limit
+	});
+
+	if (!response.ok) {
+		console.error('Failed to get files:', response.error);
+		return null;
+	}
+
+	return response.data as FilesData;
+}
+
+// ================================
+// Export Functions
+// ================================
+
+export interface ExportOptions {
+	outputPath: string;
+	fullPaths?: boolean;
+	dbName?: string;
+}
+
+/**
+ * Export scan results to CSV file.
+ * @param options - Export options including output path and database name
+ */
+export async function exportCsv(options: ExportOptions): Promise<CommandResult> {
+	return await invoke<CommandResult>('export_csv', { options });
+}
+
+/**
+ * Open a save file dialog for CSV export.
+ * Returns the selected file path or null if cancelled.
+ */
+export async function selectExportPath(): Promise<string | null> {
+	const { save } = await import('@tauri-apps/plugin-dialog');
+	const result = await save({
+		title: 'Export scan results',
+		defaultPath: `archifiltre-export-${Date.now()}.csv`,
+		filters: [{ name: 'CSV', extensions: ['csv'] }]
+	});
+	return result;
+}
+
+// ================================
+// Tree Hierarchy Helpers
+// ================================
+
+/**
+ * Build a map of parent path -> children for tree navigation.
+ */
+export function buildTreeHierarchy(directories: DirectoryNode[]): Map<string, DirectoryNode[]> {
+	const childrenMap = new Map<string, DirectoryNode[]>();
+
+	for (const dir of directories) {
+		const parentPath = dir.path.includes('/')
+			? dir.path.substring(0, dir.path.lastIndexOf('/'))
+			: '';
+
+		if (!childrenMap.has(parentPath)) {
+			childrenMap.set(parentPath, []);
+		}
+		childrenMap.get(parentPath)!.push(dir);
+	}
+
+	// Sort children by size (largest first)
+	for (const children of childrenMap.values()) {
+		children.sort((a, b) => b.total_size - a.total_size);
+	}
+
+	return childrenMap;
+}
+
+/**
+ * Get children of a directory path.
+ */
+export function getChildren(
+	path: string,
+	childrenMap: Map<string, DirectoryNode[]>
+): DirectoryNode[] {
+	return childrenMap.get(path) ?? [];
+}
+
+/**
+ * Get root directories (those at minimum depth).
+ */
+export function getRootDirectories(directories: DirectoryNode[]): DirectoryNode[] {
+	if (directories.length === 0) return [];
+	const minDepth = Math.min(...directories.map((d) => d.depth));
+	return directories
+		.filter((d) => d.depth === minDepth)
+		.sort((a, b) => b.total_size - a.total_size);
+}
+
+/**
+ * Generate a color for a directory path.
+ */
+export function getColorForPath(path: string, isDirectory: boolean): string {
+	if (!isDirectory) return '#6b7280'; // gray for files
+
+	// Hash the path to get a consistent color
+	let hash = 0;
+	for (let i = 0; i < path.length; i++) {
+		hash = path.charCodeAt(i) + ((hash << 5) - hash);
+	}
+
+	// Use HSL for better color distribution
+	const hue = Math.abs(hash) % 360;
+	const saturation = 65 + (Math.abs(hash >> 8) % 20); // 65-85%
+	const lightness = 45 + (Math.abs(hash >> 16) % 15); // 45-60%
+
+	return `hsl(${hue}, ${saturation}%, ${lightness}%)`;
 }
 
 // ================================
