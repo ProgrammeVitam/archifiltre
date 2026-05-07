@@ -130,6 +130,21 @@
 			}
 
 			isInitialized = true;
+
+			unsubscribeActiveScan = activeScan.subscribe((scan) => {
+				if (!scan) return;
+
+				if (loadedForScanId !== scan.id) {
+					treeData = null;
+					statsData = null;
+					visualizationError = null;
+					isLoadingVisualization = false;
+
+					if (scan.state === 'complete') {
+						loadVisualizationData(scan.dbName, scan.id);
+					}
+				}
+			});
 		} catch (error) {
 			initError = `Failed to initialize: ${error}`;
 			healthStatus.set('unhealthy');
@@ -154,27 +169,6 @@
 
 	// Subscribe to activeScan changes to handle sidebar clicks
 	let unsubscribeActiveScan: (() => void) | null = null;
-
-	onMount(() => {
-		// Set up subscription after initial mount
-		unsubscribeActiveScan = activeScan.subscribe((scan) => {
-			if (!scan) return;
-
-			// If switching to a different scan
-			if (loadedForScanId !== scan.id) {
-				// Clear old visualization data
-				treeData = null;
-				statsData = null;
-				visualizationError = null;
-				isLoadingVisualization = false;
-
-				// Load visualization for completed scans
-				if (scan.state === 'complete') {
-					loadVisualizationData(scan.dbName, scan.id);
-				}
-			}
-		});
-	});
 
 	onDestroy(() => {
 		unsubscribeActiveScan?.();
