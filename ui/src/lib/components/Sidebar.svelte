@@ -85,7 +85,6 @@
 	}
 
 	// Computed values
-	let completedScans = $derived($scans.filter((s) => s.path !== null).length);
 	let scansWithPath = $derived($scans.filter((s) => s.path));
 </script>
 
@@ -93,12 +92,12 @@
 <aside class="sidebar {className}" class:collapsed class:sidebar-linux={isLinux}>
 	<!-- Sidebar Header -->
 	<div class="sidebar-header">
-		<div class="sidebar-logo">
+		<div class="sidebar-logo" class:logo-hidden={collapsed}>
 			<ArchifiltreLogo size={20} />
 			<span class="sidebar-logo-text">Archifiltre</span>
 			<span class="sidebar-version">v5</span>
 		</div>
-		<button class="toggle-btn" onclick={toggleCollapsed} title="Close sidebar">
+		<button class="toggle-btn" onclick={toggleCollapsed} title="Close sidebar (Ctrl+B)">
 			<PanelLeftCloseIcon size={18} />
 		</button>
 	</div>
@@ -189,6 +188,17 @@
 		display: flex;
 		align-items: center;
 		gap: 8px;
+		opacity: 1;
+		transform: translateX(0);
+		transition:
+			opacity 0.15s ease,
+			transform 0.2s ease;
+	}
+
+	/* Logo slides out to the left when sidebar collapses */
+	.sidebar-logo.logo-hidden {
+		opacity: 0;
+		transform: translateX(-20px);
 	}
 
 	.sidebar-logo-text {

@@ -24,7 +24,6 @@ import {
   generateRunId,
   type ScanConfig,
   type ScanResult,
-  type ScanProgressEvent,
 } from '@lib/scanner.ts';
 
 export default class Scan extends Command {
@@ -163,25 +162,11 @@ export default class Scan extends Command {
         duplicateGroups: 0,
       };
 
-      // Check if running in a TTY (interactive terminal) or as a sidecar (piped)
-      const isTTY = process.stdout.isTTY;
-
-      if (isTTY) {
-        ux.action.start(`Scanning ${rootPath}`);
-      }
+      ux.action.start(`Scanning ${rootPath}`);
 
       await new Promise<void>((resolve, reject) => {
-        const result$ = scanDirectory(database!, scanConfig, (event: ScanProgressEvent) => {
-          logger.debug('Progress callback received', { status: event.status, phase: event.phase });
-
-          if (isTTY) {
-            // Interactive mode: update spinner
-            ux.action.status = event.status;
-          } else {
-            // Sidecar mode: emit JSON for Tauri UI
-            // eslint-disable-next-line no-console
-            process.stdout.write(`${JSON.stringify(event)}\n`);
-          }
+        const result$ = scanDirectory(database!, scanConfig, (status: string) => {
+          ux.action.status = status; // Direct assignment - oclif should handle the refresh
         });
 
         result$.subscribe({
@@ -192,17 +177,13 @@ export default class Scan extends Command {
             const duration = Date.now() - startTime;
             const durationStr = formatDuration(duration);
 
-            if (isTTY) {
-              ux.action.stop(
-                `${lastProgress.filesIngested.toLocaleString()} files, ${lastProgress.duplicateGroups.toLocaleString()} duplicate groups (${durationStr})`
-              );
-            }
+            ux.action.stop(
+              `${lastProgress.filesIngested.toLocaleString()} files, ${lastProgress.duplicateGroups.toLocaleString()} duplicate groups (${durationStr})`
+            );
             resolve();
           },
           error: error => {
-            if (isTTY) {
-              ux.action.stop('failed');
-            }
+            ux.action.stop('failed');
             reject(error);
           },
         });

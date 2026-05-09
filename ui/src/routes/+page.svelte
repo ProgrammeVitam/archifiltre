@@ -10,7 +10,8 @@
 		startScanningScan,
 		finishScanningScan,
 		setErrorForScan,
-		resetScan
+		resetScan,
+		viewMode
 	} from '$lib/stores';
 	import {
 		healthCheck,
@@ -25,8 +26,6 @@
 		queryTree,
 		queryStats,
 		formatBytes,
-		exportCsv,
-		selectExportPath,
 		type TreeData,
 		type ScanStats
 	} from '$lib/tauri';
@@ -36,16 +35,7 @@
 	import ScanProgress from '$lib/components/ScanProgress.svelte';
 	import IcicleChart from '$lib/components/IcicleChart.svelte';
 	import FileTable from '$lib/components/FileTable.svelte';
-	import * as Tabs from '$lib/components/ui/tabs';
-	import {
-		LoaderCircle,
-		CircleAlert,
-		RefreshCw,
-		Download,
-		Plus,
-		LayoutGrid,
-		List
-	} from '@lucide/svelte';
+	import { LoaderCircle, CircleAlert, RefreshCw, Plus } from '@lucide/svelte';
 	import type { UnlistenFn } from '@tauri-apps/api/event';
 
 	// ================================
@@ -61,9 +51,6 @@
 	let statsData = $state<ScanStats | null>(null);
 	let isLoadingVisualization = $state(false);
 	let visualizationError = $state<string | null>(null);
-
-	// View toggle state
-	let viewMode = $state<string>('chart');
 
 	// ================================
 	// Initialization
@@ -285,31 +272,16 @@
 		scansStore.addScan();
 	}
 
-	async function handleExport(): Promise<void> {
-		const scan = $activeScan;
-		if (!scan) return;
+	// ================================
+	// Computed values for status bar
+	// ================================
 
-		try {
-			// Open save dialog
-			const outputPath = await selectExportPath();
-			if (!outputPath) return; // User cancelled
-
-			// Export to CSV
-			const result = await exportCsv({
-				outputPath,
-				dbName: scan.dbName,
-				fullPaths: true
-			});
-
-			if (result.success) {
-				console.log('Export successful:', outputPath);
-			} else {
-				console.error('Export failed:', result.error);
-			}
-		} catch (error) {
-			console.error('Export error:', error);
-		}
-	}
+	let fileCount = $derived(statsData?.totalFiles ?? $activeScan?.scanResult.filesDiscovered ?? 0);
+	let folderCount = $derived($activeScan?.scanResult.folders ?? 0);
+	let duplicateCount = $derived(
+		statsData?.duplicateFiles ?? $activeScan?.scanResult.duplicateFiles ?? 0
+	);
+	let totalSize = $derived(statsData?.totalPhysicalSize ?? $activeScan?.scanResult.totalSize ?? 0);
 </script>
 
 <!-- Main Container -->
@@ -377,85 +349,25 @@
 					</div>
 				</div>
 			{:else if treeData}
-				<!-- Visualization -->
-				<Tabs.Root bind:value={viewMode} class="flex min-h-0 flex-1 flex-col">
-					<!-- View toggle tabs -->
-					<div class="border-b px-4 py-2">
-						<Tabs.List>
-							<Tabs.Trigger value="chart">
-								<LayoutGrid size={16} />
-								<span>Chart</span>
-							</Tabs.Trigger>
-							<Tabs.Trigger value="table">
-								<List size={16} />
-								<span>Table</span>
-							</Tabs.Trigger>
-						</Tabs.List>
-					</div>
-
-					<!-- Content area -->
-					<Tabs.Content value="chart" class="min-h-0 flex-1 overflow-auto p-4">
+				<!-- Visualization Content -->
+				<div class="visualization-content">
+					{#if $viewMode === 'chart'}
 						<IcicleChart data={treeData} class="h-full w-full" />
-					</Tabs.Content>
-					<Tabs.Content value="table" class="min-h-0 flex-1 overflow-auto p-4">
+					{:else}
 						<FileTable data={treeData} class="h-full w-full" />
-					</Tabs.Content>
+					{/if}
+				</div>
 
-					<!-- Stats bar at the bottom -->
-					<div class="border-t bg-card px-4 py-3">
-						<div class="flex items-center justify-between">
-							<!-- Stats -->
-							<div class="flex gap-6">
-								<div class="flex items-center gap-2">
-									<span class="text-2xl font-bold text-foreground">
-										{statsData?.totalFiles?.toLocaleString() ??
-											$activeScan?.scanResult.filesDiscovered.toLocaleString()}
-									</span>
-									<span class="text-sm text-muted-foreground">files</span>
-								</div>
-								<div class="flex items-center gap-2">
-									<span class="text-2xl font-bold text-foreground">
-										{$activeScan?.scanResult.folders.toLocaleString()}
-									</span>
-									<span class="text-sm text-muted-foreground">folders</span>
-								</div>
-								<div class="flex items-center gap-2">
-									<span class="text-2xl font-bold text-foreground">
-										{statsData?.duplicateFiles?.toLocaleString() ??
-											$activeScan?.scanResult.duplicateFiles.toLocaleString()}
-									</span>
-									<span class="text-sm text-muted-foreground">duplicates</span>
-								</div>
-								<div class="flex items-center gap-2">
-									<span class="text-2xl font-bold text-foreground">
-										{formatBytes(
-											statsData?.totalPhysicalSize ?? $activeScan?.scanResult.totalSize ?? 0
-										)}
-									</span>
-									<span class="text-sm text-muted-foreground">total size</span>
-								</div>
-							</div>
-
-							<!-- Actions -->
-							<div class="flex gap-2">
-								<Button variant="outline" size="sm" onclick={handleReset}>
-									<RefreshCw size={14} class="mr-2" />
-									Lorem ipsum
-								</Button>
-								<Button size="sm" onclick={handleExport}>
-									<Download size={14} class="mr-2" />
-									Export
-								</Button>
-							</div>
-						</div>
-
-						<!-- Scanned path -->
-						<div class="mt-2 text-xs text-muted-foreground">
-							<span>Scanned: </span>
-							<span class="font-mono">{$activeScan?.path}</span>
-						</div>
-					</div>
-				</Tabs.Root>
+				<!-- Minimal Status Bar -->
+				<div class="status-bar">
+					<span class="status-item">{fileCount.toLocaleString()} files</span>
+					<span class="status-separator">•</span>
+					<span class="status-item">{folderCount.toLocaleString()} folders</span>
+					<span class="status-separator">•</span>
+					<span class="status-item">{duplicateCount.toLocaleString()} duplicates</span>
+					<span class="status-separator">•</span>
+					<span class="status-item">{formatBytes(totalSize)}</span>
+				</div>
 			{/if}
 		</div>
 	{:else if $activeScan?.state === 'error'}
@@ -480,3 +392,41 @@
 		</div>
 	{/if}
 </div>
+
+<style>
+	.visualization-content {
+		flex: 1;
+		min-height: 0;
+		overflow: auto;
+		padding: 16px;
+		display: flex;
+		flex-direction: column;
+	}
+
+	.visualization-content :global(.h-full) {
+		flex: 1;
+		min-height: 0;
+	}
+
+	.status-bar {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 3px 12px;
+		background-color: var(--muted);
+		border-top: 1px solid var(--border);
+		font-size: 11px;
+		color: var(--muted-foreground);
+		height: 22px;
+		flex-shrink: 0;
+	}
+
+	.status-item {
+		white-space: nowrap;
+	}
+
+	.status-separator {
+		opacity: 0.4;
+		font-size: 8px;
+	}
+</style>

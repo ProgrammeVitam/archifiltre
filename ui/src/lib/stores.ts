@@ -384,6 +384,10 @@ export type TabState = ScanState;
 /** CLI version string */
 export const cliVersion = writable<string | null>(null);
 
+// View mode store for Chart/Table toggle (shared between layout and page)
+export type ViewMode = 'chart' | 'table';
+export const viewMode = writable<ViewMode>('chart');
+
 /** Health status of the CLI */
 export const healthStatus = writable<'unknown' | 'healthy' | 'unhealthy'>('unknown');
 

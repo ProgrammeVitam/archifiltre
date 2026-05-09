@@ -204,7 +204,8 @@ class ArchifiltrLogger {
     const sanitizedContext = this.sanitizeContext(context);
     const oclifCommand = OclifCommandRegistry.getCommand();
 
-    // Send to Oclif command if available
+    // Send errors and warnings to Oclif command if available (console output)
+    // INFO and DEBUG go to file only - console UX is handled separately via ux.action
     if (oclifCommand) {
       const contextStr = sanitizedContext ? ` ${JSON.stringify(sanitizedContext)}` : '';
       const fullMessage = `${message}${contextStr}`;
@@ -219,14 +220,7 @@ class ArchifiltrLogger {
         case 'warn':
           oclifCommand.warn(`WARN: ${fullMessage}`);
           break;
-        case 'info':
-          oclifCommand.log(fullMessage);
-          break;
-        case 'debug':
-          if (oclifCommand.debug) {
-            oclifCommand.debug(`DEBUG: ${fullMessage}`);
-          }
-          break;
+        // INFO and DEBUG are file-only - no console output
       }
     }
 

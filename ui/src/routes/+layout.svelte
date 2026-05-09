@@ -1,16 +1,29 @@
 <script lang="ts">
 	import './layout.css';
 	import { onMount } from 'svelte';
-	import { platform, detectPlatform, activeTab, hasActiveScans, type Platform } from '$lib/stores';
+	import {
+		platform,
+		detectPlatform,
+		activeScan,
+		hasActiveScans,
+		viewMode,
+		type Platform,
+		type ViewMode
+	} from '$lib/stores';
 	import { Badge } from '$lib/components/ui/badge';
+	import { Button } from '$lib/components/ui/button';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import ArchifiltreLogo from '$lib/components/ArchifiltreLogo.svelte';
 	import {
 		Loader2 as Loader2Icon,
 		CheckCircle2 as CheckCircle2Icon,
 		AlertCircle as AlertCircleIcon,
-		PanelLeft as PanelLeftIcon
+		PanelLeft as PanelLeftIcon,
+		LayoutGrid as LayoutGridIcon,
+		List as ListIcon,
+		Download as DownloadIcon
 	} from '@lucide/svelte';
+	import { exportCsv, selectExportPath } from '$lib/tauri';
 
 	let { children } = $props();
 
@@ -83,6 +96,36 @@
 		await toggleMaximize();
 	}
 
+	function setViewMode(mode: ViewMode) {
+		viewMode.set(mode);
+	}
+
+	async function handleExport(): Promise<void> {
+		const scan = $activeScan;
+		if (!scan) return;
+
+		try {
+			// Open save dialog
+			const outputPath = await selectExportPath();
+			if (!outputPath) return; // User cancelled
+
+			// Export to CSV
+			const result = await exportCsv({
+				outputPath,
+				dbName: scan.dbName,
+				fullPaths: true
+			});
+
+			if (result.success) {
+				console.log('Export successful:', outputPath);
+			} else {
+				console.error('Export failed:', result.error);
+			}
+		} catch (error) {
+			console.error('Export error:', error);
+		}
+	}
+
 	onMount(() => {
 		const handleKeydown = (e: KeyboardEvent) => {
 			// Dev tools toggle: Ctrl+Shift+P
@@ -113,6 +156,9 @@
 	function setDevPlatform(p: Platform | null) {
 		devPlatformOverride = p;
 	}
+
+	// Derived state for showing view toggle and export button
+	let showViewControls = $derived($activeScan?.state === 'complete');
 </script>
 
 <!-- Window container - padding and shadow only on Linux -->
@@ -215,31 +261,6 @@
 					onmousedown={startDrag}
 					ondblclick={handleDoubleClick}
 				>
-					<!-- Sidebar toggle (when collapsed) -->
-					{#if sidebarCollapsed}
-						<button
-							class="sidebar-toggle-btn"
-							onclick={() => (sidebarCollapsed = false)}
-							title="Open sidebar"
-							data-no-drag
-						>
-							<span class="sidebar-toggle-icon">
-								<ArchifiltreLogo size={20} class="toggle-logo" />
-								<PanelLeftIcon size={18} class="toggle-panel-icon" />
-							</span>
-							{#if $activeTab?.path}
-								{#if $activeTab.state === 'scanning'}
-									<Loader2Icon size={14} class="animate-spin text-blue-500" />
-								{:else if $activeTab.state === 'complete'}
-									<CheckCircle2Icon size={14} class="text-green-500" />
-								{:else if $activeTab.state === 'error'}
-									<AlertCircleIcon size={14} class="text-red-500" />
-								{/if}
-								<span class="sidebar-toggle-scan-name">{$activeTab.name}</span>
-							{/if}
-						</button>
-					{/if}
-
 					<!-- macOS: controls on left -->
 					{#if effectivePlatform === 'macos'}
 						<div class="window-controls macos" data-no-drag>
@@ -263,20 +284,71 @@
 						</div>
 					{/if}
 
-					<!-- Status (center area is draggable) -->
-					<div class="titlebar-status">
-						{#if $hasActiveScans}
-							<Badge variant="outline" class="gap-1.5" data-no-drag>
-								<span class="h-2 w-2 animate-pulse rounded-full bg-blue-500"></span>
-								Scanning...
-							</Badge>
-						{:else if $activeTab?.state === 'error'}
-							<Badge variant="destructive" class="gap-1.5" data-no-drag>
-								<span class="h-2 w-2 rounded-full bg-red-500"></span>
-								Error
-							</Badge>
-						{/if}
-					</div>
+					<!-- Sidebar toggle (when collapsed) - single button with logo, status, and folder name -->
+					{#if sidebarCollapsed}
+						<button
+							class="sidebar-toggle-btn"
+							onclick={() => (sidebarCollapsed = false)}
+							title="Open sidebar (Ctrl+B)"
+							data-no-drag
+						>
+							<span class="sidebar-toggle-icon">
+								<ArchifiltreLogo size={20} class="toggle-logo" />
+								<PanelLeftIcon size={18} class="toggle-panel-icon" />
+							</span>
+							{#if $activeScan?.path}
+								{#if $activeScan.state === 'scanning'}
+									<Loader2Icon size={14} class="animate-spin text-blue-500" />
+								{:else if $activeScan.state === 'complete'}
+									<CheckCircle2Icon size={14} class="text-green-500" />
+								{:else if $activeScan.state === 'error'}
+									<AlertCircleIcon size={14} class="text-red-500" />
+								{/if}
+								<span class="sidebar-toggle-scan-name">{$activeScan.name}</span>
+							{/if}
+						</button>
+					{/if}
+
+					<!-- View toggle (Chart/Table) - only shown when scan complete -->
+					{#if showViewControls}
+						<div class="titlebar-view-toggle" data-no-drag>
+							<button
+								class="view-toggle-btn"
+								class:active={$viewMode === 'chart'}
+								onclick={() => setViewMode('chart')}
+								title="Chart view"
+							>
+								<LayoutGridIcon size={14} />
+								<span>Chart</span>
+							</button>
+							<button
+								class="view-toggle-btn"
+								class:active={$viewMode === 'table'}
+								onclick={() => setViewMode('table')}
+								title="Table view"
+							>
+								<ListIcon size={14} />
+								<span>Table</span>
+							</button>
+						</div>
+					{/if}
+
+					<!-- Spacer to push export and controls to the right -->
+					<div class="titlebar-spacer"></div>
+
+					<!-- Export button - only shown when scan complete -->
+					{#if showViewControls}
+						<Button
+							variant="ghost"
+							size="sm"
+							class="titlebar-export-btn"
+							onclick={handleExport}
+							data-no-drag
+						>
+							<DownloadIcon size={14} />
+							<span>Export</span>
+						</Button>
+					{/if}
 
 					<!-- Windows/GNOME: controls on right -->
 					{#if effectivePlatform && effectivePlatform !== 'macos'}
@@ -336,7 +408,10 @@
 		background-color: var(--background);
 	}
 
-	/* Sidebar toggle button in titlebar */
+	/* ================================
+	   Sidebar Toggle Button (in titlebar)
+	   ================================ */
+
 	.sidebar-toggle-btn {
 		display: flex;
 		align-items: center;
@@ -394,5 +469,61 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 		color: var(--foreground);
+	}
+
+	/* ================================
+	   View Toggle Tabs
+	   ================================ */
+
+	.titlebar-view-toggle {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+		background-color: var(--muted);
+		padding: 3px;
+		border-radius: 8px;
+		margin-left: 12px;
+	}
+
+	.view-toggle-btn {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 5px 10px;
+		border: none;
+		border-radius: 6px;
+		background-color: transparent;
+		color: var(--muted-foreground);
+		font-size: 12px;
+		font-weight: 500;
+		cursor: pointer;
+		transition: all 0.15s ease;
+	}
+
+	.view-toggle-btn:hover {
+		color: var(--foreground);
+	}
+
+	.view-toggle-btn.active {
+		background-color: var(--background);
+		color: var(--foreground);
+		box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+	}
+
+	/* ================================
+	   Titlebar Spacer
+	   ================================ */
+
+	.titlebar-spacer {
+		flex: 1;
+	}
+
+	/* ================================
+	   Export Button
+	   ================================ */
+
+	:global(.titlebar-export-btn) {
+		gap: 6px;
+		margin-right: 8px;
 	}
 </style>
