@@ -365,6 +365,70 @@ export async function queryFiles(
 }
 
 // ================================
+// Thumbnail Cache Types & Helpers
+// ================================
+
+/** Cached thumbnail result from the database */
+export interface CachedThumbnail {
+	thumbnail: string | null;
+	width?: number;
+	height?: number;
+	format?: string;
+	cached: boolean;
+}
+
+/**
+ * Check if a thumbnail is cached in the database.
+ * Returns the base64-encoded thumbnail if cached, or null if not.
+ * Requires an active query session.
+ */
+export async function getThumbnailFromCache(filePath: string): Promise<CachedThumbnail | null> {
+	try {
+		const response = await sendQuery({
+			id: `get_thumbnail_${Date.now()}`,
+			action: 'get_thumbnail',
+			path: filePath
+		});
+
+		if (!response.ok) {
+			return null;
+		}
+
+		return response.data as CachedThumbnail;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Store a generated thumbnail in the database cache.
+ * Requires an active query session.
+ */
+export async function storeThumbnailInCache(
+	filePath: string,
+	thumbnailBase64: string,
+	width: number,
+	height: number,
+	format: string
+): Promise<boolean> {
+	try {
+		const response = await sendQuery({
+			id: `store_thumbnail_${Date.now()}`,
+			action: 'store_thumbnail',
+			path: filePath,
+			thumbnail: thumbnailBase64,
+			width,
+			height,
+			format
+		});
+
+		return response.ok;
+	} catch {
+		return false;
+	}
+}
+
+// ================================
 // Export Functions
 // ================================
 

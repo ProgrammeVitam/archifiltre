@@ -9,6 +9,7 @@
         "@tauri-apps/plugin-os": "^2.3.2",
         "@tauri-apps/plugin-shell": "^2.3.5",
         "@tauri-controls/svelte": "^0.4.0",
+        "@thumbnailjs/core": "^0.1.0",
         "docx-preview": "^0.3.7",
         "pdfjs-dist": "^5.6.205",
         "thumbnailjs": "^0.2.0",
@@ -349,6 +350,8 @@
     "@testing-library/svelte-core": ["@testing-library/svelte-core@1.0.0", "", { "peerDependencies": { "svelte": "^3 || ^4 || ^5 || ^5.0.0-next.0" } }, "sha512-VkUePoLV6oOYwSUvX6ShA8KLnJqZiYMIbP2JW2t0GLWLkJxKGvuH5qrrZBV/X7cXFnLGuFQEC7RheYiZOW68KQ=="],
 
     "@testing-library/user-event": ["@testing-library/user-event@14.6.1", "", { "peerDependencies": { "@testing-library/dom": ">=7.21.4" } }, "sha512-vq7fv0rnt+QTXgPxr5Hjc210p6YKq2kmdziLgnsZGgLJ9e6VAShx1pACLuRjd/AS/sr7phAR58OIIpf0LlmQNw=="],
+
+    "@thumbnailjs/core": ["@thumbnailjs/core@0.1.0", "", { "dependencies": { "pdfjs-dist": "^5.6.205" } }, "sha512-MUBE6iYz5J71vp76cNI6+NPmOWyC2MfGCmKtf7UrJ2kAzt4Y2eqQM6SF/YIKgzdXtshS22Y7CIwfBZy4o/g+PA=="],
 
     "@tootallnate/quickjs-emscripten": ["@tootallnate/quickjs-emscripten@0.23.0", "", {}, "sha512-C5Mc6rdnsaJDjO3UpGW/CQTHtCKaYlScZTly4JIu97Jxo/odCiH0ITnDXSJPTOrEKk/ycSZ0AOgTmkDtkOsvIA=="],
 
