@@ -12,6 +12,7 @@
 		type TreeData,
 		type FileNode
 	} from '$lib/tauri';
+	import { selectDirectory, selectFile, hoverDirectory, hoverFile, clearHoveredItem } from '$lib/stores';
 
 	// ================================
 	// Types
@@ -582,12 +583,44 @@
 		if (hit !== hoveredRect) {
 			hoveredRect = hit;
 			render();
+
+			// Update hover stores for drawer preview
+			if (hit) {
+				const centerX = hit.x + hit.width / 2;
+				if (hit.node) {
+					hoverDirectory(hit.node, centerX);
+				} else if (hit.file) {
+					hoverFile(hit.file, centerX);
+				}
+			} else {
+				clearHoveredItem();
+			}
 		}
 	}
 
 	function handleMouseLeave() {
 		hoveredRect = null;
+		clearHoveredItem();
 		render();
+	}
+
+	function handleClick(e: MouseEvent) {
+		if (!canvas) return;
+
+		const rect = canvas.getBoundingClientRect();
+		const clickX = e.clientX - rect.left;
+		const clickY = e.clientY - rect.top;
+
+		const hit = findRectAt(clickX, clickY);
+		if (hit) {
+			// Calculate center X of the selected item (in screen coordinates)
+			const centerX = hit.x + hit.width / 2;
+			if (hit.node) {
+				selectDirectory(hit.node, centerX);
+			} else if (hit.file) {
+				selectFile(hit.file, centerX);
+			}
+		}
 	}
 </script>
 
@@ -598,46 +631,10 @@
 			bind:this={canvas}
 			onmousemove={handleMouseMove}
 			onmouseleave={handleMouseLeave}
-			class="block w-full"
+			onclick={handleClick}
+			class="block w-full cursor-pointer"
 			style="height: {contentHeight}px;"
 		></canvas>
 
-		<!-- Tooltip -->
-		{#if hoveredRect}
-			{@const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1}
-			<div
-				class="pointer-events-none absolute z-50 max-w-xs rounded-lg border border-white/10 bg-slate-900/95 px-3.5 py-2.5 text-xs shadow-xl"
-				style="left: {Math.min(mouseX + 12, canvasWidth / dpr - 220)}px; top: {Math.max(
-					10,
-					mouseY - 10
-				)}px;"
-			>
-				{#if hoveredRect.node}
-					<div class="mb-1 text-sm font-semibold text-slate-100">{hoveredRect.node.name}</div>
-					<div class="mb-1.5 font-mono text-[10px] break-all text-slate-500">
-						{hoveredRect.node.path}
-					</div>
-					<div class="flex gap-1.5 text-[11px] text-slate-400">
-						<span>{formatBytes(hoveredRect.node.total_size)}</span>
-						<span>•</span>
-						<span>{hoveredRect.node.file_count.toLocaleString()} files</span>
-						<span>•</span>
-						<span>{hoveredRect.node.dir_count.toLocaleString()} folders</span>
-					</div>
-				{:else if hoveredRect.file}
-					<div class="mb-1 text-sm font-semibold text-slate-100">{hoveredRect.file.name}</div>
-					<div class="mb-1.5 font-mono text-[10px] break-all text-slate-500">
-						{hoveredRect.file.path}
-					</div>
-					<div class="flex gap-1.5 text-[11px] text-slate-400">
-						<span>{formatBytes(hoveredRect.file.size)}</span>
-						{#if hoveredRect.file.is_archive}
-							<span>•</span>
-							<span>Archive ({hoveredRect.file.archive_format})</span>
-						{/if}
-					</div>
-				{/if}
-			</div>
-		{/if}
 	</div>
 </div>

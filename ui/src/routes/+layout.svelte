@@ -20,6 +20,7 @@
 		AlertCircle as AlertCircleIcon,
 		PanelLeft as PanelLeftIcon,
 		LayoutGrid as LayoutGridIcon,
+		FolderTree as FolderTreeIcon,
 		List as ListIcon,
 		Download as DownloadIcon
 	} from '@lucide/svelte';
@@ -309,26 +310,35 @@
 						</button>
 					{/if}
 
-					<!-- View toggle (Chart/Table) - only shown when scan complete -->
+					<!-- View toggle (Visual/Tree/Flat) - only shown when scan complete -->
 					{#if showViewControls}
 						<div class="titlebar-view-toggle" data-no-drag>
 							<button
 								class="view-toggle-btn"
-								class:active={$viewMode === 'chart'}
-								onclick={() => setViewMode('chart')}
-								title="Chart view"
+								class:active={$viewMode === 'stalactite'}
+								onclick={() => setViewMode('stalactite')}
+								title="Visual view"
 							>
 								<LayoutGridIcon size={14} />
-								<span>Chart</span>
+								<span>Visual</span>
 							</button>
 							<button
 								class="view-toggle-btn"
-								class:active={$viewMode === 'table'}
-								onclick={() => setViewMode('table')}
-								title="Table view"
+								class:active={$viewMode === 'tree'}
+								onclick={() => setViewMode('tree')}
+								title="Tree view"
+							>
+								<FolderTreeIcon size={14} />
+								<span>Tree</span>
+							</button>
+							<button
+								class="view-toggle-btn"
+								class:active={$viewMode === 'flat'}
+								onclick={() => setViewMode('flat')}
+								title="Flat list"
 							>
 								<ListIcon size={14} />
-								<span>Table</span>
+								<span>Flat</span>
 							</button>
 						</div>
 					{/if}

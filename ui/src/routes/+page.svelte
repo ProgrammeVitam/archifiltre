@@ -11,7 +11,10 @@
 		finishScanningScan,
 		setErrorForScan,
 		resetScan,
-		viewMode
+		viewMode,
+		selectedItem,
+		hoveredItem,
+		clearSelectedItem
 	} from '$lib/stores';
 	import {
 		healthCheck,
@@ -35,6 +38,8 @@
 	import ScanProgress from '$lib/components/ScanProgress.svelte';
 	import IcicleChart from '$lib/components/IcicleChart.svelte';
 	import FileTable from '$lib/components/FileTable.svelte';
+	import TreeView from '$lib/components/TreeView.svelte';
+	import FileDetailsPanel from '$lib/components/FileDetailsPanel.svelte';
 	import { LoaderCircle, CircleAlert, RefreshCw, Plus } from '@lucide/svelte';
 	import type { UnlistenFn } from '@tauri-apps/api/event';
 
@@ -126,6 +131,7 @@
 					statsData = null;
 					visualizationError = null;
 					isLoadingVisualization = false;
+					clearSelectedItem();
 
 					if (scan.state === 'complete') {
 						loadVisualizationData(scan.dbName, scan.id);
@@ -263,6 +269,8 @@
 			treeData = null;
 			statsData = null;
 			visualizationError = null;
+			// Clear selected item
+			clearSelectedItem();
 			// Reset the scan
 			resetScan(scan.id);
 		}
@@ -350,23 +358,36 @@
 				</div>
 			{:else if treeData}
 				<!-- Visualization Content -->
-				<div class="visualization-content">
-					{#if $viewMode === 'chart'}
+				<div
+					class="flex flex-col overflow-auto p-4 pb-0"
+					class:flex-1={!$selectedItem && !$hoveredItem}
+					class:shrink-0={$selectedItem || $hoveredItem}
+				>
+					{#if $viewMode === 'stalactite'}
 						<IcicleChart data={treeData} class="h-full w-full" />
+					{:else if $viewMode === 'tree'}
+						<TreeView data={treeData} class="h-full w-full" />
 					{:else}
 						<FileTable data={treeData} class="h-full w-full" />
 					{/if}
 				</div>
 
+				<!-- File/Folder Details Panel with Picker -->
+				{#if $selectedItem || $hoveredItem}
+					<FileDetailsPanel />
+				{/if}
+
 				<!-- Minimal Status Bar -->
-				<div class="status-bar">
-					<span class="status-item">{fileCount.toLocaleString()} files</span>
-					<span class="status-separator">•</span>
-					<span class="status-item">{folderCount.toLocaleString()} folders</span>
-					<span class="status-separator">•</span>
-					<span class="status-item">{duplicateCount.toLocaleString()} duplicates</span>
-					<span class="status-separator">•</span>
-					<span class="status-item">{formatBytes(totalSize)}</span>
+				<div
+					class="flex h-5.5 shrink-0 items-center gap-1.5 border-t border-border bg-muted px-3 text-[11px] text-muted-foreground"
+				>
+					<span class="whitespace-nowrap">{fileCount.toLocaleString()} files</span>
+					<span class="text-[8px] opacity-40">•</span>
+					<span class="whitespace-nowrap">{folderCount.toLocaleString()} folders</span>
+					<span class="text-[8px] opacity-40">•</span>
+					<span class="whitespace-nowrap">{duplicateCount.toLocaleString()} duplicates</span>
+					<span class="text-[8px] opacity-40">•</span>
+					<span class="whitespace-nowrap">{formatBytes(totalSize)}</span>
 				</div>
 			{/if}
 		</div>
@@ -394,39 +415,9 @@
 </div>
 
 <style>
-	.visualization-content {
+	/* Allow visualization children to fill available space */
+	:global(.flex-1.flex-col > .h-full) {
 		flex: 1;
 		min-height: 0;
-		overflow: auto;
-		padding: 16px;
-		display: flex;
-		flex-direction: column;
-	}
-
-	.visualization-content :global(.h-full) {
-		flex: 1;
-		min-height: 0;
-	}
-
-	.status-bar {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-		padding: 3px 12px;
-		background-color: var(--muted);
-		border-top: 1px solid var(--border);
-		font-size: 11px;
-		color: var(--muted-foreground);
-		height: 22px;
-		flex-shrink: 0;
-	}
-
-	.status-item {
-		white-space: nowrap;
-	}
-
-	.status-separator {
-		opacity: 0.4;
-		font-size: 8px;
 	}
 </style>

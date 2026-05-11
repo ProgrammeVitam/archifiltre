@@ -385,8 +385,164 @@ export type TabState = ScanState;
 export const cliVersion = writable<string | null>(null);
 
 // View mode store for Chart/Table toggle (shared between layout and page)
-export type ViewMode = 'chart' | 'table';
-export const viewMode = writable<ViewMode>('chart');
+export type ViewMode = 'stalactite' | 'tree' | 'flat';
+export const viewMode = writable<ViewMode>('stalactite');
+
+// Selected item store for details panel (shared across all views)
+export interface SelectedItem {
+	type: 'file' | 'directory';
+	path: string;
+	name: string;
+	size: number;
+	// Directory-specific fields
+	fileCount?: number;
+	dirCount?: number;
+	totalSize?: number;
+	// File-specific fields
+	contentSize?: number | null;
+	mtime?: number;
+	isHidden?: boolean;
+	hash?: string | null;
+	isArchive?: boolean;
+	archiveFormat?: string | null;
+}
+
+export const selectedItem = writable<SelectedItem | null>(null);
+
+/** X position of the selected item (for drawing picker line) */
+export const selectedItemX = writable<number | null>(null);
+
+/** Hovered item for preview in drawer */
+export const hoveredItem = writable<SelectedItem | null>(null);
+
+/** X position of the hovered item */
+export const hoveredItemX = writable<number | null>(null);
+
+/** Clear the selected item */
+export function clearSelectedItem(): void {
+	selectedItem.set(null);
+	selectedItemX.set(null);
+}
+
+/** Clear the hovered item */
+export function clearHoveredItem(): void {
+	hoveredItem.set(null);
+	hoveredItemX.set(null);
+}
+
+/** Set the hovered item from a directory node */
+export function hoverDirectory(
+	node: {
+		path: string;
+		name: string;
+		total_size: number;
+		file_count: number;
+		dir_count: number;
+	},
+	xPosition?: number
+): void {
+	hoveredItem.set({
+		type: 'directory',
+		path: node.path,
+		name: node.name,
+		size: node.total_size,
+		totalSize: node.total_size,
+		fileCount: node.file_count,
+		dirCount: node.dir_count
+	});
+	if (xPosition !== undefined) {
+		hoveredItemX.set(xPosition);
+	}
+}
+
+/** Set the hovered item from a file node */
+export function hoverFile(
+	file: {
+		path: string;
+		name: string;
+		size: number;
+		content_size?: number | null;
+		mtime?: number;
+		is_hidden?: boolean;
+		hash?: string | null;
+		is_archive?: boolean;
+		archive_format?: string | null;
+	},
+	xPosition?: number
+): void {
+	hoveredItem.set({
+		type: 'file',
+		path: file.path,
+		name: file.name,
+		size: file.size,
+		contentSize: file.content_size,
+		mtime: file.mtime,
+		isHidden: file.is_hidden,
+		hash: file.hash,
+		isArchive: file.is_archive,
+		archiveFormat: file.archive_format
+	});
+	if (xPosition !== undefined) {
+		hoveredItemX.set(xPosition);
+	}
+}
+
+/** Set the selected item from a directory node */
+export function selectDirectory(
+	node: {
+		path: string;
+		name: string;
+		total_size: number;
+		file_count: number;
+		dir_count: number;
+	},
+	xPosition?: number
+): void {
+	selectedItem.set({
+		type: 'directory',
+		path: node.path,
+		name: node.name,
+		size: node.total_size,
+		totalSize: node.total_size,
+		fileCount: node.file_count,
+		dirCount: node.dir_count
+	});
+	if (xPosition !== undefined) {
+		selectedItemX.set(xPosition);
+	}
+}
+
+/** Set the selected item from a file node */
+export function selectFile(
+	file: {
+		path: string;
+		name: string;
+		size: number;
+		content_size?: number | null;
+		mtime?: number;
+		is_hidden?: boolean;
+		hash?: string | null;
+		is_archive?: boolean;
+		archive_format?: string | null;
+	},
+	xPosition?: number
+): void {
+	selectedItem.set({
+		type: 'file',
+		path: file.path,
+		name: file.name,
+		size: file.size,
+		contentSize: file.content_size,
+		mtime: file.mtime,
+		isHidden: file.is_hidden,
+		hash: file.hash,
+		isArchive: file.is_archive,
+		archiveFormat: file.archive_format
+	});
+	if (xPosition !== undefined) {
+		selectedItemX.set(xPosition);
+	}
+}
 
 /** Health status of the CLI */
 export const healthStatus = writable<'unknown' | 'healthy' | 'unhealthy'>('unknown');

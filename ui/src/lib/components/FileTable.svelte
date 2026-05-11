@@ -1,15 +1,7 @@
 <script lang="ts">
 	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
-	import {
-		formatBytes,
-		buildTreeHierarchy,
-		getChildren,
-		getRootDirectories,
-		queryFiles,
-		type DirectoryNode,
-		type TreeData,
-		type FileNode
-	} from '$lib/tauri';
+	import { formatBytes, queryFiles, type TreeData, type FileNode } from '$lib/tauri';
+	import { selectDirectory, selectFile } from '$lib/stores';
 
 	// ================================
 	// Props
@@ -31,9 +23,7 @@
 		name: string;
 		size: number;
 		type: 'directory' | 'file';
-		depth: number;
-		fileCount?: number;
-		dirCount?: number;
+		parentPath: string;
 		isArchive?: boolean;
 		archiveFormat?: string | null;
 	}
@@ -43,16 +33,14 @@
 	// ================================
 
 	let rows: TableRow[] = $state([]);
-	let sortColumn: 'name' | 'size' | 'type' = $state('name');
+	let sortColumn: 'name' | 'size' | 'type' | 'path' = $state('name');
 	let sortDirection: 'asc' | 'desc' = $state('asc');
 	let isLoading = $state(false);
 
-	// Files cache
+	// Files cache and deduplication
 	let filesCache: SvelteMap<string, FileNode[]> = new SvelteMap();
 	let loadingFiles: SvelteSet<string> = new SvelteSet();
-
-	// Derived
-	let childrenMap = $derived(data ? buildTreeHierarchy(data.directories) : new Map());
+	let seenPaths: SvelteSet<string> = new SvelteSet();
 
 	// ================================
 	// Data Loading
@@ -69,6 +57,7 @@
 
 		isLoading = true;
 		rows = [];
+		seenPaths.clear();
 
 		// Load files for root
 		await loadFilesForDirectory('');
@@ -78,8 +67,8 @@
 			await loadFilesForDirectory(dir.path);
 		}
 
-		// Build table rows
-		buildTableRows();
+		// Build flat table rows (deduplicated)
+		buildFlatRows();
 		isLoading = false;
 	}
 
@@ -106,66 +95,49 @@
 		}
 	}
 
-	function buildTableRows() {
+	function buildFlatRows() {
 		if (!data) {
 			rows = [];
 			return;
 		}
 
 		const newRows: TableRow[] = [];
+		seenPaths.clear();
 
-		// Add root files
-		const rootFiles = filesCache.get('') || [];
-		for (const file of rootFiles) {
-			newRows.push({
-				path: file.path,
-				name: file.name,
-				size: file.size,
-				type: 'file',
-				depth: 0,
-				isArchive: file.is_archive,
-				archiveFormat: file.archive_format
-			});
-		}
-
-		// Recursively add directories and their files
-		function addDirectoryContents(dirs: DirectoryNode[], depth: number) {
-			for (const dir of dirs) {
-				// Add directory row
+		// Add all directories as rows
+		for (const dir of data.directories) {
+			if (!seenPaths.has(dir.path)) {
+				seenPaths.add(dir.path);
+				const parentPath = dir.path.includes('/')
+					? dir.path.substring(0, dir.path.lastIndexOf('/'))
+					: '';
 				newRows.push({
 					path: dir.path,
 					name: dir.name,
 					size: dir.total_size,
 					type: 'directory',
-					depth,
-					fileCount: dir.file_count,
-					dirCount: dir.dir_count
+					parentPath
 				});
+			}
+		}
 
-				// Add files in this directory
-				const dirFiles = filesCache.get(dir.path) || [];
-				for (const file of dirFiles) {
+		// Add all files from cache (deduplicated)
+		for (const [dirPath, files] of filesCache) {
+			for (const file of files) {
+				if (!seenPaths.has(file.path)) {
+					seenPaths.add(file.path);
 					newRows.push({
 						path: file.path,
 						name: file.name,
 						size: file.size,
 						type: 'file',
-						depth: depth + 1,
+						parentPath: dirPath,
 						isArchive: file.is_archive,
 						archiveFormat: file.archive_format
 					});
 				}
-
-				// Add subdirectories
-				const children = getChildren(dir.path, childrenMap);
-				if (children.length > 0) {
-					addDirectoryContents(children, depth + 1);
-				}
 			}
 		}
-
-		const rootDirs = getRootDirectories(data.directories);
-		addDirectoryContents(rootDirs, 0);
 
 		rows = newRows;
 	}
@@ -174,7 +146,7 @@
 	// Sorting
 	// ================================
 
-	function sortRows(column: 'name' | 'size' | 'type') {
+	function sortRows(column: 'name' | 'size' | 'type' | 'path') {
 		if (sortColumn === column) {
 			sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
 		} else {
@@ -197,6 +169,9 @@
 					break;
 				case 'type':
 					comparison = a.type.localeCompare(b.type);
+					break;
+				case 'path':
+					comparison = a.parentPath.localeCompare(b.parentPath);
 					break;
 			}
 
@@ -246,9 +221,35 @@
 		return iconMap[ext || ''] || '📄';
 	}
 
-	function getSortIndicator(column: 'name' | 'size' | 'type'): string {
+	function getSortIndicator(column: 'name' | 'size' | 'type' | 'path'): string {
 		if (sortColumn !== column) return '';
 		return sortDirection === 'asc' ? ' ↑' : ' ↓';
+	}
+
+	function handleRowClick(row: TableRow) {
+		if (row.type === 'directory') {
+			// Find the directory node in data
+			const dirNode = data?.directories.find((d) => d.path === row.path);
+			if (dirNode) {
+				selectDirectory(dirNode);
+			}
+		} else {
+			// It's a file - find it in the cache
+			const files = filesCache.get(row.parentPath) || [];
+			const fileNode = files.find((f) => f.path === row.path);
+			if (fileNode) {
+				selectFile(fileNode);
+			} else {
+				// Fallback: create a minimal file selection
+				selectFile({
+					path: row.path,
+					name: row.name,
+					size: row.size,
+					is_archive: row.isArchive,
+					archive_format: row.archiveFormat
+				});
+			}
+		}
 	}
 </script>
 
@@ -276,6 +277,12 @@
 							Name{getSortIndicator('name')}
 						</th>
 						<th
+							class="cursor-pointer px-3 py-2.5 text-left font-semibold text-muted-foreground select-none hover:bg-muted"
+							onclick={() => sortRows('path')}
+						>
+							Location{getSortIndicator('path')}
+						</th>
+						<th
 							class="w-24 cursor-pointer px-3 py-2.5 text-right font-semibold text-muted-foreground select-none hover:bg-muted"
 							onclick={() => sortRows('size')}
 						>
@@ -290,26 +297,28 @@
 					</tr>
 				</thead>
 				<tbody>
-					{#each sortedRows as row}
+					{#each sortedRows as row (row.path)}
 						<tr
-							class="border-b border-border/50 transition-colors hover:bg-muted/50"
+							class="cursor-pointer border-b border-border/50 transition-colors hover:bg-muted/50"
 							class:font-medium={row.type === 'directory'}
+							onclick={() => handleRowClick(row)}
+							role="button"
+							tabindex="0"
+							onkeydown={(e) => e.key === 'Enter' && handleRowClick(row)}
 						>
 							<td class="px-3 py-2">
 								<div class="flex items-center gap-1.5">
-									<span style="width: {row.depth * 20}px" class="shrink-0"></span>
 									<span class="shrink-0">{getFileIcon(row)}</span>
 									<span class="truncate" title={row.path}>{row.name}</span>
-									{#if row.type === 'directory'}
-										<span class="shrink-0 text-xs text-muted-foreground">
-											({row.fileCount} files, {row.dirCount} folders)
-										</span>
-									{:else if row.isArchive && row.archiveFormat}
+									{#if row.isArchive && row.archiveFormat}
 										<span class="shrink-0 text-xs text-muted-foreground">
 											({row.archiveFormat})
 										</span>
 									{/if}
 								</div>
+							</td>
+							<td class="max-w-xs truncate px-3 py-2 text-muted-foreground" title={row.parentPath}>
+								{row.parentPath || '/'}
 							</td>
 							<td class="px-3 py-2 text-right whitespace-nowrap text-muted-foreground">
 								{formatBytes(row.size)}
