@@ -31,7 +31,6 @@ import {
 } from '@lib/database.ts';
 import { eq, and, like, isNotNull, sql, desc, gt, asc } from 'drizzle-orm';
 import { handleDescribeDirectory } from '@extensions/ai-describe/index.ts';
-import { handleGetThumbnail, handleStoreThumbnail } from '@extensions/file-thumbnails/index.ts';
 
 // === Types ===
 
@@ -468,26 +467,6 @@ export default class Query extends Command {
             this.database,
             this.runId,
             (request.path as string) ?? ''
-          );
-          break;
-
-        case 'get_thumbnail':
-          data = await handleGetThumbnail(
-            this.database,
-            this.runId,
-            (request.path as string) ?? ''
-          );
-          break;
-
-        case 'store_thumbnail':
-          data = await handleStoreThumbnail(
-            this.database,
-            this.runId,
-            (request.path as string) ?? '',
-            request.thumbnail as string,
-            (request.width as number) ?? 0,
-            (request.height as number) ?? 0,
-            (request.format as string) ?? 'image/png'
           );
           break;
 

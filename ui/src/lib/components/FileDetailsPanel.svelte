@@ -6,7 +6,7 @@
 		hoveredItemX,
 		clearSelectedItem
 	} from '$lib/stores';
-	import { formatBytes } from '$lib/tauri';
+	import { formatBytes, queryDirectoryDescription, type DirectoryDescription } from '$lib/tauri';
 	import { Button } from '$lib/components/ui/button';
 	import {
 		XIcon,
@@ -33,6 +33,10 @@
 	} from '@lucide/svelte';
 	import FilePreview from './FilePreview.svelte';
 
+	// AI description state
+	let aiDescription: DirectoryDescription | null = $state(null);
+	let isLoadingDescription = $state(false);
+	let lastDescribedPath: string | null = $state(null);
 
 	// Determine which item to display: selected takes priority, then hovered
 	let displayItem = $derived($selectedItem ?? $hoveredItem);
@@ -44,6 +48,26 @@
 		if (!displayItem) return [];
 		const parts = displayItem.path.split('/').filter(Boolean);
 		return parts;
+	});
+
+	// Fetch AI description when a directory is selected
+	$effect(() => {
+		const item = $selectedItem;
+		if (item && item.type === 'directory' && item.path !== lastDescribedPath) {
+			lastDescribedPath = item.path;
+			isLoadingDescription = true;
+			aiDescription = null;
+			queryDirectoryDescription(item.path).then((result) => {
+				if (lastDescribedPath === item.path) {
+					aiDescription = result;
+					isLoadingDescription = false;
+				}
+			});
+		} else if (!item || item.type !== 'directory') {
+			aiDescription = null;
+			isLoadingDescription = false;
+			lastDescribedPath = null;
+		}
 	});
 
 	// thumbnailjs handles all file types — native previews for images/pdf/video/svg,
@@ -224,6 +248,35 @@
 						<FilePreview path={displayItem.path} class="h-full w-full" />
 					</div>
 				{:else if displayItem.type === 'directory'}
+					<!-- Directory: AI description -->
+					<div class="flex w-1/2 shrink-0 flex-col border-r border-border bg-muted/20 p-6">
+						<div class="mb-3 flex items-center gap-2 text-sm font-medium text-muted-foreground">
+							<TextIcon class="h-4 w-4" />
+							<span>Summary</span>
+						</div>
+
+						{#if isLoadingDescription}
+							<div class="flex flex-1 items-center gap-2 text-sm text-muted-foreground">
+								<LoaderCircleIcon class="h-4 w-4 animate-spin" />
+								<span>Analyzing directory contents…</span>
+							</div>
+						{:else if aiDescription?.description}
+							<div class="flex flex-1 flex-col">
+								<p class="leading-relaxed text-foreground">
+									{aiDescription.description}
+								</p>
+								{#if aiDescription.model}
+									<p class="mt-auto pt-4 text-xs text-muted-foreground/50">
+										{aiDescription.model}{aiDescription.cached ? ' · cached' : ''}
+									</p>
+								{/if}
+							</div>
+						{:else if aiDescription?.error}
+							<p class="text-sm text-muted-foreground/60 italic">{aiDescription.error}</p>
+						{:else}
+							<p class="text-sm text-muted-foreground/40 italic">No description available.</p>
+						{/if}
+					</div>
 				{/if}
 
 				<!-- Right column: Metadata -->

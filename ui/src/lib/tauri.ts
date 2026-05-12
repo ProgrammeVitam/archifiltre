@@ -364,6 +364,42 @@ export async function queryFiles(
 	return response.data as FilesData;
 }
 
+/** AI-generated directory description */
+export interface DirectoryDescription {
+	description: string | null;
+	model?: string;
+	cached?: boolean;
+	error?: string;
+}
+
+/**
+ * Get an AI-generated description of a directory.
+ * Uses an LLM API to analyze the directory tree structure.
+ * Results are cached in the database.
+ * Requires an active query session.
+ */
+export async function queryDirectoryDescription(
+	dirPath: string = ''
+): Promise<DirectoryDescription | null> {
+	try {
+		const response = await sendQuery({
+			id: `describe_directory_${Date.now()}`,
+			action: 'describe_directory',
+			path: dirPath
+		});
+
+		if (!response.ok) {
+			console.error('Failed to get directory description:', response.error);
+			return { description: null, error: response.error };
+		}
+
+		return response.data as DirectoryDescription;
+	} catch (error) {
+		console.error('Error querying directory description:', error);
+		return null;
+	}
+}
+
 // ================================
 // Thumbnail Cache Types & Helpers
 // ================================

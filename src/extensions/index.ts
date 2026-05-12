@@ -23,7 +23,6 @@ import * as summary from './summary.ts';
 import * as csvExport from './csv-export.ts';
 import * as checksum from './checksum/index.ts';
 import * as aiDescribe from './ai-describe/index.ts';
-import * as fileThumbnails from './file-thumbnails/index.ts';
 
 // === Extension Registry ===
 
@@ -36,7 +35,6 @@ const EXTENSIONS: Record<string, unknown>[] = [
   csvExport,
   checksum,
   aiDescribe,
-  fileThumbnails,
   // Future extensions go here:
   // jsonExport,
   // etc.
@@ -88,4 +86,4 @@ export const EXTENSION_COMMAND_NAMES: string[] = Object.keys(EXTENSION_COMMANDS)
 // === Re-export Extension Functions ===
 // Export individual extensions for direct use by other commands
 
-export { summary, csvExport, checksum, aiDescribe, fileThumbnails };
+export { summary, csvExport, checksum, aiDescribe };
