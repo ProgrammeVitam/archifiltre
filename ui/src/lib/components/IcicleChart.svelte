@@ -635,6 +635,5 @@
 			class="block w-full cursor-pointer"
 			style="height: {contentHeight}px;"
 		></canvas>
-
 	</div>
 </div>

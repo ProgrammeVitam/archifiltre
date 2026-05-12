@@ -31,6 +31,12 @@ import {
 } from '@lib/database.ts';
 import { eq, and, like, isNotNull, sql, desc, gt, asc } from 'drizzle-orm';
 import { handleDescribeDirectory } from '@extensions/ai-describe/index.ts';
+import { handleGetThumbnail, handleStoreThumbnail } from '@extensions/file-thumbnails/index.ts';
+import {
+  handleSetDeleteTag,
+  handleRemoveDeleteTag,
+  handleGetDeleteTags,
+} from '@extensions/delete-tags/index.ts';
 
 // === Types ===
 
@@ -468,6 +474,46 @@ export default class Query extends Command {
             this.runId,
             (request.path as string) ?? ''
           );
+          break;
+
+        case 'get_thumbnail':
+          data = await handleGetThumbnail(
+            this.database,
+            this.runId,
+            (request.path as string) ?? ''
+          );
+          break;
+
+        case 'store_thumbnail':
+          data = await handleStoreThumbnail(
+            this.database,
+            this.runId,
+            (request.path as string) ?? '',
+            request.thumbnail as string,
+            (request.width as number) ?? 0,
+            (request.height as number) ?? 0,
+            (request.format as string) ?? 'image/png'
+          );
+          break;
+
+        case 'set_delete_tag':
+          data = await handleSetDeleteTag(
+            this.database!,
+            this.runId!,
+            (request.path as string) ?? ''
+          );
+          break;
+
+        case 'remove_delete_tag':
+          data = await handleRemoveDeleteTag(
+            this.database!,
+            this.runId!,
+            (request.path as string) ?? ''
+          );
+          break;
+
+        case 'get_delete_tags':
+          data = await handleGetDeleteTags(this.database!, this.runId!);
           break;
 
         default:

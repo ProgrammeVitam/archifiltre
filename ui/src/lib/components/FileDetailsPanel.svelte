@@ -4,9 +4,17 @@
 		selectedItemX,
 		hoveredItem,
 		hoveredItemX,
-		clearSelectedItem
+		clearSelectedItem,
+		deleteTags,
+		isTaggedForDeletion
 	} from '$lib/stores';
-	import { formatBytes, queryDirectoryDescription, type DirectoryDescription } from '$lib/tauri';
+	import {
+		formatBytes,
+		queryDirectoryDescription,
+		type DirectoryDescription,
+		setDeleteTag,
+		removeDeleteTag
+	} from '$lib/tauri';
 	import { Button } from '$lib/components/ui/button';
 	import {
 		XIcon,
@@ -29,7 +37,8 @@
 		FilesIcon,
 		FolderOpenIcon,
 		TextIcon,
-		LoaderCircleIcon
+		LoaderCircleIcon,
+		Trash2Icon
 	} from '@lucide/svelte';
 	import FilePreview from './FilePreview.svelte';
 
@@ -42,6 +51,12 @@
 	let displayItem = $derived($selectedItem ?? $hoveredItem);
 	let displayX = $derived($selectedItem ? $selectedItemX : $hoveredItemX);
 	let isPreview = $derived(!$selectedItem && !!$hoveredItem);
+
+	// Delete tag state
+	let isItemTagged = $derived(
+		displayItem ? isTaggedForDeletion(displayItem.path, $deleteTags) : false
+	);
+	let isDirectlyTagged = $derived(displayItem ? $deleteTags.has(displayItem.path) : false);
 
 	// Parse path into breadcrumb segments
 	let breadcrumbs = $derived(() => {
@@ -172,6 +187,33 @@
 
 		return map[ext] ?? FileIcon;
 	}
+
+	async function toggleDeleteTag() {
+		if (!displayItem) return;
+
+		const path = displayItem.path;
+		if ($deleteTags.has(path)) {
+			// Remove the tag
+			const success = await removeDeleteTag(path);
+			if (success) {
+				deleteTags.update((tags) => {
+					const next = new Set(tags);
+					next.delete(path);
+					return next;
+				});
+			}
+		} else {
+			// Set the tag
+			const success = await setDeleteTag(path);
+			if (success) {
+				deleteTags.update((tags) => {
+					const next = new Set(tags);
+					next.add(path);
+					return next;
+				});
+			}
+		}
+	}
 </script>
 
 {#if displayItem && displayX !== null}
@@ -224,6 +266,15 @@
 						{/if}
 					{/each}
 				</div>
+
+				{#if isItemTagged}
+					<span
+						class="flex shrink-0 items-center gap-1 rounded bg-red-500/15 px-2 py-0.5 text-xs font-medium text-red-500"
+					>
+						<Trash2Icon class="h-3 w-3" />
+						Deletion
+					</span>
+				{/if}
 
 				<!-- Close button - only show when item is selected -->
 				{#if $selectedItem}
@@ -369,6 +420,26 @@
 								</span>
 							{/if}
 						{/if}
+
+						<!-- Delete Tag Toggle -->
+						<div class="col-span-2 mt-3 border-t border-border pt-3">
+							<Button
+								variant={isDirectlyTagged ? 'destructive' : 'outline'}
+								size="sm"
+								onclick={toggleDeleteTag}
+								class="w-full gap-2"
+							>
+								<Trash2Icon class="h-4 w-4" />
+								{#if isDirectlyTagged}
+									Unmark for deletion
+								{:else}
+									Mark for deletion
+								{/if}
+							</Button>
+							{#if isItemTagged && !isDirectlyTagged}
+								<p class="mt-2 text-xs text-red-500">A parent directory is marked for deletion</p>
+							{/if}
+						</div>
 					</div>
 				</div>
 			</div>

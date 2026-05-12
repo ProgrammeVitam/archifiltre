@@ -79,15 +79,30 @@ type ChecksumColumn = (typeof CHECKSUM_COLUMNS)[number];
 /**
  * Build CSV columns array with only populated checksum columns
  */
-function buildCsvColumns(populatedChecksums: ChecksumColumn[]): string[] {
-  return [...BASE_COLUMNS_BEFORE_CHECKSUMS, ...populatedChecksums, ...BASE_COLUMNS_AFTER_CHECKSUMS];
+function buildCsvColumns(
+  populatedChecksums: ChecksumColumn[],
+  hasDeleteTags: boolean = false
+): string[] {
+  const columns: string[] = [
+    ...BASE_COLUMNS_BEFORE_CHECKSUMS,
+    ...populatedChecksums,
+    ...BASE_COLUMNS_AFTER_CHECKSUMS,
+  ];
+  if (hasDeleteTags) {
+    columns.push('tagged_for_deletion');
+  }
+  return columns;
 }
 
 /**
  * Get CSV header row
  */
-function getCsvHeader(delimiter: string, populatedChecksums: ChecksumColumn[]): string {
-  return buildCsvColumns(populatedChecksums).join(delimiter);
+function getCsvHeader(
+  delimiter: string,
+  populatedChecksums: ChecksumColumn[],
+  hasDeleteTags: boolean = false
+): string {
+  return buildCsvColumns(populatedChecksums, hasDeleteTags).join(delimiter);
 }
 
 /**
@@ -129,7 +144,8 @@ function formatCsvRow(
   file: FileWithHashes,
   delimiter: string,
   populatedChecksums: ChecksumColumn[],
-  rootPath?: string
+  rootPath?: string,
+  deleteTagPaths?: Set<string>
 ): string {
   const filePath = rootPath ? path.join(rootPath, file.path) : file.path;
 
@@ -153,6 +169,10 @@ function formatCsvRow(
   ];
 
   const values = [...baseValuesBefore, ...checksumValues, ...baseValuesAfter];
+
+  if (deleteTagPaths) {
+    values.push(deleteTagPaths.has(file.path) ? true : '');
+  }
 
   return values.map(v => escapeCsvValue(v, delimiter)).join(delimiter);
 }
@@ -200,6 +220,34 @@ async function getPopulatedChecksumColumns(
 
   logger.debug('Detected populated checksum columns', { runId, columns: populated.join(', ') });
   return populated;
+}
+
+/**
+ * Detect if any delete tags exist for this run.
+ * Returns false if the delete_tags table doesn't exist (extension not used yet).
+ */
+async function hasDeleteTagsForRun(
+  connection: DatabaseConnection,
+  runId: string
+): Promise<boolean> {
+  try {
+    const result = await connection.pg.query<{ has_data: boolean }>(
+      `SELECT EXISTS (
+        SELECT 1 FROM delete_tags
+        WHERE run_id = $1
+        LIMIT 1
+      ) as has_data`,
+      [runId]
+    );
+    return result.rows[0]?.has_data ?? false;
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    if (errorMessage.includes('does not exist')) {
+      logger.debug('delete_tags table does not exist, no tags to export', { runId });
+      return false;
+    }
+    throw error;
+  }
 }
 
 // === Batched Query with JOIN ===
@@ -361,11 +409,12 @@ function writeLines(fileHandle: FileHandle, lines: string[]): Observable<number>
 
 // === Export Pipeline ===
 
-export interface CsvExportOptions {
+interface CsvExportOptions {
   delimiter?: string;
   batchSize?: number;
   rootPath?: string; // When provided, paths will be full paths
   populatedChecksums?: ChecksumColumn[]; // Which checksum columns have data
+  hasDeleteTags?: boolean; // Whether delete tags exist for this run
 }
 
 /**
@@ -384,7 +433,13 @@ export function exportToCsv(
   outputPath: string,
   options: CsvExportOptions = {}
 ): Observable<number> {
-  const { delimiter = ',', batchSize = 5000, rootPath, populatedChecksums = [] } = options;
+  const {
+    delimiter = ',',
+    batchSize = 5000,
+    rootPath,
+    populatedChecksums = [],
+    hasDeleteTags = false,
+  } = options;
 
   let fileHandle: FileHandle | null = null;
 
@@ -394,51 +449,76 @@ export function exportToCsv(
       outputPath,
       batchSize,
       checksumColumns: populatedChecksums.join(', '),
+      hasDeleteTags,
     });
 
-    // Open file and write header
-    return from(fsp.open(outputPath, 'w')).pipe(
-      tap(handle => {
-        fileHandle = handle;
-      }),
-      // Write header (with only populated checksum columns)
-      concatMap(handle =>
-        from(handle.write(`${getCsvHeader(delimiter, populatedChecksums)}\n`)).pipe(
-          map(() => handle)
-        )
-      ),
-      // Start streaming batches with JOIN (only if checksums exist)
-      concatMap(() =>
-        getFilesWithHashesBatched(database, runId, batchSize, populatedChecksums.length > 0).pipe(
-          // Format batch to CSV lines (with only populated checksum columns)
-          map(batch =>
-            batch.map(file => formatCsvRow(file, delimiter, populatedChecksums, rootPath))
-          ),
-          // Write batch to file with backpressure
-          concatMap(lines => {
-            if (!fileHandle) {
-              throw new Error('File handle not initialized');
-            }
-            return writeLines(fileHandle, lines);
+    // Load delete tag paths if the extension has been used
+    const deleteTagsPromise: Promise<Set<string>> = hasDeleteTags
+      ? database.pg
+          .query<{ path: string }>(`SELECT path FROM delete_tags WHERE run_id = $1`, [runId])
+          .then(result => new Set(result.rows.map(r => r.path)))
+      : Promise.resolve(new Set<string>());
+
+    return from(deleteTagsPromise).pipe(
+      concatMap(deleteTagPaths => {
+        // Open file and write header
+        return from(fsp.open(outputPath, 'w')).pipe(
+          tap(handle => {
+            fileHandle = handle;
           }),
-          // Accumulate total count
-          scan((total, batchCount) => total + batchCount, 0),
-          // Emit 0 if no files found
-          defaultIfEmpty(0)
-        )
-      ),
-      // Get final count
-      last(),
-      // Cleanup: close file handle
-      finalize(async () => {
-        if (fileHandle) {
-          await fileHandle.close();
-          logger.debug('Closed CSV file handle', { outputPath });
-        }
-      }),
-      catchError(error => {
-        logger.error('CSV export failed', error as Error, { runId, outputPath });
-        throw error;
+          // Write header (with only populated checksum columns + delete tag column)
+          concatMap(handle =>
+            from(
+              handle.write(`${getCsvHeader(delimiter, populatedChecksums, hasDeleteTags)}\n`)
+            ).pipe(map(() => handle))
+          ),
+          // Start streaming batches with JOIN (only if checksums exist)
+          concatMap(() =>
+            getFilesWithHashesBatched(
+              database,
+              runId,
+              batchSize,
+              populatedChecksums.length > 0
+            ).pipe(
+              // Format batch to CSV lines (with only populated checksum columns + delete tags)
+              map(batch =>
+                batch.map(file =>
+                  formatCsvRow(
+                    file,
+                    delimiter,
+                    populatedChecksums,
+                    rootPath,
+                    hasDeleteTags ? deleteTagPaths : undefined
+                  )
+                )
+              ),
+              // Write batch to file with backpressure
+              concatMap(lines => {
+                if (!fileHandle) {
+                  throw new Error('File handle not initialized');
+                }
+                return writeLines(fileHandle, lines);
+              }),
+              // Accumulate total count
+              scan((total, batchCount) => total + batchCount, 0),
+              // Emit 0 if no files found
+              defaultIfEmpty(0)
+            )
+          ),
+          // Get final count
+          last(),
+          // Cleanup: close file handle
+          finalize(async () => {
+            if (fileHandle) {
+              await fileHandle.close();
+              logger.debug('Closed CSV file handle', { outputPath });
+            }
+          }),
+          catchError(error => {
+            logger.error('CSV export failed', error as Error, { runId, outputPath });
+            throw error;
+          })
+        );
       })
     );
   });
@@ -544,12 +624,18 @@ export const COMMAND = {
           ux.action.stop('none');
         }
 
+        // Detect if any delete tags exist
+        ux.action.start('Detecting delete tags');
+        const hasDeleteTags = await hasDeleteTagsForRun(database, runId);
+        ux.action.stop(hasDeleteTags ? 'yes' : 'none');
+
         // Export to CSV
         ux.action.start(`Exporting to ${resolvedOutput}`);
 
         const totalFiles = await exportToCsv(database, runId, resolvedOutput, {
           rootPath,
           populatedChecksums,
+          hasDeleteTags,
         }).toPromise();
 
         ux.action.stop(`${totalFiles?.toLocaleString() ?? 0} files`);

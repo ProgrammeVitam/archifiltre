@@ -776,6 +776,29 @@ export function setAppState(state: ScanState): void {
 }
 
 // ================================
+// Delete Tags
+// ================================
+
+/** Set of paths currently tagged for deletion */
+export const deleteTags = writable<Set<string>>(new Set());
+
+/** Whether a specific path (or any of its ancestors) is tagged for deletion */
+export function isTaggedForDeletion(path: string, tags: Set<string>): boolean {
+	// Direct match
+	if (tags.has(path)) return true;
+	// Check if any ancestor directory is tagged
+	const parts = path.split('/');
+	for (let i = 1; i < parts.length; i++) {
+		const ancestor = parts.slice(0, i).join('/');
+		if (tags.has(ancestor)) return true;
+	}
+	return false;
+}
+
+/** Count of items directly tagged for deletion */
+export const deleteTagCount = derived(deleteTags, ($tags) => $tags.size);
+
+// ================================
 // Platform Detection
 // ================================
 

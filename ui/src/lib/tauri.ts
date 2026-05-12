@@ -465,6 +465,77 @@ export async function storeThumbnailInCache(
 }
 
 // ================================
+// Delete Tags Functions
+// ================================
+
+/** Delete tag entry returned by the backend */
+export interface DeleteTag {
+	path: string;
+	created_at: number;
+}
+
+/** Result from get_delete_tags query */
+export interface GetDeleteTagsResult {
+	tags: DeleteTag[];
+}
+
+/**
+ * Mark a file or directory for deletion.
+ * Requires an active query session.
+ */
+export async function setDeleteTag(path: string): Promise<boolean> {
+	try {
+		const response = await sendQuery({
+			id: `set_delete_tag_${Date.now()}`,
+			action: 'set_delete_tag',
+			path
+		});
+		return response.ok;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Remove the deletion tag from a file or directory.
+ * Requires an active query session.
+ */
+export async function removeDeleteTag(path: string): Promise<boolean> {
+	try {
+		const response = await sendQuery({
+			id: `remove_delete_tag_${Date.now()}`,
+			action: 'remove_delete_tag',
+			path
+		});
+		return response.ok;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Get all deletion tags for the current scan.
+ * Requires an active query session.
+ */
+export async function getDeleteTags(): Promise<GetDeleteTagsResult | null> {
+	try {
+		const response = await sendQuery({
+			id: `get_delete_tags_${Date.now()}`,
+			action: 'get_delete_tags'
+		});
+
+		if (!response.ok) {
+			console.error('Failed to get delete tags:', response.error);
+			return null;
+		}
+
+		return response.data as GetDeleteTagsResult;
+	} catch {
+		return null;
+	}
+}
+
+// ================================
 // Export Functions
 // ================================
 
