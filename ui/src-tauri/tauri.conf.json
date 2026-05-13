@@ -49,7 +49,7 @@
 			"icons/icon.icns",
 			"icons/icon.ico"
 		],
-		"externalBin": [],
+		"externalBin": ["../../dist/archifiltre"],
 		"category": "Utility",
 		"shortDescription": "Privacy-first file scanning tool"
 	},
