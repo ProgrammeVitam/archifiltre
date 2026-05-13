@@ -32,6 +32,8 @@ export interface ScanResult {
 	archives: number;
 	archiveEntries: number;
 	totalSize: number;
+	filesHashed: number;
+	filesToHash: number;
 }
 
 export interface TerminalLine {
@@ -40,6 +42,14 @@ export interface TerminalLine {
 	stream: 'stdout' | 'stderr' | 'info' | 'success' | 'error';
 	timestamp: Date;
 }
+
+export type ScanPhase =
+	| 'discovery'
+	| 'ingestion'
+	| 'prefilter'
+	| 'hashing'
+	| 'duplicate-detection'
+	| 'complete';
 
 /**
  * Scan represents a single analysis session.
@@ -66,6 +76,8 @@ export interface Scan {
 	terminalOutput: TerminalLine[];
 	/** Current progress message */
 	scanProgress: string;
+	/** Current scan phase */
+	scanPhase: ScanPhase;
 	/** Error message if state is 'error' */
 	errorMessage: string | null;
 	/** Timestamp when scan was created */
@@ -97,7 +109,9 @@ const defaultScanResult: ScanResult = {
 	hiddenFiles: 0,
 	archives: 0,
 	archiveEntries: 0,
-	totalSize: 0
+	totalSize: 0,
+	filesHashed: 0,
+	filesToHash: 0
 };
 
 // ================================
@@ -131,6 +145,7 @@ export function createScan(): Scan {
 		scanResult: { ...defaultScanResult },
 		terminalOutput: [],
 		scanProgress: '',
+		scanPhase: 'discovery',
 		errorMessage: null,
 		createdAt: Date.now()
 	};
@@ -366,6 +381,9 @@ export const terminalOutput = derived(activeScan, ($scan) => $scan?.terminalOutp
 /** Scan progress (from active scan) - LEGACY */
 export const scanProgress = derived(activeScan, ($scan) => $scan?.scanProgress ?? '');
 
+/** Scan phase (from active scan) - LEGACY */
+export const scanPhase = derived(activeScan, ($scan): ScanPhase => $scan?.scanPhase ?? 'discovery');
+
 /** Whether an operation is running (from active scan) - LEGACY */
 export const isRunning = derived(activeScan, ($scan) => $scan?.state === 'scanning');
 
@@ -594,10 +612,47 @@ export function clearTerminal(): void {
 	}
 }
 
+interface JsonProgressEvent {
+	type: string;
+	phase: ScanPhase;
+	filesDiscovered: number;
+	filesIngested: number;
+	filesHashed?: number;
+	filesToHash?: number;
+	hashErrors?: number;
+	duplicateSizes?: number;
+	duplicateGroups: number;
+	status: string;
+}
+
+function tryParseJsonProgressEvent(line: string): JsonProgressEvent | null {
+	try {
+		const parsed = JSON.parse(line);
+		if (parsed?.type === 'scan-progress') return parsed as JsonProgressEvent;
+	} catch { /* not JSON */ }
+	return null;
+}
+
 /** Parse scan output and update results for a specific scan */
 export function parseScanOutputForScan(scanId: string, line: string): void {
 	const scan = scansStore.getScan(scanId);
 	if (!scan) return;
+
+	// Try JSON progress event first (CLI in non-TTY mode emits these)
+	const event = tryParseJsonProgressEvent(line);
+	if (event) {
+		scansStore.updateScan(scanId, {
+			scanPhase: event.phase,
+			scanResult: {
+				...scan.scanResult,
+				filesDiscovered: event.filesDiscovered,
+				duplicateGroups: event.duplicateGroups,
+				...(event.filesHashed !== undefined && { filesHashed: event.filesHashed }),
+				...(event.filesToHash !== undefined && { filesToHash: event.filesToHash })
+			}
+		});
+		return;
+	}
 
 	const updates: Partial<ScanResult> = {};
 
@@ -686,6 +741,7 @@ export function startScanningScan(scanId: string, path: string, eventScanId: str
 		scanResult: { ...defaultScanResult },
 		terminalOutput: [],
 		scanProgress: '',
+		scanPhase: 'discovery',
 		errorMessage: null
 	});
 }
@@ -752,6 +808,7 @@ export function resetScan(scanId: string): void {
 		scanResult: { ...defaultScanResult },
 		terminalOutput: [],
 		scanProgress: '',
+		scanPhase: 'discovery',
 		errorMessage: null
 	});
 }

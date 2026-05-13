@@ -24,6 +24,7 @@ import {
   generateRunId,
   type ScanConfig,
   type ScanResult,
+  type ScanProgressEvent,
 } from '@lib/scanner.ts';
 
 export default class Scan extends Command {
@@ -162,11 +163,21 @@ export default class Scan extends Command {
         duplicateGroups: 0,
       };
 
-      ux.action.start(`Scanning ${rootPath}`);
+      const isTTY = process.stdout.isTTY;
+
+      if (isTTY) {
+        ux.action.start(`Scanning ${rootPath}`);
+      }
 
       await new Promise<void>((resolve, reject) => {
-        const result$ = scanDirectory(database!, scanConfig, (status: string) => {
-          ux.action.status = status; // Direct assignment - oclif should handle the refresh
+        const result$ = scanDirectory(database!, scanConfig, (event: ScanProgressEvent) => {
+          logger.debug('Progress callback received', { status: event.status, phase: event.phase });
+          if (isTTY) {
+            ux.action.status = event.status;
+          } else {
+            // eslint-disable-next-line no-console
+            process.stdout.write(`${JSON.stringify(event)}\n`);
+          }
         });
 
         result$.subscribe({
@@ -177,13 +188,17 @@ export default class Scan extends Command {
             const duration = Date.now() - startTime;
             const durationStr = formatDuration(duration);
 
-            ux.action.stop(
-              `${lastProgress.filesIngested.toLocaleString()} files, ${lastProgress.duplicateGroups.toLocaleString()} duplicate groups (${durationStr})`
-            );
+            if (isTTY) {
+              ux.action.stop(
+                `${lastProgress.filesIngested.toLocaleString()} files, ${lastProgress.duplicateGroups.toLocaleString()} duplicate groups (${durationStr})`
+              );
+            }
             resolve();
           },
           error: error => {
-            ux.action.stop('failed');
+            if (isTTY) {
+              ux.action.stop('failed');
+            }
             reject(error);
           },
         });

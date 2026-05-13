@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { scanResult } from '$lib/stores';
+	import { scanResult, scanPhase } from '$lib/stores';
 	import { LoaderCircle } from '@lucide/svelte';
 
 	// ================================
@@ -19,8 +19,34 @@
 
 	let folderName = $derived(path.split('/').pop() || path.split('\\').pop() || path);
 
+	let phaseLabel = $derived(() => {
+		switch ($scanPhase) {
+			case 'discovery':
+				return 'Discovering files';
+			case 'ingestion':
+				return 'Discovering files';
+			case 'prefilter':
+				return 'Analyzing sizes';
+			case 'hashing':
+				return 'Finding duplicates';
+			case 'duplicate-detection':
+				return 'Finding duplicates';
+			case 'complete':
+				return 'Complete';
+			default:
+				return 'Scanning';
+		}
+	});
 
-
+	let showHashingProgress = $derived(
+		($scanPhase === 'hashing' || $scanPhase === 'duplicate-detection') &&
+			$scanResult.filesToHash > 0
+	);
+	let hashingPercentage = $derived(
+		$scanResult.filesToHash > 0
+			? Math.round(($scanResult.filesHashed / $scanResult.filesToHash) * 100)
+			: 0
+	);
 </script>
 
 <div class="flex h-full w-full flex-col items-center justify-center {className}">
@@ -51,9 +77,24 @@
 		<div class="flex flex-col items-center space-y-3">
 			<div class="flex items-center gap-2 text-sm text-muted-foreground">
 				<span class="inline-block h-2 w-2 animate-pulse rounded-full bg-primary"></span>
-				<span>Scanning...</span>
+				<span>{phaseLabel()}</span>
 			</div>
 
+			<!-- Hashing progress bar (only shown during hashing phase) -->
+			{#if showHashingProgress}
+				<div class="w-64 space-y-1">
+					<div class="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+						<div
+							class="h-full bg-primary transition-all duration-300 ease-out"
+							style="width: {hashingPercentage}%"
+						></div>
+					</div>
+					<div class="text-center text-xs text-muted-foreground">
+						{$scanResult.filesHashed.toLocaleString()} / {$scanResult.filesToHash.toLocaleString()}
+						checksums ({hashingPercentage}%)
+					</div>
+				</div>
+			{/if}
 		</div>
 	</div>
 
