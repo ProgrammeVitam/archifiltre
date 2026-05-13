@@ -36,7 +36,7 @@
 	import { Alert, AlertDescription, AlertTitle } from '$lib/components/ui/alert';
 	import DropZone from '$lib/components/DropZone.svelte';
 	import ScanProgress from '$lib/components/ScanProgress.svelte';
-	import IcicleChart from '$lib/components/IcicleChart.svelte';
+	import StalactiteChart from '$lib/components/StalactiteChart.svelte';
 	import FileTable from '$lib/components/FileTable.svelte';
 	import TreeView from '$lib/components/TreeView.svelte';
 	import FileDetailsPanel from '$lib/components/FileDetailsPanel.svelte';
@@ -364,7 +364,7 @@
 					class:shrink-0={$selectedItem || $hoveredItem}
 				>
 					{#if $viewMode === 'stalactite'}
-						<IcicleChart data={treeData} class="h-full w-full" />
+						<StalactiteChart data={treeData} class="h-full w-full" />
 					{:else if $viewMode === 'tree'}
 						<TreeView data={treeData} class="h-full w-full" />
 					{:else}

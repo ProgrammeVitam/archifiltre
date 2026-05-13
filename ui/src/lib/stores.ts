@@ -384,7 +384,7 @@ export type TabState = ScanState;
 /** CLI version string */
 export const cliVersion = writable<string | null>(null);
 
-// View mode store for Chart/Table toggle (shared between layout and page)
+// View mode store for Stalactite/Tree/Flat toggle (shared between layout and page)
 export type ViewMode = 'stalactite' | 'tree' | 'flat';
 export const viewMode = writable<ViewMode>('stalactite');
 
