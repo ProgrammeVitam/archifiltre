@@ -436,18 +436,18 @@ async fn export_csv(
         .resource_dir()
         .map_err(|e| format!("Failed to get resource dir: {}", e))?;
 
-    let possible_names = if cfg!(target_os = "windows") {
-        vec!["archifiltre-x86_64-pc-windows-msvc.exe"]
+    let possible_names: Vec<&str> = if cfg!(target_os = "windows") {
+        vec!["archifiltre-x86_64-pc-windows-msvc.exe", "archifiltre.exe"]
     } else if cfg!(target_os = "macos") {
         #[cfg(target_arch = "aarch64")]
-        let names = vec!["archifiltre-aarch64-apple-darwin"];
+        let names = vec!["archifiltre-aarch64-apple-darwin", "archifiltre"];
         #[cfg(target_arch = "x86_64")]
-        let names = vec!["archifiltre-x86_64-apple-darwin"];
+        let names = vec!["archifiltre-x86_64-apple-darwin", "archifiltre"];
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        let names = vec!["archifiltre-x86_64-apple-darwin"];
+        let names = vec!["archifiltre-x86_64-apple-darwin", "archifiltre"];
         names
     } else {
-        vec!["archifiltre-x86_64-unknown-linux-gnu"]
+        vec!["archifiltre-x86_64-unknown-linux-gnu", "archifiltre"]
     };
 
     let mut sidecar_path = None;
@@ -459,20 +459,16 @@ async fn export_csv(
         }
     }
 
-    // Also check in the app's directory (for development)
+    // Fallback: check next to the executable itself (portable installs)
     if sidecar_path.is_none() {
-        for name in &possible_names {
-            let dev_path = std::path::PathBuf::from("../../dist").join(name);
-            if dev_path.exists() {
-                sidecar_path = Some(dev_path);
-                break;
-            }
-            let cwd_path = std::env::current_dir()
-                .ok()
-                .map(|p| p.join("dist").join(name));
-            if let Some(ref p) = cwd_path {
-                if p.exists() {
-                    sidecar_path = cwd_path;
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        if let Some(ref dir) = exe_dir {
+            for name in &possible_names {
+                let path = dir.join(name);
+                if path.exists() {
+                    sidecar_path = Some(path);
                     break;
                 }
             }
@@ -480,10 +476,7 @@ async fn export_csv(
     }
 
     let binary_path = sidecar_path.ok_or_else(|| {
-        format!(
-            "Sidecar binary not found. Looked in: {:?} and ./dist/",
-            resource_dir
-        )
+        format!("Sidecar binary not found. Looked in: {:?}", resource_dir)
     })?;
 
     // Spawn the process
@@ -572,18 +565,18 @@ async fn start_query_session(
         .map_err(|e| format!("Failed to get resource dir: {}", e))?;
 
     // Try different possible sidecar locations (simple naming convention)
-    let possible_names = if cfg!(target_os = "windows") {
-        vec!["archifiltre-x86_64-pc-windows-msvc.exe"]
+    let possible_names: Vec<&str> = if cfg!(target_os = "windows") {
+        vec!["archifiltre-x86_64-pc-windows-msvc.exe", "archifiltre.exe"]
     } else if cfg!(target_os = "macos") {
         #[cfg(target_arch = "aarch64")]
-        let names = vec!["archifiltre-aarch64-apple-darwin"];
+        let names = vec!["archifiltre-aarch64-apple-darwin", "archifiltre"];
         #[cfg(target_arch = "x86_64")]
-        let names = vec!["archifiltre-x86_64-apple-darwin"];
+        let names = vec!["archifiltre-x86_64-apple-darwin", "archifiltre"];
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        let names = vec!["archifiltre-x86_64-apple-darwin"];
+        let names = vec!["archifiltre-x86_64-apple-darwin", "archifiltre"];
         names
     } else {
-        vec!["archifiltre-x86_64-unknown-linux-gnu"]
+        vec!["archifiltre-x86_64-unknown-linux-gnu", "archifiltre"]
     };
 
     let mut sidecar_path = None;
@@ -595,21 +588,16 @@ async fn start_query_session(
         }
     }
 
-    // Also check in the app's directory (for development)
+    // Fallback: check next to the executable itself (portable installs)
     if sidecar_path.is_none() {
-        for name in &possible_names {
-            let dev_path = std::path::PathBuf::from("../../dist").join(name);
-            if dev_path.exists() {
-                sidecar_path = Some(dev_path);
-                break;
-            }
-            // Try absolute path from current dir
-            let cwd_path = std::env::current_dir()
-                .ok()
-                .map(|p| p.join("dist").join(name));
-            if let Some(ref p) = cwd_path {
-                if p.exists() {
-                    sidecar_path = cwd_path;
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()));
+        if let Some(ref dir) = exe_dir {
+            for name in &possible_names {
+                let path = dir.join(name);
+                if path.exists() {
+                    sidecar_path = Some(path);
                     break;
                 }
             }
@@ -617,10 +605,7 @@ async fn start_query_session(
     }
 
     let binary_path = sidecar_path.ok_or_else(|| {
-        format!(
-            "Sidecar binary not found. Looked in: {:?} and ./dist/",
-            resource_dir
-        )
+        format!("Sidecar binary not found. Looked in: {:?}", resource_dir)
     })?;
 
     // Spawn the process with piped stdin/stdout
