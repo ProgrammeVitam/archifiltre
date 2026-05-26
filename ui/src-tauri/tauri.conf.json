@@ -24,11 +24,7 @@
 				"dragDropEnabled": true,
 				"decorations": false,
 				"transparent": true,
-				"shadow": true,
-				"windowEffects": {
-					"effects": ["sidebar"],
-					"state": "followsWindowActiveState"
-				}
+				"shadow": true
 			}
 		],
 		"security": {

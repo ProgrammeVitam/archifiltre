@@ -437,17 +437,17 @@ async fn export_csv(
         .map_err(|e| format!("Failed to get resource dir: {}", e))?;
 
     let possible_names = if cfg!(target_os = "windows") {
-        vec!["archifiltre-windows.exe"]
+        vec!["archifiltre-x86_64-pc-windows-msvc.exe"]
     } else if cfg!(target_os = "macos") {
         #[cfg(target_arch = "aarch64")]
-        let names = vec!["archifiltre-macos-arm64"];
+        let names = vec!["archifiltre-aarch64-apple-darwin"];
         #[cfg(target_arch = "x86_64")]
-        let names = vec!["archifiltre-macos"];
+        let names = vec!["archifiltre-x86_64-apple-darwin"];
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        let names = vec!["archifiltre-macos"];
+        let names = vec!["archifiltre-x86_64-apple-darwin"];
         names
     } else {
-        vec!["archifiltre-linux"]
+        vec!["archifiltre-x86_64-unknown-linux-gnu"]
     };
 
     let mut sidecar_path = None;
@@ -573,17 +573,17 @@ async fn start_query_session(
 
     // Try different possible sidecar locations (simple naming convention)
     let possible_names = if cfg!(target_os = "windows") {
-        vec!["archifiltre-windows.exe"]
+        vec!["archifiltre-x86_64-pc-windows-msvc.exe"]
     } else if cfg!(target_os = "macos") {
         #[cfg(target_arch = "aarch64")]
-        let names = vec!["archifiltre-macos-arm64"];
+        let names = vec!["archifiltre-aarch64-apple-darwin"];
         #[cfg(target_arch = "x86_64")]
-        let names = vec!["archifiltre-macos"];
+        let names = vec!["archifiltre-x86_64-apple-darwin"];
         #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-        let names = vec!["archifiltre-macos"];
+        let names = vec!["archifiltre-x86_64-apple-darwin"];
         names
     } else {
-        vec!["archifiltre-linux"]
+        vec!["archifiltre-x86_64-unknown-linux-gnu"]
     };
 
     let mut sidecar_path = None;

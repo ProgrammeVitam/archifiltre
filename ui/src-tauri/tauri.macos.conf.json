@@ -1,0 +1,12 @@
+{
+	"app": {
+		"windows": [
+			{
+				"windowEffects": {
+					"effects": ["sidebar"],
+					"state": "followsWindowActiveState"
+				}
+			}
+		]
+	}
+}
