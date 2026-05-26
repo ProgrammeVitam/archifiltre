@@ -7,6 +7,7 @@
  * ⚠️  DEVELOPMENT ONLY - Not intended for production use!
  */
 
+import type { Server } from 'node:net';
 import { PGlite } from '@electric-sql/pglite';
 import { createServer, LogLevel } from 'pglite-server';
 import * as fs from 'node:fs';
@@ -22,7 +23,7 @@ export interface PGLiteServerOptions {
 
 export class PGLiteServer {
   private db: PGlite | null = null;
-  private server: unknown = null;
+  private server: Server | null = null;
   private options: Required<PGLiteServerOptions>;
 
   constructor(options: PGLiteServerOptions = {}) {
@@ -69,7 +70,7 @@ export class PGLiteServer {
 
       // Start listening
       await new Promise<void>((resolve, reject) => {
-        this.server.listen(this.options.port, (err?: Error) => {
+        this.server!.listen(this.options.port, (err?: Error) => {
           if (err) {
             reject(err);
           } else {

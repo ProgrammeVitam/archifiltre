@@ -14,6 +14,10 @@ const WASM_FILES = [
     dest: 'wasm_binaries/pglite.data',
   },
   {
+    source: 'node_modules/@electric-sql/pglite/dist/initdb.wasm',
+    dest: 'wasm_binaries/initdb.wasm',
+  },
+  {
     source: 'node_modules/libarchive-wasm/dist/libarchive.wasm',
     dest: 'wasm_binaries/libarchive.wasm',
   },

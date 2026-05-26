@@ -23,7 +23,23 @@ import { isStandalone } from './platform-paths.ts';
 
 // Import PGlite WASM files for bundled executable (embedded at build time)
 import wasmPath from '../../wasm_binaries/pglite.wasm' with { type: 'file' };
+import initdbWasmPath from '../../wasm_binaries/initdb.wasm' with { type: 'file' };
 import dataPath from '../../wasm_binaries/pglite.data' with { type: 'file' };
+
+// Cached compiled WASM modules to avoid recompilation on subsequent PGlite instances
+let _pgliteWasmModule: WebAssembly.Module | undefined;
+let _initdbWasmModule: WebAssembly.Module | undefined;
+
+async function getStandalonePGliteOptions() {
+  if (!isStandalone()) return {};
+  _pgliteWasmModule ??= await WebAssembly.compile(await file(wasmPath).arrayBuffer());
+  _initdbWasmModule ??= await WebAssembly.compile(await file(initdbWasmPath).arrayBuffer());
+  return {
+    pgliteWasmModule: _pgliteWasmModule,
+    initdbWasmModule: _initdbWasmModule,
+    fsBundle: file(dataPath),
+  };
+}
 
 // === Schema Definition ===
 
@@ -195,13 +211,7 @@ export async function createDatabase(name: string): Promise<DatabaseConnection> 
     // Initialize PGlite with explicit dataDir for standalone compatibility
     const pg = new PGlite({
       dataDir: resolvedPath,
-
-      // Provide WASM files for bundled executable
-      wasmModule: isStandalone()
-        ? await WebAssembly.compile(await file(wasmPath).arrayBuffer())
-        : undefined,
-
-      fsBundle: isStandalone() ? file(dataPath) : undefined,
+      ...(await getStandalonePGliteOptions()),
     });
 
     // Wait for PGlite to be ready
@@ -268,11 +278,7 @@ export function cleanDatabase(connection: DatabaseConnection, runId: string): Ob
 
       const newPg = new PGlite({
         dataDir: resolvedPath,
-        // Provide WASM files for bundled executable (same as createDatabase)
-        wasmModule: isStandalone()
-          ? await WebAssembly.compile(await file(wasmPath).arrayBuffer())
-          : undefined,
-        fsBundle: isStandalone() ? file(dataPath) : undefined,
+        ...(await getStandalonePGliteOptions()),
       });
       await newPg.waitReady;
       const newDb = drizzle(newPg, { schema: { files } });

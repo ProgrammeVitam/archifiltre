@@ -24,7 +24,6 @@ export interface OclifCommandContext {
   log(message?: string): void;
   warn(input: string | Error): string | Error;
   error(input: string | Error, options?: { exit?: number | false }): never;
-  debug?(...args: unknown[]): void;
 }
 
 export interface LoggingConfig {

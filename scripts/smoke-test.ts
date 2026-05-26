@@ -28,13 +28,13 @@ console.log(`🧪 ${platform} smoke test: ${dataset} → ${testDir}`);
 
 if (platform === 'linux') {
   await $`podman run --rm \
-    -v ./dist/archifiltre-linux:/usr/local/bin/archifiltre:Z \
+    -v ./dist/archifiltre-x86_64-unknown-linux-gnu:/usr/local/bin/archifiltre:Z \
     -v ${testDir}:/test-data:Z \
     registry.access.redhat.com/ubi8/ubi:latest \
     sh -c 'chmod +x /usr/local/bin/archifiltre && archifiltre scan /test-data'`;
 } else if (platform === 'windows') {
   await $`podman run --rm \
-    -v ./dist/archifiltre-windows.exe:/app/archifiltre.exe:Z \
+    -v ./dist/archifiltre-x86_64-pc-windows-msvc.exe:/app/archifiltre.exe:Z \
     -v ${testDir}:/test-data:Z \
     docker.io/scottyhardy/docker-wine \
     sh -c 'wine /app/archifiltre.exe scan /test-data'`;

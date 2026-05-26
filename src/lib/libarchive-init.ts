@@ -4,6 +4,7 @@
  */
 
 import { ArchiveReader } from 'libarchive-wasm';
+import type { LibarchiveWasm } from 'libarchive-wasm/dist/libarchiveWasm';
 import { isStandalone } from '@lib/platform-paths.ts';
 import { logger } from '@lib/logging.ts';
 
@@ -17,7 +18,7 @@ interface LibarchiveWasmOptions {
   locateFile?: (path: string) => string;
 }
 
-type LibarchiveWasmLoader = (options?: LibarchiveWasmOptions) => Promise<unknown>;
+type LibarchiveWasmLoader = (options?: LibarchiveWasmOptions) => Promise<LibarchiveWasm>;
 
 /**
  * Extracts error message from unknown error type
@@ -28,12 +29,12 @@ function getErrorMessage(error: unknown): string {
 
 // Dynamic imports to avoid bundling issues
 let libarchiveWasm: LibarchiveWasmLoader | null = null;
-let wasmModule: unknown = null;
+let wasmModule: LibarchiveWasm | null = null;
 
 /**
  * Initialize libarchive WASM module with automatic dev/standalone detection
  */
-export async function initializeLibarchiveWasm(): Promise<unknown> {
+export async function initializeLibarchiveWasm(): Promise<LibarchiveWasm> {
   if (wasmModule) {
     return wasmModule; // Return cached module
   }

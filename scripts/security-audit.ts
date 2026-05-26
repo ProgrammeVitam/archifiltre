@@ -28,6 +28,7 @@ interface Config {
   json: boolean;
   output: string | null;
   quiet: boolean;
+  verbose: boolean;
   skipTrivy: boolean;
   skipSemgrep: boolean;
   severity: string;
@@ -280,6 +281,7 @@ class SecurityAuditor {
       assumeYes: false,
       showDigests: false,
       checkOnly: false,
+      verbose: false,
     };
 
     for (let i = 0; i < args.length; i++) {

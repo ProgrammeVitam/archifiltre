@@ -133,8 +133,8 @@ class StandaloneConfig extends Config {
     Object.defineProperty(this, 'commandIDs', { value: Object.keys(COMMANDS), writable: false });
   }
 
-  async load() {
-    return this;
+  async load(): Promise<void> {
+    return;
   }
 
   async runHook<T extends keyof Interfaces.Hooks>(
@@ -144,19 +144,24 @@ class StandaloneConfig extends Config {
     return {} as Interfaces.Hooks[T]['return'];
   }
 
-  findCommand(id: string): Interfaces.Command | undefined {
+  findCommand(id: string, opts: { must: true }): Command.Loadable;
+  findCommand(id: string, opts?: { must: boolean }): Command.Loadable | undefined;
+  findCommand(id: string, opts?: { must: boolean }): Command.Loadable | undefined {
     const CommandClass = COMMANDS[id];
-    if (!CommandClass) return undefined;
+    if (!CommandClass) {
+      if (opts?.must) throw new Error(`Command ${id} not found`);
+      return undefined;
+    }
 
     return {
       id,
-      load: async () => CommandClass as any,
+      load: async () => CommandClass as unknown as Command,
       description: CommandClass.description || '',
       aliases: [],
       hidden: false,
       usage: CommandClass.usage,
       examples: CommandClass.examples || [],
-    } as Interfaces.Command;
+    } as unknown as Command.Loadable;
   }
 }
 
@@ -197,10 +202,12 @@ function showHelp(commandName?: string) {
       console.log();
     }
 
-    if (CommandClass.examples && CommandClass.examples.length > 0) {
+    const examples = (CommandClass as unknown as typeof Command).examples;
+    if (examples && examples.length > 0) {
       console.log('EXAMPLES');
-      for (const example of CommandClass.examples) {
-        const formatted = example
+      for (const example of examples) {
+        const raw = typeof example === 'string' ? example : example.command;
+        const formatted = raw
           .replace(/<%= config.bin %>/g, 'archifiltre')
           .replace(/<%= command.id %>/g, commandName);
         console.log(`  $ ${formatted}`);
@@ -299,7 +306,7 @@ async function main() {
 
     // Handle version flag
     if (isVersion && !command) {
-      const versionCmd = new Version([], config);
+      const versionCmd = new (Version as unknown as new (argv: string[], config: Config) => Command)([], config);
       await versionCmd.run();
       return;
     }
@@ -320,7 +327,7 @@ async function main() {
     }
 
     // Run the command
-    const commandInstance = new CommandClass(args, config);
+    const commandInstance = new (CommandClass as unknown as new (argv: string[], config: Config) => Command)(args, config);
     await commandInstance.run();
   } catch (error) {
     if (error && typeof error === 'object' && 'oclif' in error) {

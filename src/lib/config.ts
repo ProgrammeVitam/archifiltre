@@ -281,7 +281,7 @@ export class ConfigManager {
    */
   private applyOverrides(): void {
     if (Object.keys(this.configOverrides).length > 0) {
-      logger.debug('Applying configuration overrides', this.configOverrides);
+      logger.debug('Applying configuration overrides');
       // TODO: Implement deep merge of overrides
       // this.config = deepMerge(this.config, this.configOverrides);
     }
@@ -351,13 +351,13 @@ export class ConfigManager {
 
       if (typeof value === 'object' && !Array.isArray(value)) {
         // Deep merge nested objects
-        result[configKey] = {
+        (result as Record<string, unknown>)[configKey] = {
           ...(result[configKey] as object),
           ...value,
-        } as (typeof result)[typeof configKey];
+        };
       } else {
         // Direct assignment for primitives
-        result[configKey] = value as (typeof result)[typeof configKey];
+        (result as Record<string, unknown>)[configKey] = value;
       }
     }
 

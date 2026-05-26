@@ -18,11 +18,10 @@
     "noEmit": true,
     "declaration": false,
     "types": ["vitest/globals", "bun-types"],
-    "baseUrl": ".",
     "paths": {
-      "@commands/*": ["src/commands/*"],
-      "@lib/*": ["src/lib/*"],
-      "@extensions/*": ["src/extensions/*"]
+      "@commands/*": ["./src/commands/*"],
+      "@lib/*": ["./src/lib/*"],
+      "@extensions/*": ["./src/extensions/*"]
     }
   },
   "include": ["src/**/*", "test/**/*", "scripts/**/*"],
