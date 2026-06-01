@@ -15,16 +15,16 @@
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import ArchifiltreLogo from '$lib/components/ArchifiltreLogo.svelte';
 	import {
-		Loader2 as Loader2Icon,
-		CheckCircle2 as CheckCircle2Icon,
-		AlertCircle as AlertCircleIcon,
-		PanelLeft as PanelLeftIcon,
-		LayoutGrid as LayoutGridIcon,
-		FolderTree as FolderTreeIcon,
-		List as ListIcon,
-		Download as DownloadIcon
+		LoaderCircleIcon,
+		CircleCheckIcon,
+		CircleAlertIcon,
+		PanelLeftIcon,
+		LayoutGridIcon,
+		FolderTreeIcon,
+		ListIcon
 	} from '@lucide/svelte';
-	import { exportCsv, selectExportPath } from '$lib/tauri';
+	import ExportDropdown from '$lib/components/ExportDropdown.svelte';
+	import BackgroundJobsPanel from '$lib/components/BackgroundJobsPanel.svelte';
 
 	let { children } = $props();
 
@@ -99,32 +99,6 @@
 
 	function setViewMode(mode: ViewMode) {
 		viewMode.set(mode);
-	}
-
-	async function handleExport(): Promise<void> {
-		const scan = $activeScan;
-		if (!scan) return;
-
-		try {
-			// Open save dialog
-			const outputPath = await selectExportPath();
-			if (!outputPath) return; // User cancelled
-
-			// Export to CSV
-			const result = await exportCsv({
-				outputPath,
-				dbName: scan.dbName,
-				fullPaths: true
-			});
-
-			if (result.success) {
-				console.log('Export successful:', outputPath);
-			} else {
-				console.error('Export failed:', result.error);
-			}
-		} catch (error) {
-			console.error('Export error:', error);
-		}
 	}
 
 	onMount(() => {
@@ -299,11 +273,11 @@
 							</span>
 							{#if $activeScan?.path}
 								{#if $activeScan.state === 'scanning'}
-									<Loader2Icon size={14} class="animate-spin text-blue-500" />
+									<LoaderCircleIcon size={14} class="animate-spin text-blue-500" />
 								{:else if $activeScan.state === 'complete'}
-									<CheckCircle2Icon size={14} class="text-green-500" />
+									<CircleCheckIcon size={14} class="text-green-500" />
 								{:else if $activeScan.state === 'error'}
-									<AlertCircleIcon size={14} class="text-red-500" />
+									<CircleAlertIcon size={14} class="text-red-500" />
 								{/if}
 								<span class="sidebar-toggle-scan-name">{$activeScan.name}</span>
 							{/if}
@@ -346,18 +320,9 @@
 					<!-- Spacer to push export and controls to the right -->
 					<div class="titlebar-spacer"></div>
 
-					<!-- Export button - only shown when scan complete -->
+					<!-- Export dropdown - only shown when scan complete -->
 					{#if showViewControls}
-						<Button
-							variant="ghost"
-							size="sm"
-							class="titlebar-export-btn"
-							onclick={handleExport}
-							data-no-drag
-						>
-							<DownloadIcon size={14} />
-							<span>Export</span>
-						</Button>
+						<ExportDropdown />
 					{/if}
 
 					<!-- Windows/GNOME: controls on right -->
@@ -392,6 +357,9 @@
 		</div>
 	</div>
 </div>
+
+<!-- Fixed background jobs panel (bottom-right, only when scan is complete) -->
+<BackgroundJobsPanel />
 
 <style>
 	.app-layout {
