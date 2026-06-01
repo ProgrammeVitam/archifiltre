@@ -604,7 +604,7 @@ export function scanDirectory(
 
     // Phase 5: Hash calculation for files with duplicate content_size
     switchMap(() =>
-      performHashing(connection, config.runId, config.rootPath, (processed, total, errors) => {
+      performHashing({ database: connection, runId: config.runId, rootPath: config.rootPath }, (processed, total, errors) => {
         if (processed % 100 === 0 || processed === total) {
           const percentage = total > 0 ? ((processed / total) * 100).toFixed(1) : '0.0';
           const status = `hashed ${processed.toLocaleString()}/${total.toLocaleString()} files (${percentage}%)`;

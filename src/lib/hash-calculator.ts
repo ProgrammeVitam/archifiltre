@@ -33,15 +33,19 @@ import {
 import { logger } from '@lib/logging.ts';
 import type { DatabaseConnection } from '@lib/database.ts';
 import { findDuplicateSizes, files } from '@lib/database.ts';
+import type { PipelineContext } from '@lib/pipeline-context.ts';
 import { eq, and, count, isNull, inArray, sql } from 'drizzle-orm';
 
 import { readFileContent, type FileEntry } from '@lib/file-reader.ts';
+import { pausable } from '@lib/pausable.ts';
 
 // Hash calculation configuration
 export interface HashConfig {
   concurrency?: number;
   batchSize?: number;
   onProgress?: (processed: number, total: number, errors: number) => void;
+  pauseSignal?: import('rxjs').Subject<void>;
+  resumeSignal?: import('rxjs').Subject<void>;
 }
 
 // Hash calculation statistics
@@ -69,7 +73,7 @@ export interface FileHashEntry {
 /**
  * Default hashing configuration
  */
-export const DEFAULT_HASH_CONFIG: Required<Omit<HashConfig, 'onProgress'>> = {
+export const DEFAULT_HASH_CONFIG: Required<Omit<HashConfig, 'onProgress' | 'pauseSignal' | 'resumeSignal'>> = {
   concurrency: Math.max(2, (os.cpus()?.length ?? 4) - 1),
   batchSize: 100, // Small batches to keep memory bounded
 };
@@ -381,6 +385,7 @@ export function calculateHashes(
           let currentOffset = 0;
 
           return range(0, Math.ceil(totalFiles / finalConfig.batchSize)).pipe(
+            pausable({ pauseSignal: finalConfig.pauseSignal, resumeSignal: finalConfig.resumeSignal }),
             concatMap(() => {
               const offset = currentOffset;
               currentOffset += finalConfig.batchSize;
@@ -453,13 +458,21 @@ export function calculateHashes(
  * Convenience function for hash calculation with progress reporting
  */
 export function performHashing(
-  connection: DatabaseConnection,
-  runId: string,
-  rootPath: string,
+  context: PipelineContext,
   progressCallback?: (processed: number, total: number, errors: number) => void
 ): Observable<void> {
+  const { database: connection, runId, rootPath, onProgress, pauseSignal, resumeSignal } = context;
+  const combined =
+    progressCallback || onProgress
+      ? (processed: number, total: number, errors: number) => {
+          progressCallback?.(processed, total, errors);
+          onProgress?.('hashing', processed, total);
+        }
+      : undefined;
   return calculateHashes(connection, runId, rootPath, {
-    onProgress: progressCallback,
+    onProgress: combined,
+    pauseSignal,
+    resumeSignal,
   });
 }
 
