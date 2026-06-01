@@ -5,7 +5,7 @@ export default defineConfig({
   test: {
     globals: true,
     environment: 'node',
-    include: ['test/**/*.test.ts'],
+    include: ['test/**/*.test.ts', 'src/**/*.test.ts'],
     exclude: ['**/node_modules/**', '**/dist/**'],
     reporters: ['verbose'],
     testTimeout: 10000,
@@ -29,11 +29,9 @@ export default defineConfig({
   },
   resolve: {
     alias: {
-      '@cli': resolve(__dirname, './src/cli'),
-      '@api': resolve(__dirname, './src/api'),
-      '@core': resolve(__dirname, './src/core'),
-      '@infra': resolve(__dirname, './src/infra'),
-      '@shared': resolve(__dirname, './src/shared'),
+      '@commands': resolve(__dirname, './src/commands'),
+      '@lib': resolve(__dirname, './src/lib'),
+      '@extensions': resolve(__dirname, './src/extensions'),
     },
   },
   esbuild: {
