@@ -9,6 +9,7 @@
  */
 
 import type { DatabaseConnection } from '@lib/database.ts';
+import { fileThumbnails } from '@extensions/file-thumbnails/schema.ts';
 
 // Re-export schema types for consumers
 export type { FileThumbnailRow, FileThumbnailSelect } from '@extensions/file-thumbnails/schema.ts';
@@ -118,3 +119,11 @@ export async function handleStoreThumbnail(
 
   return { stored: true };
 }
+
+export const MANIFEST = {
+  id: 'file-thumbnails',
+  name: 'File Thumbnails',
+  description: 'Stores browser-generated thumbnails for files',
+  version: '1.0.0',
+  schema: [fileThumbnails],
+};

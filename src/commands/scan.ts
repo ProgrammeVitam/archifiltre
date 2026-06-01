@@ -6,17 +6,19 @@
  * Uses oclif UI patterns for clean, professional output.
  */
 
-import { Command, Args, Flags, ux } from '@oclif/core';
+import { Args, Flags, ux } from '@oclif/core';
 import path from 'node:path';
-import { setupOclifContext, logger } from '@lib/logging.ts';
+import { lastValueFrom } from 'rxjs';
+import { logger } from '@lib/logging.ts';
 import { formatDuration } from '@lib/helpers.ts';
 import {
   createScanDatabase,
-  closeScanDatabase,
   insertScanMetadata,
   updateScanMetadata,
   type DatabaseConnection,
 } from '@lib/database.ts';
+import { BaseCommand } from '@lib/base-command.ts';
+import type { JobContext } from '@lib/job-context.ts';
 import { summary } from '@extensions/summary.ts';
 import {
   scanDirectory,
@@ -27,7 +29,7 @@ import {
   type ScanProgressEvent,
 } from '@lib/scanner.ts';
 
-export default class Scan extends Command {
+export default class Scan extends BaseCommand {
   static override description = 'Scan directory tree and detect duplicates';
 
   static override examples = [
@@ -38,6 +40,7 @@ export default class Scan extends Command {
   ];
 
   static override flags = {
+    ...BaseCommand.baseFlags,
     'include-hidden': Flags.boolean({
       description: 'Include hidden files and directories',
       default: false,
@@ -104,138 +107,103 @@ export default class Scan extends Command {
     }),
   };
 
-  async run(): Promise<void> {
+  // Set by openDatabase() so jobLabel can reference it
+  private _rootPath = '';
+
+  get jobType() { return 'scan'; }
+  get jobLabel() { return `Scan ${this._rootPath || '...'}`; }
+  get phases() { return ['discovery', 'prefilter', 'hashing', 'duplicate-detection']; }
+
+  async openDatabase(): Promise<{ db: DatabaseConnection; runId: string; rootPath: string }> {
     const { args, flags } = await this.parse(Scan);
-    const directory = args.directory as string;
 
-    const cleanupLogging = setupOclifContext(this);
-    let database: DatabaseConnection | undefined;
-
-    // Cast config to access custom originalCwd property from StandaloneConfig
-    // Falls back to process.cwd() if not available (e.g., during development or if StandaloneConfig fails)
     const config = this.config as typeof this.config & { originalCwd?: string };
     const originalCwd = config.originalCwd || process.cwd();
+    const resolvedDirectory = path.resolve(originalCwd, args.directory as string);
 
-    try {
-      // Resolve directory relative to where the user ran the command
-      const resolvedDirectory = path.resolve(originalCwd, directory);
-
-      // Validate scan target
-      const pathValidation = await validateScanPath(resolvedDirectory);
-      if (!pathValidation.valid) {
-        this.error(`Invalid scan target: ${pathValidation.error}`, { exit: 1 });
-      }
-
-      const rootPath = pathValidation.resolvedPath!;
-      const runId = flags['run-id'] || generateRunId();
-      const startedAt = Math.floor(Date.now() / 1000);
-
-      logger.info('Scan started', {
-        runId,
-        directory: rootPath,
-        db: flags.db,
-        includeHidden: flags['include-hidden'],
-        archivesEnabled: !flags['disable-archives'],
-      });
-
-      // Create database connection
-      database = await createScanDatabase(flags.db);
-
-      // Configure scanner
-      const scanConfig: ScanConfig = {
-        rootPath,
-        runId,
-        includeHidden: flags['include-hidden'],
-        batchSize: flags['batch-size'],
-        enableArchiveProcessing: !flags['disable-archives'],
-        maxArchiveDepth: flags['max-archive-depth'],
-        maxArchiveSize: flags['max-archive-size'] * 1024 * 1024, // Convert MB to bytes
-        archiveTimeoutMs: flags['archive-timeout'] * 1000, // Convert seconds to milliseconds
-        enableArchiveNesting: !flags['disable-archive-nesting'],
-      };
-
-      // Start scanning with clean oclif action
-      const startTime = Date.now();
-      let lastProgress: ScanResult = {
-        phase: 'complete',
-        filesDiscovered: 0,
-        filesIngested: 0,
-        duplicateGroups: 0,
-      };
-
-      const isTTY = process.stdout.isTTY;
-
-      if (isTTY) {
-        ux.action.start(`Scanning ${rootPath}`);
-      }
-
-      await new Promise<void>((resolve, reject) => {
-        const result$ = scanDirectory(database!, scanConfig, (event: ScanProgressEvent) => {
-          logger.debug('Progress callback received', { status: event.status, phase: event.phase });
-          if (isTTY) {
-            ux.action.status = event.status;
-          } else {
-            // eslint-disable-next-line no-console
-            process.stdout.write(`${JSON.stringify(event)}\n`);
-          }
-        });
-
-        result$.subscribe({
-          next: (result: ScanResult) => {
-            lastProgress = result;
-          },
-          complete: () => {
-            const duration = Date.now() - startTime;
-            const durationStr = formatDuration(duration);
-
-            if (isTTY) {
-              ux.action.stop(
-                `${lastProgress.filesIngested.toLocaleString()} files, ${lastProgress.duplicateGroups.toLocaleString()} duplicate groups (${durationStr})`
-              );
-            }
-            resolve();
-          },
-          error: error => {
-            if (isTTY) {
-              ux.action.stop('failed');
-            }
-            reject(error);
-          },
-        });
-      });
-
-      // Store scan metadata (after scan completes, since scanner cleans the database)
-      await insertScanMetadata(database!, runId, rootPath, startedAt).toPromise();
-      await updateScanMetadata(database!, runId, lastProgress.filesIngested).toPromise();
-
-      // Display summary results
-      await summary(database!, runId, this);
-
-      const finalDuration = Date.now() - startTime;
-      logger.info('Scan completed', {
-        runId,
-        rootPath,
-        durationMs: finalDuration,
-        filesDiscovered: lastProgress.filesDiscovered,
-        filesIngested: lastProgress.filesIngested,
-        duplicateGroups: lastProgress.duplicateGroups,
-      });
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-
-      logger.error('Scan command failed', error instanceof Error ? error : undefined, {
-        directory,
-        runId: flags['run-id'],
-        db: flags.db,
-      });
-
-      this.error(`Scan failed: ${errorMessage}`, { exit: 1 });
-    } finally {
-      // Cleanup
-      if (database) {
-        await closeScanDatabase(database);
-      }
-      cleanupLogging();
+    const pathValidation = await validateScanPath(resolvedDirectory);
+    if (!pathValidation.valid) {
+      this.error(`Invalid scan target: ${pathValidation.error}`, { exit: 1 });
     }
+
+    const rootPath = pathValidation.resolvedPath!;
+    const runId = flags['run-id'] || generateRunId();
+
+    this._rootPath = rootPath;
+
+    logger.info('Scan started', {
+      runId,
+      directory: rootPath,
+      db: flags.db,
+      includeHidden: flags['include-hidden'],
+      archivesEnabled: !flags['disable-archives'],
+    });
+
+    const db = await createScanDatabase(flags.db);
+    return { db, runId, rootPath };
+  }
+
+  async runJob(context: JobContext): Promise<void> {
+    const { flags } = await this.parse(Scan);
+
+    const scanConfig: ScanConfig = {
+      rootPath: context.rootPath,
+      runId: context.runId,
+      includeHidden: flags['include-hidden'],
+      batchSize: flags['batch-size'],
+      enableArchiveProcessing: !flags['disable-archives'],
+      maxArchiveDepth: flags['max-archive-depth'],
+      maxArchiveSize: flags['max-archive-size'] * 1024 * 1024,
+      archiveTimeoutMs: flags['archive-timeout'] * 1000,
+      enableArchiveNesting: !flags['disable-archive-nesting'],
+    };
+
+    const startTime = Date.now();
+    const startedAt = Math.floor(startTime / 1000);
+    let lastProgress: ScanResult = {
+      phase: 'complete',
+      filesDiscovered: 0,
+      filesIngested: 0,
+      duplicateGroups: 0,
+    };
+
+    const isTTY = process.stdout.isTTY;
+
+    if (isTTY) {
+      ux.action.start(`Scanning ${context.rootPath}`);
+    }
+
+    lastProgress = await lastValueFrom(
+      scanDirectory(context.database, scanConfig, (event: ScanProgressEvent) => {
+        context.onProgress?.(event.phase, event.filesDiscovered, null, event.status);
+        if (isTTY) {
+          ux.action.status = event.status;
+        } else if (!context.onProgress) {
+          process.stdout.write(`${JSON.stringify(event)}\n`);
+        }
+      })
+    );
+
+    const duration = Date.now() - startTime;
+
+    if (isTTY) {
+      ux.action.stop(
+        `${lastProgress.filesIngested.toLocaleString()} files, ${lastProgress.duplicateGroups.toLocaleString()} duplicate groups (${formatDuration(duration)})`
+      );
+    }
+
+    await insertScanMetadata(context.database, context.runId, context.rootPath, startedAt).toPromise();
+    await updateScanMetadata(context.database, context.runId, lastProgress.filesIngested).toPromise();
+
+    await summary(context.database, context.runId, this);
+
+    logger.info('Scan completed', {
+      runId: context.runId,
+      rootPath: context.rootPath,
+      durationMs: duration,
+      filesDiscovered: lastProgress.filesDiscovered,
+      filesIngested: lastProgress.filesIngested,
+      duplicateGroups: lastProgress.duplicateGroups,
+    });
   }
 }

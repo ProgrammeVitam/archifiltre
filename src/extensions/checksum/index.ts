@@ -22,7 +22,9 @@
  * Uses RxJS streaming to handle large datasets efficiently.
  */
 
-import { Command, Flags, ux } from '@oclif/core';
+import { Flags, ux } from '@oclif/core';
+import { BaseCommand } from '@lib/base-command.ts';
+import type { JobContext } from '@lib/job-context.ts';
 import { createHash } from 'node:crypto';
 import type { Readable } from 'node:stream';
 import { Observable, defer, from, EMPTY, of, concat } from 'rxjs';
@@ -37,17 +39,18 @@ import {
   switchMap,
 } from 'rxjs/operators';
 import { eq, and, gt, sql, isNull, isNotNull } from 'drizzle-orm';
-import { setupOclifContext, logger } from '@lib/logging.ts';
+import { logger } from '@lib/logging.ts';
 import {
   createScanDatabase,
-  closeScanDatabase,
   getLatestRunId,
   getScanMetadata,
   files,
   type DatabaseConnection,
 } from '@lib/database.ts';
 import { createFileContentStream, type FileEntry } from '@lib/file-reader.ts';
-import { SUPPORTED_ALGORITHMS, type ChecksumAlgorithm } from './schema.ts';
+import type { PipelineContext } from '@lib/pipeline-context.ts';
+import { pausable } from '@lib/pausable.ts';
+import { fileChecksums, SUPPORTED_ALGORITHMS, type ChecksumAlgorithm } from './schema.ts';
 
 // Re-export schema for other extensions to use
 export { fileChecksums, SUPPORTED_ALGORITHMS, type ChecksumAlgorithm } from './schema.ts';
@@ -491,6 +494,81 @@ function copyExistingXxHash64(
   });
 }
 
+// === Batch Processing Core ===
+
+/**
+ * Carries the file to read and the set of paths to write the checksum to.
+ * - Regular/unique files:  writePaths = [entry.path]           (1 write per read)
+ * - Duplicate groups:      writePaths = all paths in the group (1 read, N writes)
+ */
+interface ChecksumBatchItem {
+  entry: FileEntry;
+  writePaths: string[];
+}
+
+/**
+ * Core streaming loop shared by all pipeline variants.
+ *
+ * source       — Observable<ChecksumBatchItem[]>: emits arrays (batches).
+ *                Batches are processed sequentially (concatMap); items within a batch
+ *                are processed concurrently up to `concurrency`.
+ * writePaths   — 1 for single files, N for duplicate groups. On error the whole item is
+ *                skipped (EMPTY) and writePaths.length is added to the error count.
+ */
+function processBatches(
+  source: Observable<ChecksumBatchItem[]>,
+  options: {
+    rootPath: string;
+    database: DatabaseConnection;
+    runId: string;
+    algorithm: ChecksumAlgorithm;
+    concurrency: number;
+    onProgress: (processed: number, errors: number) => void;
+    pauseSignal?: import('rxjs').Subject<void>;
+    resumeSignal?: import('rxjs').Subject<void>;
+  }
+): Observable<{ processed: number; errors: number }> {
+  const { rootPath, database, runId, algorithm, concurrency, onProgress, pauseSignal, resumeSignal } = options;
+  let totalProcessed = 0;
+  let totalErrors = 0;
+
+  return source.pipe(
+    pausable({ pauseSignal, resumeSignal }),
+    concatMap(batch =>
+      from(batch).pipe(
+        mergeMap(
+          item =>
+            computeFileChecksum(rootPath, item.entry, algorithm).pipe(
+              switchMap(checksum =>
+                from(item.writePaths.map(path => ({ path, checksum })))
+              ),
+              catchError(error => {
+                logger.debug('Failed to compute checksum', {
+                  path: item.entry.path,
+                  archiveParentPath: item.entry.archiveParentPath,
+                  error: String(error),
+                });
+                totalErrors += item.writePaths.length;
+                onProgress(totalProcessed, totalErrors);
+                return EMPTY;
+              })
+            ),
+          concurrency
+        ),
+        toArray(),
+        concatMap(checksums => upsertChecksumBatch(database, runId, algorithm, checksums)),
+        tap(count => {
+          totalProcessed += count;
+          onProgress(totalProcessed, totalErrors);
+        })
+      )
+    ),
+    toArray(),
+    map(() => ({ processed: totalProcessed, errors: totalErrors })),
+    defaultIfEmpty({ processed: 0, errors: 0 })
+  );
+}
+
 /**
  * Calculate xxHash64 for files that don't have it (unique content_size files)
  * Supports both regular filesystem files and archive entries
@@ -499,51 +577,19 @@ function calculateMissingXxHash64(
   database: DatabaseConnection,
   runId: string,
   rootPath: string,
-  options: { batchSize: number; concurrency: number },
+  options: { batchSize: number; concurrency: number; pauseSignal?: import('rxjs').Subject<void>; resumeSignal?: import('rxjs').Subject<void> },
   onProgress: (processed: number, errors: number) => void
 ): Observable<{ processed: number; errors: number }> {
-  const { batchSize, concurrency } = options;
-
-  let totalProcessed = 0;
-  let totalErrors = 0;
-
-  // Get files without hash (unique content_size, includes archive entries)
-  return getUniqueFiles(database, runId, batchSize).pipe(
-    concatMap(batch => {
-      return from(batch).pipe(
-        mergeMap(file => {
-          // Use shared file-reader for archive-aware access
-          const entry: FileEntry = {
-            path: file.path,
-            archiveParentPath: file.archiveParentPath,
-            archiveFormat: file.archiveFormat,
-          };
-
-          return computeFileChecksum(rootPath, entry, 'xxhash64').pipe(
-            map(checksum => ({ path: file.path, checksum })),
-            catchError(error => {
-              logger.debug('Skipping file for xxHash64 due to error', {
-                path: file.path,
-                archiveParentPath: file.archiveParentPath,
-                error: String(error),
-              });
-              totalErrors++;
-              onProgress(totalProcessed, totalErrors);
-              return EMPTY;
-            })
-          );
-        }, concurrency),
-        toArray(),
-        concatMap(checksums => upsertChecksumBatch(database, runId, 'xxhash64', checksums)),
-        tap(count => {
-          totalProcessed += count;
-          onProgress(totalProcessed, totalErrors);
-        })
-      );
-    }),
-    toArray(),
-    map(() => ({ processed: totalProcessed, errors: totalErrors })),
-    defaultIfEmpty({ processed: 0, errors: 0 })
+  return processBatches(
+    getUniqueFiles(database, runId, options.batchSize).pipe(
+      map(batch =>
+        batch.map(file => ({
+          entry: { path: file.path, archiveParentPath: file.archiveParentPath, archiveFormat: file.archiveFormat },
+          writePaths: [file.path],
+        }))
+      )
+    ),
+    { rootPath, database, runId, algorithm: 'xxhash64', concurrency: options.concurrency, onProgress, pauseSignal: options.pauseSignal, resumeSignal: options.resumeSignal }
   );
 }
 
@@ -556,8 +602,9 @@ function computeXxHash64Optimized(
   database: DatabaseConnection,
   runId: string,
   rootPath: string,
-  options: { batchSize: number; concurrency: number },
-  progress: ChecksumProgress
+  options: { batchSize: number; concurrency: number; pauseSignal?: import('rxjs').Subject<void>; resumeSignal?: import('rxjs').Subject<void> },
+  progress: ChecksumProgress,
+  onProgress?: (processed: number, total: number | null) => void
 ): Observable<ChecksumProgress> {
   return defer(() => {
     logger.debug('Using optimized xxHash64 processing');
@@ -565,12 +612,14 @@ function computeXxHash64Optimized(
     // First, copy existing hashes
     return copyExistingXxHash64(database, runId, copied => {
       progress.processed = copied;
+      onProgress?.(progress.processed, progress.total);
     }).pipe(
       switchMap(copiedCount => {
         // Then calculate for files without hash
-        return calculateMissingXxHash64(database, runId, rootPath, options, (processed, errors) => {
+        return calculateMissingXxHash64(database, runId, rootPath, { batchSize: options.batchSize, concurrency: options.concurrency, pauseSignal: options.pauseSignal, resumeSignal: options.resumeSignal }, (processed, errors) => {
           progress.processed = copiedCount + processed;
           progress.filesSkipped = errors;
+          onProgress?.(progress.processed, progress.total);
         });
       }),
       map(result => {
@@ -591,7 +640,8 @@ export interface ChecksumOptions {
 }
 
 /**
- * Process duplicate groups - calculate checksum once per group, propagate to all files
+ * Process duplicate groups — compute checksum once per group, propagate to all member paths.
+ * All groups are treated as a single batch; within the batch, concurrency limits parallel reads.
  */
 function processDuplicateGroups(
   database: DatabaseConnection,
@@ -600,166 +650,67 @@ function processDuplicateGroups(
   groups: DuplicateGroup[],
   algorithm: ChecksumAlgorithm,
   concurrency: number,
-  onProgress: (processed: number, errors: number) => void
+  onProgress: (processed: number, errors: number) => void,
+  pauseSignal?: import('rxjs').Subject<void>,
+  resumeSignal?: import('rxjs').Subject<void>
 ): Observable<{ processed: number; errors: number }> {
   if (groups.length === 0) {
     return of({ processed: 0, errors: 0 });
   }
-
-  let totalProcessed = 0;
-  let totalErrors = 0;
-
-  return from(groups).pipe(
-    // Process groups with concurrency limit
-    mergeMap(group => {
-      // Use shared file-reader for archive-aware access
-      const entry: FileEntry = {
-        path: group.representativePath,
-        archiveParentPath: group.representativeArchiveParentPath,
-        archiveFormat: group.representativeArchiveFormat,
-      };
-
-      return computeFileChecksum(rootPath, entry, algorithm).pipe(
-        // On success, create checksum entries for ALL files in the group
-        switchMap(checksum => {
-          const checksumEntries = group.paths.map(p => ({ path: p, checksum }));
-          return upsertChecksumBatch(database, runId, algorithm, checksumEntries).pipe(
-            map(count => {
-              totalProcessed += count;
-              onProgress(totalProcessed, totalErrors);
-              return { processed: count, errors: 0 };
-            })
-          );
-        }),
-        catchError(error => {
-          logger.debug('Failed to checksum duplicate group', {
-            representativePath: group.representativePath,
-            archiveParentPath: group.representativeArchiveParentPath,
-            groupSize: group.paths.length,
-            error: String(error),
-          });
-          totalErrors += group.paths.length;
-          onProgress(totalProcessed, totalErrors);
-          return of({ processed: 0, errors: group.paths.length });
-        })
-      );
-    }, concurrency),
-    // Collect final results
-    toArray(),
-    map(results => ({
-      processed: results.reduce((sum, r) => sum + r.processed, 0),
-      errors: results.reduce((sum, r) => sum + r.errors, 0),
-    }))
+  return processBatches(
+    of(
+      groups.map(group => ({
+        entry: {
+          path: group.representativePath,
+          archiveParentPath: group.representativeArchiveParentPath,
+          archiveFormat: group.representativeArchiveFormat,
+        },
+        writePaths: group.paths,
+      }))
+    ),
+    { rootPath, database, runId, algorithm, concurrency, onProgress, pauseSignal, resumeSignal }
   );
 }
 
-/**
- * Process unique files - calculate checksum individually for each file
- * Supports both regular filesystem files and archive entries
- */
+/** Process unique files — compute checksum individually for each file (no group optimization). */
 function processUniqueFiles(
   database: DatabaseConnection,
   runId: string,
   rootPath: string,
-  options: { algorithm: ChecksumAlgorithm; batchSize: number; concurrency: number },
+  options: { algorithm: ChecksumAlgorithm; batchSize: number; concurrency: number; pauseSignal?: import('rxjs').Subject<void>; resumeSignal?: import('rxjs').Subject<void> },
   onProgress: (processed: number, errors: number) => void
 ): Observable<{ processed: number; errors: number }> {
-  const { algorithm, batchSize, concurrency } = options;
-
-  let totalProcessed = 0;
-  let totalErrors = 0;
-
-  return getUniqueFiles(database, runId, batchSize).pipe(
-    concatMap(batch => {
-      return from(batch).pipe(
-        mergeMap(file => {
-          // Use shared file-reader for archive-aware access
-          const entry: FileEntry = {
-            path: file.path,
-            archiveParentPath: file.archiveParentPath,
-            archiveFormat: file.archiveFormat,
-          };
-
-          return computeFileChecksum(rootPath, entry, algorithm).pipe(
-            map(checksum => ({ path: file.path, checksum })),
-            catchError(error => {
-              logger.debug('Skipping unique file due to error', {
-                path: file.path,
-                archiveParentPath: file.archiveParentPath,
-                error: String(error),
-              });
-              totalErrors++;
-              onProgress(totalProcessed, totalErrors);
-              return EMPTY;
-            })
-          );
-        }, concurrency),
-        toArray(),
-        concatMap(checksums => upsertChecksumBatch(database, runId, algorithm, checksums)),
-        tap(count => {
-          totalProcessed += count;
-          onProgress(totalProcessed, totalErrors);
-        })
-      );
-    }),
-    toArray(),
-    map(() => ({ processed: totalProcessed, errors: totalErrors })),
-    defaultIfEmpty({ processed: 0, errors: 0 })
+  return processBatches(
+    getUniqueFiles(database, runId, options.batchSize).pipe(
+      map(batch =>
+        batch.map(file => ({
+          entry: { path: file.path, archiveParentPath: file.archiveParentPath, archiveFormat: file.archiveFormat },
+          writePaths: [file.path],
+        }))
+      )
+    ),
+    { rootPath, database, runId, algorithm: options.algorithm, concurrency: options.concurrency, onProgress, pauseSignal: options.pauseSignal, resumeSignal: options.resumeSignal }
   );
 }
 
-/**
- * Process ALL files without optimization (--each-file mode)
- * Supports both regular filesystem files and archive entries
- */
+/** Process ALL files without any optimization (--each-file mode). */
 function processAllFiles(
   database: DatabaseConnection,
   runId: string,
   rootPath: string,
-  options: { algorithm: ChecksumAlgorithm; batchSize: number; concurrency: number },
+  options: { algorithm: ChecksumAlgorithm; batchSize: number; concurrency: number; pauseSignal?: import('rxjs').Subject<void>; resumeSignal?: import('rxjs').Subject<void> },
   onProgress: (processed: number, errors: number) => void
 ): Observable<{ processed: number; errors: number }> {
-  const { algorithm, batchSize, concurrency } = options;
-
-  let totalProcessed = 0;
-  let totalErrors = 0;
-
-  return getAllFiles(database, runId, batchSize).pipe(
-    concatMap(batch => {
-      return from(batch).pipe(
-        mergeMap(file => {
-          // Use shared file-reader for archive-aware access
-          const entry: FileEntry = {
-            path: file.path,
-            archiveParentPath: file.archiveParentPath,
-            archiveFormat: file.archiveFormat,
-          };
-
-          return computeFileChecksum(rootPath, entry, algorithm).pipe(
-            map(checksum => ({ path: file.path, checksum })),
-            catchError(error => {
-              logger.debug('Skipping file due to error', {
-                path: file.path,
-                archiveParentPath: file.archiveParentPath,
-                error: String(error),
-              });
-              totalErrors++;
-              onProgress(totalProcessed, totalErrors);
-              return EMPTY;
-            })
-          );
-        }, concurrency),
-        toArray(),
-        concatMap(checksums => upsertChecksumBatch(database, runId, algorithm, checksums)),
-        tap(count => {
-          totalProcessed += count;
-          onProgress(totalProcessed, totalErrors);
-        })
-      );
-    }),
-    toArray(),
-    map(() => ({ processed: totalProcessed, errors: totalErrors })),
-    defaultIfEmpty({ processed: 0, errors: 0 })
+  return processBatches(
+    getAllFiles(database, runId, options.batchSize).pipe(
+      map(batch =>
+        batch.map(file => ({
+          entry: { path: file.path, archiveParentPath: file.archiveParentPath, archiveFormat: file.archiveFormat },
+          writePaths: [file.path],
+        }))
+      )
+    ),
+    { rootPath, database, runId, algorithm: options.algorithm, concurrency: options.concurrency, onProgress, pauseSignal: options.pauseSignal, resumeSignal: options.resumeSignal }
   );
 }
 
@@ -775,11 +726,10 @@ function processAllFiles(
  * @returns Observable that emits progress updates and completes with total count
  */
 export function computeChecksums(
-  database: DatabaseConnection,
-  runId: string,
-  rootPath: string,
+  context: PipelineContext,
   options: ChecksumOptions
 ): Observable<ChecksumProgress> {
+  const { database, runId, rootPath, onProgress: ctxProgress, pauseSignal, resumeSignal } = context;
   const { algorithm, batchSize = 5000, concurrency = 4, eachFile = false } = options;
 
   return defer(() => {
@@ -819,10 +769,11 @@ export function computeChecksums(
             database,
             runId,
             rootPath,
-            { algorithm, batchSize, concurrency },
+            { algorithm, batchSize, concurrency, pauseSignal, resumeSignal },
             (processed, errors) => {
               progress.processed = processed;
               progress.filesSkipped = errors;
+              ctxProgress?.('checksum', progress.processed, progress.total);
             }
           );
         }),
@@ -870,8 +821,9 @@ export function computeChecksums(
             database,
             runId,
             rootPath,
-            { batchSize, concurrency },
-            progress
+            { batchSize, concurrency, pauseSignal, resumeSignal },
+            progress,
+            (processed, total) => ctxProgress?.('checksum', processed, total)
           );
         }),
         catchError(error => {
@@ -924,7 +876,10 @@ export function computeChecksums(
               (processed, errors) => {
                 progress.processed = processed;
                 progress.filesSkipped = errors;
-              }
+                ctxProgress?.('checksum', progress.processed, progress.total);
+              },
+              pauseSignal,
+              resumeSignal
             ).pipe(
               // Then process unique files
               switchMap(groupResults => {
@@ -934,10 +889,11 @@ export function computeChecksums(
                   database,
                   runId,
                   rootPath,
-                  { algorithm, batchSize, concurrency },
+                  { algorithm, batchSize, concurrency, pauseSignal, resumeSignal },
                   (processed, errors) => {
                     progress.processed = groupProcessed + processed;
                     progress.filesSkipped = groupResults.errors + errors;
+                    ctxProgress?.('checksum', progress.processed, progress.total);
                   }
                 );
               })
@@ -1011,183 +967,162 @@ async function getChecksumStats(
 
 // === Command Declaration ===
 
-/**
- * Checksum command - auto-registered via extension registry
- */
-export const COMMAND = {
-  name: 'checksum',
-  command: class Checksum extends Command {
-    static override description = 'Compute cryptographic checksums for scanned files';
+class ChecksumCommand extends BaseCommand {
+  static override description = 'Compute cryptographic checksums for scanned files';
 
-    static override examples = [
-      '<%= config.bin %> <%= command.id %>',
-      '<%= config.bin %> <%= command.id %> --algorithm xxhash64',
-      '<%= config.bin %> <%= command.id %> --algorithm md5',
-      '<%= config.bin %> <%= command.id %> --algorithm sha256',
-      '<%= config.bin %> <%= command.id %> --algorithm sha512',
-      '<%= config.bin %> <%= command.id %> --each-file',
-    ];
+  static override examples = [
+    '<%= config.bin %> <%= command.id %>',
+    '<%= config.bin %> <%= command.id %> --algorithm xxhash64',
+    '<%= config.bin %> <%= command.id %> --algorithm md5',
+    '<%= config.bin %> <%= command.id %> --algorithm sha256',
+    '<%= config.bin %> <%= command.id %> --algorithm sha512',
+    '<%= config.bin %> <%= command.id %> --each-file',
+  ];
 
-    static override flags = {
-      algorithm: Flags.string({
-        char: 'a',
-        description: 'Checksum algorithm to use',
-        options: SUPPORTED_ALGORITHMS,
-        default: 'xxhash64',
-      }),
-      'each-file': Flags.boolean({
-        description:
-          'Calculate checksum for each file individually (disables duplicate optimization)',
-        default: false,
-      }),
-    };
+  static override flags = {
+    ...BaseCommand.baseFlags,
+    algorithm: Flags.string({
+      char: 'a',
+      description: 'Checksum algorithm to use',
+      options: SUPPORTED_ALGORITHMS,
+      default: 'xxhash64',
+    }),
+    'each-file': Flags.boolean({
+      description: 'Calculate checksum for each file individually (disables duplicate optimization)',
+      default: false,
+    }),
+  };
 
-    async run(): Promise<void> {
-      const { flags } = await this.parse(Checksum);
-      const algorithm = flags.algorithm as ChecksumAlgorithm;
-      const eachFile = flags['each-file'];
+  private _rootPath = '';
 
-      const cleanupLogging = setupOclifContext(
-        this as unknown as Parameters<typeof setupOclifContext>[0]
+  get jobType() { return 'checksum'; }
+  get jobLabel() { return `Checksum ${this._rootPath || '...'}`; }
+  get phases() { return ['checksum']; }
+
+  async openDatabase(): Promise<{ db: DatabaseConnection; runId: string; rootPath: string }> {
+    const db = await createScanDatabase('main');
+
+    await ensureChecksumTable(db);
+
+    const runId = await getLatestRunId(db).toPromise();
+    if (!runId) {
+      this.error(
+        'No scans found in database. Run a scan first with: archifiltre scan <directory>',
+        { exit: 1 }
       );
-      let database: DatabaseConnection | undefined;
+    }
 
-      try {
-        // Connect to database
-        database = await createScanDatabase('main');
+    const metadata = await getScanMetadata(db, runId).toPromise();
+    if (!metadata) {
+      this.error(
+        'Scan metadata not found. This scan may have been created with an older version.',
+        { exit: 1 }
+      );
+    }
 
-        // Ensure checksum table exists
-        await ensureChecksumTable(database);
+    this._rootPath = metadata.root_path;
+    return { db, runId, rootPath: metadata.root_path };
+  }
 
-        // Get latest run_id
-        ux.action.start('Finding latest scan');
-        const runId = await getLatestRunId(database).toPromise();
+  async runJob(context: JobContext): Promise<void> {
+    const { flags } = await this.parse(ChecksumCommand);
+    const algorithm = flags.algorithm as ChecksumAlgorithm;
+    const eachFile = flags['each-file'];
 
-        if (!runId) {
-          ux.action.stop('failed');
-          this.error(
-            'No scans found in database. Run a scan first with: archifiltre scan <directory>',
-            { exit: 1 }
-          );
-        }
+    const stats = await getChecksumStats(context.database, context.runId);
 
-        ux.action.stop(runId);
+    this.log('');
+    this.log(`Total files: ${stats.totalFiles.toLocaleString()}`);
 
-        // Get scan metadata to find root_path
-        ux.action.start('Loading scan metadata');
-        const metadata = await getScanMetadata(database, runId).toPromise();
-
-        if (!metadata) {
-          ux.action.stop('failed');
-          this.error(
-            'Scan metadata not found. This scan may have been created with an older version.',
-            { exit: 1 }
-          );
-        }
-
-        const rootPath = metadata.root_path;
-        ux.action.stop(rootPath);
-
-        // Get statistics
-        const stats = await getChecksumStats(database, runId);
-
-        this.log('');
-        this.log(`Total files: ${stats.totalFiles.toLocaleString()}`);
-
-        if (!eachFile) {
-          if (algorithm === 'xxhash64') {
-            // xxHash64 has special optimization - copies existing hashes
-            this.log(
-              `  - Files with existing xxHash64: ${stats.filesWithHash.toLocaleString()} (will be copied)`
-            );
-            this.log(`  - Files needing calculation: ${stats.filesWithoutHash.toLocaleString()}`);
-            this.log('');
-            this.log(
-              `Disk reads required: ${stats.filesWithoutHash.toLocaleString()} ` +
-                `(saving ${stats.filesWithHash.toLocaleString()} reads by copying existing hashes)`
-            );
-          } else {
-            this.log(
-              `  - Files in duplicate groups: ${stats.filesInDuplicateGroups.toLocaleString()}`
-            );
-            this.log(`  - Unique files: ${stats.filesWithoutHash.toLocaleString()}`);
-            this.log(`  - Duplicate groups: ${stats.duplicateGroups.toLocaleString()}`);
-            this.log('');
-            this.log(
-              `Disk reads required: ${(stats.duplicateGroups + stats.filesWithoutHash).toLocaleString()} ` +
-                `(saving ${(stats.filesInDuplicateGroups - stats.duplicateGroups).toLocaleString()} reads)`
-            );
-          }
-        }
-
+    if (!eachFile) {
+      if (algorithm === 'xxhash64') {
+        this.log(
+          `  - Files with existing xxHash64: ${stats.filesWithHash.toLocaleString()} (will be copied)`
+        );
+        this.log(`  - Files needing calculation: ${stats.filesWithoutHash.toLocaleString()}`);
         this.log('');
         this.log(
-          `Computing ${algorithm.toUpperCase()} checksums${eachFile ? ' (--each-file mode)' : ' (optimized)'}...`
+          `Disk reads required: ${stats.filesWithoutHash.toLocaleString()} ` +
+            `(saving ${stats.filesWithHash.toLocaleString()} reads by copying existing hashes)`
         );
-
-        let lastProgress: ChecksumProgress = {
-          processed: 0,
-          total: stats.totalFiles,
-          duplicateGroups: 0,
-          uniqueFiles: 0,
-          filesSkipped: 0,
-        };
-
-        await new Promise<void>((resolve, reject) => {
-          if (!database) {
-            reject(new Error('Database connection not available'));
-            return;
-          }
-
-          computeChecksums(database, runId, rootPath, { algorithm, eachFile }).subscribe({
-            next: progress => {
-              lastProgress = progress;
-              ux.action.start(
-                `Computing ${algorithm.toUpperCase()} checksums`,
-                `${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()} files`
-              );
-            },
-            complete: () => {
-              ux.action.stop(`${lastProgress.processed.toLocaleString()} files`);
-              resolve();
-            },
-            error: err => {
-              ux.action.stop('failed');
-              reject(err);
-            },
-          });
-        });
-
+      } else {
+        this.log(
+          `  - Files in duplicate groups: ${stats.filesInDuplicateGroups.toLocaleString()}`
+        );
+        this.log(`  - Unique files: ${stats.filesWithoutHash.toLocaleString()}`);
+        this.log(`  - Duplicate groups: ${stats.duplicateGroups.toLocaleString()}`);
         this.log('');
         this.log(
-          `Checksum computation completed: ${lastProgress.processed.toLocaleString()} files processed`
+          `Disk reads required: ${(stats.duplicateGroups + stats.filesWithoutHash).toLocaleString()} ` +
+            `(saving ${(stats.filesInDuplicateGroups - stats.duplicateGroups).toLocaleString()} reads)`
         );
-
-        if (lastProgress.filesSkipped > 0) {
-          this.log(`  (${lastProgress.filesSkipped.toLocaleString()} files skipped due to errors)`);
-        }
-
-        logger.info('Checksum computation completed', {
-          runId,
-          algorithm,
-          eachFile,
-          totalProcessed: lastProgress.processed,
-          filesSkipped: lastProgress.filesSkipped,
-        });
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-
-        logger.error('Checksum command failed', error instanceof Error ? error : undefined, {
-          algorithm,
-        });
-
-        this.error(`Checksum computation failed: ${errorMessage}`, { exit: 1 });
-      } finally {
-        if (database) {
-          await closeScanDatabase(database);
-        }
-        cleanupLogging();
       }
     }
-  },
+
+    this.log('');
+    this.log(
+      `Computing ${algorithm.toUpperCase()} checksums${eachFile ? ' (--each-file mode)' : ' (optimized)'}...`
+    );
+
+    let lastProgress: ChecksumProgress = {
+      processed: 0,
+      total: stats.totalFiles,
+      duplicateGroups: 0,
+      uniqueFiles: 0,
+      filesSkipped: 0,
+    };
+
+    const isTTY = process.stdout.isTTY;
+    if (isTTY) ux.action.start(`Computing ${algorithm.toUpperCase()} checksums`);
+
+    await new Promise<void>((resolve, reject) => {
+      computeChecksums(context, { algorithm, eachFile }).subscribe({
+        next: progress => {
+          lastProgress = progress;
+          if (isTTY) {
+            ux.action.status = `${progress.processed.toLocaleString()} / ${progress.total.toLocaleString()} files`;
+          }
+        },
+        complete: () => {
+          if (isTTY) ux.action.stop(`${lastProgress.processed.toLocaleString()} files`);
+          resolve();
+        },
+        error: err => {
+          if (isTTY) ux.action.stop('failed');
+          reject(err);
+        },
+      });
+    });
+
+    this.log('');
+    this.log(
+      `Checksum computation completed: ${lastProgress.processed.toLocaleString()} files processed`
+    );
+
+    if (lastProgress.filesSkipped > 0) {
+      this.log(`  (${lastProgress.filesSkipped.toLocaleString()} files skipped due to errors)`);
+    }
+
+    logger.info('Checksum computation completed', {
+      runId: context.runId,
+      algorithm,
+      eachFile,
+      totalProcessed: lastProgress.processed,
+      filesSkipped: lastProgress.filesSkipped,
+    });
+  }
+}
+
+export const COMMAND = {
+  name: 'checksum',
+  command: ChecksumCommand,
+};
+
+export const MANIFEST = {
+  id: 'checksum',
+  name: 'Checksum',
+  description: 'Computes cryptographic checksums for scanned files',
+  version: '1.0.0',
+  schema: [fileChecksums],
+  command: ChecksumCommand,
 };

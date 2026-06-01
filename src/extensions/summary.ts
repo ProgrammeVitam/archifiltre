@@ -253,3 +253,10 @@ export async function summary(
     cli.log('  Error generating detailed breakdown');
   }
 }
+
+export const MANIFEST = {
+  id: 'summary',
+  name: 'Summary',
+  description: 'Displays scan statistics and duplicate detection results',
+  version: '1.0.0',
+};

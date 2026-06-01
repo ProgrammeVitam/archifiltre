@@ -7,7 +7,7 @@
  * Only includes checksum columns that have at least one value (dynamic columns).
  */
 
-import { Command, Args, Flags, ux } from '@oclif/core';
+import { Args, Flags, ux } from '@oclif/core';
 import { promises as fsp } from 'node:fs';
 import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
@@ -24,11 +24,10 @@ import {
   defaultIfEmpty,
 } from 'rxjs/operators';
 import { eq, and, gt } from 'drizzle-orm';
-import { setupOclifContext, logger } from '@lib/logging.ts';
+import { logger } from '@lib/logging.ts';
 import { generateExportFilename, ensureDirectory } from '@lib/helpers.ts';
 import {
   createScanDatabase,
-  closeScanDatabase,
   getLatestRunId,
   getScanMetadata,
   files,
@@ -36,6 +35,10 @@ import {
   type FileSelect,
 } from '@lib/database.ts';
 import { fileChecksums } from '@extensions/checksum/schema.ts';
+import type { PipelineContext } from '@lib/pipeline-context.ts';
+import { pausable } from '@lib/pausable.ts';
+import { BaseCommand } from '@lib/base-command.ts';
+import type { JobContext } from '@lib/job-context.ts';
 
 // === Types ===
 
@@ -412,7 +415,6 @@ function writeLines(fileHandle: FileHandle, lines: string[]): Observable<number>
 interface CsvExportOptions {
   delimiter?: string;
   batchSize?: number;
-  rootPath?: string; // When provided, paths will be full paths
   populatedChecksums?: ChecksumColumn[]; // Which checksum columns have data
   hasDeleteTags?: boolean; // Whether delete tags exist for this run
 }
@@ -428,15 +430,14 @@ interface CsvExportOptions {
  * @returns Observable that completes when export is done, emitting total count
  */
 export function exportToCsv(
-  database: DatabaseConnection,
-  runId: string,
+  context: PipelineContext,
   outputPath: string,
   options: CsvExportOptions = {}
 ): Observable<number> {
+  const { database, runId, rootPath } = context;
   const {
     delimiter = ',',
     batchSize = 5000,
-    rootPath,
     populatedChecksums = [],
     hasDeleteTags = false,
   } = options;
@@ -480,6 +481,7 @@ export function exportToCsv(
               batchSize,
               populatedChecksums.length > 0
             ).pipe(
+              pausable(context),
               // Format batch to CSV lines (with only populated checksum columns + delete tags)
               map(batch =>
                 batch.map(file =>
@@ -501,6 +503,7 @@ export function exportToCsv(
               }),
               // Accumulate total count
               scan((total, batchCount) => total + batchCount, 0),
+              tap(total => context.onProgress?.('export', total, null)),
               // Emit 0 if no files found
               defaultIfEmpty(0)
             )
@@ -526,142 +529,110 @@ export function exportToCsv(
 
 // === Command Declaration ===
 
-/**
- * Export command - auto-registered via extension registry
- */
+class ExportCommand extends BaseCommand {
+  static override description = 'Export scan results to CSV';
+
+  static override examples = [
+    '<%= config.bin %> <%= command.id %>',
+    '<%= config.bin %> <%= command.id %> inventory.csv',
+    '<%= config.bin %> <%= command.id %> ./output/scan-results.csv',
+    '<%= config.bin %> <%= command.id %> --full-paths',
+  ];
+
+  static override args = {
+    output: Args.string({
+      description: 'Output CSV file path (auto-generated if not provided)',
+      required: false,
+    }),
+  };
+
+  static override flags = {
+    ...BaseCommand.baseFlags,
+    'full-paths': Flags.boolean({
+      description: 'Export full absolute paths instead of relative paths',
+      default: false,
+    }),
+    db: Flags.string({
+      description: 'Database name to export from',
+      default: 'main',
+    }),
+  };
+
+  private _resolvedOutput = '';
+
+  get jobType() { return 'export'; }
+  get jobLabel() { return `Export${this._resolvedOutput ? ` → ${path.basename(this._resolvedOutput)}` : ''}`; }
+  get phases() { return ['export']; }
+
+  async openDatabase(): Promise<{ db: DatabaseConnection; runId: string; rootPath: string }> {
+    const { args, flags } = await this.parse(ExportCommand);
+
+    const config = this.config as typeof this.config & { originalCwd: string };
+    const outputPath = args.output || generateExportFilename({ type: 'export', extension: 'csv' });
+    const resolvedOutput = path.resolve(config.originalCwd, outputPath);
+    await ensureDirectory(path.dirname(resolvedOutput));
+    this._resolvedOutput = resolvedOutput;
+
+    const db = await createScanDatabase(flags.db);
+
+    const runId = await getLatestRunId(db).toPromise();
+    if (!runId) {
+      this.error(
+        'No scans found in database. Run a scan first with: archifiltre scan <directory>',
+        { exit: 1 }
+      );
+    }
+
+    const metadata = await getScanMetadata(db, runId).toPromise();
+    if (!metadata) {
+      this.warn('Scan metadata not found. Full paths will not be available.');
+    }
+
+    return { db, runId, rootPath: metadata?.root_path ?? '' };
+  }
+
+  async runJob(context: JobContext): Promise<void> {
+    const { flags } = await this.parse(ExportCommand);
+    const fullPaths = flags['full-paths'];
+
+    ux.action.start('Detecting checksum columns');
+    const populatedChecksums = await getPopulatedChecksumColumns(context.database, context.runId);
+    ux.action.stop(populatedChecksums.length > 0 ? populatedChecksums.join(', ') : 'none');
+
+    ux.action.start('Detecting delete tags');
+    const hasDeleteTags = await hasDeleteTagsForRun(context.database, context.runId);
+    ux.action.stop(hasDeleteTags ? 'yes' : 'none');
+
+    ux.action.start(`Exporting to ${this._resolvedOutput}`);
+
+    const exportContext = fullPaths ? context : { ...context, rootPath: '' };
+    const totalFiles = await exportToCsv(exportContext, this._resolvedOutput, {
+      populatedChecksums,
+      hasDeleteTags,
+    }).toPromise();
+
+    ux.action.stop(`${totalFiles?.toLocaleString() ?? 0} files`);
+
+    this.log('');
+    this.log(`Export completed: ${this._resolvedOutput}`);
+
+    logger.info('CSV export completed', {
+      runId: context.runId,
+      outputPath: this._resolvedOutput,
+      totalFiles,
+    });
+  }
+}
+
 export const COMMAND = {
   name: 'export',
-  command: class Export extends Command {
-    static override description = 'Export scan results to CSV';
+  command: ExportCommand,
+};
 
-    static override examples = [
-      '<%= config.bin %> <%= command.id %>',
-      '<%= config.bin %> <%= command.id %> inventory.csv',
-      '<%= config.bin %> <%= command.id %> ./output/scan-results.csv',
-      '<%= config.bin %> <%= command.id %> --full-paths',
-    ];
-
-    static override args = {
-      output: Args.string({
-        description: 'Output CSV file path (auto-generated if not provided)',
-        required: false,
-      }),
-    };
-
-    static override flags = {
-      'full-paths': Flags.boolean({
-        description: 'Export full absolute paths instead of relative paths',
-        default: false,
-      }),
-      db: Flags.string({
-        description: 'Database name to export from',
-        default: 'main',
-      }),
-    };
-
-    async run(): Promise<void> {
-      const { args, flags } = await this.parse(Export);
-      const fullPaths = flags['full-paths'];
-
-      // Cast config to access custom originalCwd property from StandaloneConfig
-      const config = this.config as typeof this.config & { originalCwd: string };
-      const cleanupLogging = setupOclifContext(
-        this as unknown as Parameters<typeof setupOclifContext>[0]
-      );
-      let database: DatabaseConnection | undefined;
-
-      try {
-        // Determine output path - use provided path or generate one
-        const outputPath =
-          args.output || generateExportFilename({ type: 'export', extension: 'csv' });
-
-        // Resolve output path relative to where user ran the command
-        const resolvedOutput = path.resolve(config.originalCwd, outputPath);
-
-        // Ensure output directory exists
-        const outputDir = path.dirname(resolvedOutput);
-        await ensureDirectory(outputDir);
-
-        // Connect to database
-        database = await createScanDatabase(flags.db);
-
-        // Get latest run_id
-        ux.action.start('Finding latest scan');
-        const runId = await getLatestRunId(database).toPromise();
-
-        if (!runId) {
-          ux.action.stop('failed');
-          this.error(
-            'No scans found in database. Run a scan first with: archifiltre scan <directory>',
-            {
-              exit: 1,
-            }
-          );
-        }
-
-        ux.action.stop(runId);
-
-        // Get root path if full paths requested
-        let rootPath: string | undefined;
-        if (fullPaths) {
-          ux.action.start('Loading scan metadata');
-          const metadata = await getScanMetadata(database, runId).toPromise();
-          if (metadata) {
-            rootPath = metadata.root_path;
-            ux.action.stop(rootPath);
-          } else {
-            ux.action.stop('not found (using relative paths)');
-            this.warn('Scan metadata not found. Falling back to relative paths.');
-          }
-        }
-
-        // Detect which checksum columns have data
-        ux.action.start('Detecting checksum columns');
-        const populatedChecksums = await getPopulatedChecksumColumns(database, runId);
-        if (populatedChecksums.length > 0) {
-          ux.action.stop(populatedChecksums.join(', '));
-        } else {
-          ux.action.stop('none');
-        }
-
-        // Detect if any delete tags exist
-        ux.action.start('Detecting delete tags');
-        const hasDeleteTags = await hasDeleteTagsForRun(database, runId);
-        ux.action.stop(hasDeleteTags ? 'yes' : 'none');
-
-        // Export to CSV
-        ux.action.start(`Exporting to ${resolvedOutput}`);
-
-        const totalFiles = await exportToCsv(database, runId, resolvedOutput, {
-          rootPath,
-          populatedChecksums,
-          hasDeleteTags,
-        }).toPromise();
-
-        ux.action.stop(`${totalFiles?.toLocaleString() ?? 0} files`);
-
-        this.log('');
-        this.log(`Export completed: ${resolvedOutput}`);
-
-        logger.info('CSV export completed', {
-          runId,
-          outputPath: resolvedOutput,
-          totalFiles,
-        });
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-
-        logger.error('Export command failed', error instanceof Error ? error : undefined, {
-          outputPath: args.output || '(auto-generated)',
-        });
-
-        this.error(`Export failed: ${errorMessage}`, { exit: 1 });
-      } finally {
-        if (database) {
-          await closeScanDatabase(database);
-        }
-        cleanupLogging();
-      }
-    }
-  },
+export const MANIFEST = {
+  id: 'csv-export',
+  name: 'CSV Export',
+  description: 'Exports scan results to CSV format',
+  version: '1.0.0',
+  command: ExportCommand,
 };

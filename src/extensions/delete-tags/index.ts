@@ -10,6 +10,7 @@
  */
 
 import type { DatabaseConnection } from '@lib/database.ts';
+import { deleteTags } from '@extensions/delete-tags/schema.ts';
 
 // Re-export schema types for consumers
 export type { DeleteTagRow, DeleteTagSelect } from '@extensions/delete-tags/schema.ts';
@@ -114,3 +115,11 @@ export async function handleGetDeleteTags(
     })),
   };
 }
+
+export const MANIFEST = {
+  id: 'delete-tags',
+  name: 'Delete Tags',
+  description: 'Marks files and directories for deletion',
+  version: '1.0.0',
+  schema: [deleteTags],
+};

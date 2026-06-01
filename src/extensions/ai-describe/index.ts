@@ -9,6 +9,7 @@
  */
 
 import type { DatabaseConnection } from '@lib/database.ts';
+import { directoryDescriptions } from '@extensions/ai-describe/schema.ts';
 import { getLLMConfig } from '@extensions/ai-describe/llm-client.ts';
 import { callLLM } from '@extensions/ai-describe/llm-client.ts';
 import {
@@ -160,3 +161,11 @@ export async function handleDescribeDirectory(
     return { description: null, error: message };
   }
 }
+
+export const MANIFEST = {
+  id: 'ai-describe',
+  name: 'AI Describe',
+  description: 'Generates LLM-powered descriptions for directories',
+  version: '1.0.0',
+  schema: [directoryDescriptions],
+};

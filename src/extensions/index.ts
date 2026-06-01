@@ -16,6 +16,21 @@
 
 import type { Command } from '@oclif/core';
 
+// === Extension Types ===
+
+/**
+ * Manifest exported by every extension.
+ * Command extensions also set `command`; schema-owning extensions set `schema`.
+ */
+export interface Extension {
+  id: string;
+  name: string;
+  description: string;
+  version: string;
+  schema?: unknown[];
+  command?: typeof Command;
+}
+
 // === Extension Imports ===
 // Import all extensions here. Extensions with commands will be auto-discovered.
 
@@ -86,6 +101,24 @@ export const EXTENSION_COMMANDS: Record<string, typeof Command> = Object.fromEnt
  * List of registered extension command names (for debugging/help)
  */
 export const EXTENSION_COMMAND_NAMES: string[] = Object.keys(EXTENSION_COMMANDS);
+
+// === Manifest Discovery ===
+
+function hasManifest(ext: Record<string, unknown>): ext is { MANIFEST: Extension } {
+  return (
+    'MANIFEST' in ext &&
+    ext.MANIFEST !== null &&
+    typeof ext.MANIFEST === 'object' &&
+    'id' in (ext.MANIFEST as object)
+  );
+}
+
+/**
+ * All registered extension manifests, in registry order.
+ */
+export const EXTENSION_MANIFESTS: Extension[] = EXTENSIONS.filter(hasManifest).map(
+  ext => ext.MANIFEST
+);
 
 // === Re-export Extension Functions ===
 // Export individual extensions for direct use by other commands
