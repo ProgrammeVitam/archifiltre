@@ -20,9 +20,7 @@
 		healthCheck,
 		getVersion,
 		scanDirectory,
-		onScanProgress,
-		onScanError,
-		onScanComplete,
+		onJobUpdate,
 		generateId,
 		startQuerySession,
 		stopQuerySession,
@@ -32,6 +30,7 @@
 		type TreeData,
 		type ScanStats
 	} from '$lib/tauri';
+	import { jobsStore } from '$lib/jobs';
 	import { Button } from '$lib/components/ui/button';
 	import { Alert, AlertDescription, AlertTitle } from '$lib/components/ui/alert';
 	import DropZone from '$lib/components/DropZone.svelte';
@@ -63,44 +62,46 @@
 
 	onMount(async () => {
 		try {
-			// Setup event listeners for scan progress
-			// Events include scanId - route to the correct tab
+			// Single job-update listener handles scan, checksum, and export events
 			unlisteners.push(
-				await onScanProgress((event) => {
-					// Find the scan with this scanId
-					const scan = scansStore.findScanByScanId(event.scanId);
-					if (!scan) return;
+				await onJobUpdate((event) => {
+					const { jobId, line } = event;
 
-					addTerminalLineToScan(scan.id, event.line, 'stdout');
-					parseScanOutputForScan(scan.id, event.line);
+					// Forward to jobs store for all job types
+					// For scan jobs, route to the owning scan tab
+					const scan = scansStore.findScanByJobId(jobId);
+					const scanTabId = scan?.id ?? jobId;
+					jobsStore.upsertFromEvent(line, scanTabId);
 
-					// Update progress message
-					if (event.line.includes('ingested') || event.line.includes('found')) {
-						scansStore.updateScan(scan.id, { scanProgress: event.line.trim() });
-					}
-				}),
-				await onScanError((event) => {
-					// Find the scan with this scanId
-					const scan = scansStore.findScanByScanId(event.scanId);
-					if (!scan) return;
+					// Scan-specific handling
+					if (scan) {
+						// Parse progress into scan result fields
+						parseScanOutputForScan(scan.id, line);
 
-					addTerminalLineToScan(scan.id, event.line, 'stderr');
-				}),
-				await onScanComplete((event) => {
-					// Find the scan with this scanId
-					const scan = scansStore.findScanByScanId(event.scanId);
-					if (!scan) return;
+						// Handle terminal output for non-JSON lines (summary text)
+						let parsed: Record<string, unknown> | null = null;
+						try { parsed = JSON.parse(line); } catch { /* raw text */ }
 
-					addTerminalLineToScan(
-						scan.id,
-						event.success ? '✓ Scan completed successfully' : '✗ Scan failed',
-						event.success ? 'success' : 'error'
-					);
-					finishScanningScan(scan.id, event.success);
+						if (!parsed) {
+							// Raw text from summary() — show in terminal
+							addTerminalLineToScan(scan.id, line, 'stdout');
+						}
 
-					// Load visualization data after scan completes (only for active scan)
-					if (event.success && scan.id === $activeScan?.id) {
-						loadVisualizationData(scan.dbName, scan.id);
+						// Handle scan completion via job:complete
+						if (parsed?.event === 'job:complete') {
+							addTerminalLineToScan(scan.id, '✓ Scan completed successfully', 'success');
+							finishScanningScan(scan.id, true);
+							if (scan.id === $activeScan?.id) {
+								loadVisualizationData(scan.dbName, scan.id);
+							}
+						}
+
+						// Handle scan error via job:error
+						if (parsed?.event === 'job:error') {
+							const msg = (parsed.error as string) ?? 'Scan failed';
+							addTerminalLineToScan(scan.id, `✗ ${msg}`, 'error');
+							finishScanningScan(scan.id, false);
+						}
 					}
 				})
 			);
@@ -229,15 +230,16 @@
 		statsData = null;
 		visualizationError = null;
 
-		// Generate unique IDs for this scan
-		const newScanId = generateId();
+		// Generate job ID used for both event routing and job protocol
+		const jobId = generateId();
 
-		// Start scanning - this updates the scan state
-		startScanningScan(scan.id, path, newScanId);
+		// Start scanning - this updates the scan state (scanId = jobId for routing)
+		startScanningScan(scan.id, path, jobId);
 
 		try {
 			const result = await scanDirectory({
-				scanId: newScanId,
+				scanId: jobId,
+				jobId,
 				dbName: scan.dbName,
 				path,
 				includeHidden: scan.scanOptions.includeHidden,

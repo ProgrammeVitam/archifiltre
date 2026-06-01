@@ -308,6 +308,11 @@ function createScansStore() {
 			return get({ subscribe }).scans.find((s) => s.scanId === scanId);
 		},
 
+		/** Find scan by jobId — jobId equals scanId for scan jobs */
+		findScanByJobId: (jobId: string): Scan | undefined => {
+			return get({ subscribe }).scans.find((s) => s.scanId === jobId);
+		},
+
 		// Legacy aliases for backwards compatibility
 		addTab: function () {
 			return this.addScan();
@@ -612,24 +617,36 @@ export function clearTerminal(): void {
 	}
 }
 
-interface JsonProgressEvent {
-	type: string;
+interface LegacyScanProgressEvent {
+	type: 'scan-progress';
 	phase: ScanPhase;
 	filesDiscovered: number;
 	filesIngested: number;
 	filesHashed?: number;
 	filesToHash?: number;
-	hashErrors?: number;
-	duplicateSizes?: number;
 	duplicateGroups: number;
 	status: string;
 }
 
-function tryParseJsonProgressEvent(line: string): JsonProgressEvent | null {
+interface JobProgressEvent {
+	event: 'job:progress';
+	jobId: string;
+	phase: string;
+	processed: number;
+	total: number | null;
+	detail: string;
+}
+
+function tryParseJsonProgressEvent(
+	line: string
+): LegacyScanProgressEvent | JobProgressEvent | null {
 	try {
 		const parsed = JSON.parse(line);
-		if (parsed?.type === 'scan-progress') return parsed as JsonProgressEvent;
-	} catch { /* not JSON */ }
+		if (parsed?.type === 'scan-progress') return parsed as LegacyScanProgressEvent;
+		if (parsed?.event === 'job:progress') return parsed as JobProgressEvent;
+	} catch {
+		/* not JSON */
+	}
 	return null;
 }
 
@@ -638,19 +655,43 @@ export function parseScanOutputForScan(scanId: string, line: string): void {
 	const scan = scansStore.getScan(scanId);
 	if (!scan) return;
 
-	// Try JSON progress event first (CLI in non-TTY mode emits these)
+	// Try JSON progress event first (legacy scan-progress or new job:progress)
 	const event = tryParseJsonProgressEvent(line);
 	if (event) {
-		scansStore.updateScan(scanId, {
-			scanPhase: event.phase,
-			scanResult: {
-				...scan.scanResult,
-				filesDiscovered: event.filesDiscovered,
-				duplicateGroups: event.duplicateGroups,
-				...(event.filesHashed !== undefined && { filesHashed: event.filesHashed }),
-				...(event.filesToHash !== undefined && { filesToHash: event.filesToHash })
-			}
-		});
+		if ('event' in event && event.event === 'job:progress') {
+			const validPhases: ScanPhase[] = [
+				'discovery',
+				'ingestion',
+				'prefilter',
+				'hashing',
+				'duplicate-detection',
+				'complete'
+			];
+			const phase = validPhases.includes(event.phase as ScanPhase)
+				? (event.phase as ScanPhase)
+				: scan.scanPhase;
+			scansStore.updateScan(scanId, {
+				scanPhase: phase,
+				scanProgress: event.detail,
+				scanResult: {
+					...scan.scanResult,
+					filesDiscovered: event.processed
+				}
+			});
+		} else {
+			const legacy = event as LegacyScanProgressEvent;
+			scansStore.updateScan(scanId, {
+				scanPhase: legacy.phase,
+				scanProgress: legacy.status,
+				scanResult: {
+					...scan.scanResult,
+					filesDiscovered: legacy.filesDiscovered,
+					duplicateGroups: legacy.duplicateGroups,
+					...(legacy.filesHashed !== undefined && { filesHashed: legacy.filesHashed }),
+					...(legacy.filesToHash !== undefined && { filesToHash: legacy.filesToHash })
+				}
+			});
+		}
 		return;
 	}
 
