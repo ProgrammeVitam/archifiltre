@@ -41,6 +41,7 @@ import {
 import { ArchiveReader } from 'libarchive-wasm';
 import { initializeLibarchiveWasm } from '@lib/libarchive-init.ts';
 import { performHashing } from '@lib/hash-calculator.ts';
+import { toLongPath } from '@lib/path-utils.ts';
 
 // Archive Detection Constants
 // prettier-ignore
@@ -96,7 +97,7 @@ async function isArchiveByMagicNumber(
     const absolutePath = path.resolve(filePath);
 
     // Check magic numbers (extension filtering now done in isArchiveFile)
-    const fd = await fsp.open(absolutePath, 'r');
+    const fd = await fsp.open(toLongPath(absolutePath), 'r');
     const buffer = Buffer.alloc(16);
     const { bytesRead } = await fd.read(buffer, 0, 16, 0);
     await fd.close();
@@ -258,7 +259,7 @@ async function processArchiveEntries(
 
   try {
     const absolutePath = path.resolve(rootPath, archivePath);
-    const archiveBuffer = await fsp.readFile(absolutePath);
+    const archiveBuffer = await fsp.readFile(toLongPath(absolutePath));
 
     // Initialize libarchive WASM
     const mod = await initializeLibarchiveWasm();
@@ -698,7 +699,7 @@ async function* walkFilesGenerator(
     const currentDir = stack.pop()!;
 
     try {
-      const entries = await fsp.readdir(currentDir, { withFileTypes: true });
+      const entries = await fsp.readdir(toLongPath(currentDir), { withFileTypes: true });
 
       for (const entry of entries) {
         const fullPath = path.join(currentDir, entry.name);
@@ -734,7 +735,7 @@ async function* walkFilesGenerator(
           };
         } else if (entry.isFile()) {
           try {
-            const stats = await fsp.stat(fullPath);
+            const stats = await fsp.stat(toLongPath(fullPath));
 
             // Yield file immediately with metadata for flexible filtering
             yield {
@@ -807,13 +808,13 @@ export async function validateScanPath(targetPath: string): Promise<{
 }> {
   try {
     const resolvedPath = path.resolve(targetPath);
-    const stats = await fsp.stat(resolvedPath);
+    const stats = await fsp.stat(toLongPath(resolvedPath));
 
     if (!stats.isDirectory()) {
       return { valid: false, error: 'Path is not a directory' };
     }
 
-    await fsp.access(resolvedPath);
+    await fsp.access(toLongPath(resolvedPath));
 
     return { valid: true, resolvedPath };
   } catch (error) {

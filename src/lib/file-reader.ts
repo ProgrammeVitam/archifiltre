@@ -31,6 +31,7 @@ import {
   toSystemPath,
   getArchiveRelativePath,
   pathEquals,
+  toLongPath,
 } from '@lib/path-utils.ts';
 
 // === Types ===
@@ -83,7 +84,7 @@ export async function extractFromArchive(
     relativePath,
   });
 
-  const archiveBuffer = await fs.readFile(archivePath);
+  const archiveBuffer = await fs.readFile(toLongPath(archivePath));
 
   // Initialize libarchive WASM
   const mod = await initializeLibarchiveWasm();
@@ -164,7 +165,7 @@ export async function createFileStream(rootPath: string, entry: FileEntry): Prom
       fullPath,
     });
 
-    return createReadStream(fullPath);
+    return createReadStream(toLongPath(fullPath));
   }
 }
 
@@ -236,7 +237,7 @@ export async function readFileContent(rootPath: string, entry: FileEntry): Promi
     // Regular filesystem file
     const systemPath = toSystemPath(entry.path);
     const fullPath = path.join(rootPath, systemPath);
-    return fs.readFile(fullPath);
+    return fs.readFile(toLongPath(fullPath));
   }
 }
 

@@ -152,3 +152,30 @@ export function isNormalizedPath(filePath: string): boolean {
 export function normalizeWindowsDrive(filePath: string): string {
   return normalizePath(filePath);
 }
+
+/**
+ * Prefix an absolute path with the Windows extended-length path prefix (\\?\)
+ * so that the Win32 API accepts paths longer than MAX_PATH (260 characters).
+ *
+ * No-op on non-Windows platforms and on paths that are already prefixed.
+ * UNC paths (\\server\share) are mapped to \\?\UNC\server\share as required.
+ *
+ * The prefix disables Win32 path parsing (no relative segments, no forward
+ * slashes), so this must only be called on fully-resolved absolute paths.
+ *
+ * @param filePath - Absolute path to prefix
+ * @returns Path safe for filesystem calls on Windows regardless of length
+ *
+ * @example
+ * toLongPath('C:\\very\\long\\path') → '\\\\?\\C:\\very\\long\\path'
+ * toLongPath('\\\\server\\share\\file') → '\\\\?\\UNC\\server\\share\\file'
+ */
+export function toLongPath(filePath: string): string {
+  if (process.platform !== 'win32') return filePath;
+  if (filePath.startsWith('\\\\?\\')) return filePath;
+  const backslashed = filePath.replace(/\//g, '\\');
+  if (backslashed.startsWith('\\\\')) {
+    return `\\\\?\\UNC\\${backslashed.slice(2)}`;
+  }
+  return `\\\\?\\${backslashed}`;
+}
