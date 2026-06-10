@@ -381,6 +381,37 @@ async function handleGetStats(db: DatabaseConnection, runId: string): Promise<Sc
   });
 }
 
+async function handleGetDirDateStats(
+  db: DatabaseConnection,
+  runId: string,
+  dirPath: string
+): Promise<{ min: number | null; max: number | null; median: number | null; count: number }> {
+  const result = await db.db.execute(sql`
+    SELECT mtime FROM files
+    WHERE run_id = ${runId}
+      AND path LIKE ${dirPath + '/%'}
+      AND is_directory = false
+      AND mtime > 0
+    ORDER BY mtime ASC
+  `);
+
+  const mtimes = (result.rows as Array<{ mtime: number | string }>)
+    .map(r => Number(r.mtime))
+    .filter(m => m > 0);
+
+  if (mtimes.length === 0) return { min: null, max: null, median: null, count: 0 };
+
+  const min = mtimes[0];
+  const max = mtimes[mtimes.length - 1];
+  const mid = Math.floor(mtimes.length / 2);
+  const median =
+    mtimes.length % 2 === 0
+      ? Math.round((mtimes[mid - 1] + mtimes[mid]) / 2)
+      : mtimes[mid];
+
+  return { min, max, median, count: mtimes.length };
+}
+
 // === Main Command ===
 
 export default class Query extends Command {
@@ -462,6 +493,14 @@ export default class Query extends Command {
 
         case 'get_stats':
           data = await handleGetStats(this.database, this.runId);
+          break;
+
+        case 'get_dir_date_stats':
+          data = await handleGetDirDateStats(
+            this.database,
+            this.runId,
+            (request.path as string) ?? ''
+          );
           break;
 
         case 'ping':

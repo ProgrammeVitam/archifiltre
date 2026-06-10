@@ -11,7 +11,9 @@
 	import {
 		formatBytes,
 		queryDirectoryDescription,
+		queryDirDateStats,
 		type DirectoryDescription,
+		type DirDateStats,
 		setDeleteTag,
 		removeDeleteTag
 	} from '$lib/tauri';
@@ -38,7 +40,9 @@
 		FolderOpenIcon,
 		TextIcon,
 		LoaderCircleIcon,
-		Trash2Icon
+		Trash2Icon,
+		LeafIcon,
+		CalendarIcon
 	} from '@lucide/svelte';
 	import FilePreview from './FilePreview.svelte';
 
@@ -46,6 +50,11 @@
 	let aiDescription: DirectoryDescription | null = $state(null);
 	let isLoadingDescription = $state(false);
 	let lastDescribedPath: string | null = $state(null);
+
+	// Directory date stats state
+	let dirDateStats: DirDateStats | null = $state(null);
+	let isLoadingDateStats = $state(false);
+	let lastDateStatsPath: string | null = $state(null);
 
 	// Determine which item to display: selected takes priority, then hovered
 	let displayItem = $derived($selectedItem ?? $hoveredItem);
@@ -85,12 +94,39 @@
 		}
 	});
 
+	// Fetch date stats when a directory is selected
+	$effect(() => {
+		const item = $selectedItem;
+		if (item && item.type === 'directory' && item.path !== lastDateStatsPath) {
+			lastDateStatsPath = item.path;
+			isLoadingDateStats = true;
+			dirDateStats = null;
+			queryDirDateStats(item.path).then((result) => {
+				if (lastDateStatsPath === item.path) {
+					dirDateStats = result;
+					isLoadingDateStats = false;
+				}
+			});
+		} else if (!item || item.type !== 'directory') {
+			dirDateStats = null;
+			isLoadingDateStats = false;
+			lastDateStatsPath = null;
+		}
+	});
+
 	// thumbnailjs handles all file types — native previews for images/pdf/video/svg,
 	// graceful fallback icons for everything else
 	let supportsPreview = $derived(() => {
 		if (!displayItem || displayItem.type === 'directory') return false;
 		return true;
 	});
+
+	function formatCO2(bytes: number): string {
+		const grams = (bytes / 1024 ** 3) * 11.6;
+		if (grams >= 1000) return `${(grams / 1000).toFixed(2)} kg CO₂eq/year`;
+		if (grams < 0.01) return `${(grams * 1000).toFixed(2)} mg CO₂eq/year`;
+		return `${grams.toFixed(2)} g CO₂eq/year`;
+	}
 
 	// Format a unix timestamp (seconds) into a human-readable date
 	function formatDate(timestamp: number | undefined): string | null {
@@ -347,6 +383,13 @@
 							{/if}
 						</span>
 
+						<!-- CO₂ -->
+						<div class="flex items-center gap-2 text-muted-foreground">
+							<LeafIcon class="h-3.5 w-3.5" />
+							<span>CO₂</span>
+						</div>
+						<span class="font-medium text-foreground">{formatCO2(displayItem.size)}</span>
+
 						{#if displayItem.type === 'directory'}
 							<!-- File count -->
 							<div class="flex items-center gap-2 text-muted-foreground">
@@ -365,6 +408,32 @@
 							<span class="font-medium text-foreground">
 								{displayItem.dirCount?.toLocaleString() ?? 0}
 							</span>
+
+							<!-- Date stats -->
+							{#if isLoadingDateStats}
+								<div class="col-span-2 flex items-center gap-2 text-sm text-muted-foreground">
+									<LoaderCircleIcon class="h-3.5 w-3.5 animate-spin" />
+									<span>Computing date statistics…</span>
+								</div>
+							{:else if dirDateStats && dirDateStats.count > 0}
+								<div class="flex items-center gap-2 text-muted-foreground">
+									<CalendarIcon class="h-3.5 w-3.5" />
+									<span>Oldest file</span>
+								</div>
+								<span class="font-medium text-foreground">{formatDate(dirDateStats.min ?? undefined) ?? '—'}</span>
+
+								<div class="flex items-center gap-2 text-muted-foreground">
+									<CalendarIcon class="h-3.5 w-3.5" />
+									<span>Newest file</span>
+								</div>
+								<span class="font-medium text-foreground">{formatDate(dirDateStats.max ?? undefined) ?? '—'}</span>
+
+								<div class="flex items-center gap-2 text-muted-foreground">
+									<CalendarIcon class="h-3.5 w-3.5" />
+									<span>Median date</span>
+								</div>
+								<span class="font-medium text-foreground">{formatDate(dirDateStats.median ?? undefined) ?? '—'}</span>
+							{/if}
 						{/if}
 
 						{#if displayItem.type === 'file'}

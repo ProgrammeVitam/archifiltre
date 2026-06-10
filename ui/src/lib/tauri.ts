@@ -443,6 +443,33 @@ export async function queryDirectoryDescription(
 	}
 }
 
+/** Date statistics for all descendant files of a directory */
+export interface DirDateStats {
+	min: number | null;
+	max: number | null;
+	median: number | null;
+	count: number;
+}
+
+/**
+ * Get min, max, and median mtime across all descendant files of a directory.
+ * Requires an active query session.
+ */
+export async function queryDirDateStats(dirPath: string): Promise<DirDateStats | null> {
+	const response = await sendQuery({
+		id: `get_dir_date_stats_${Date.now()}`,
+		action: 'get_dir_date_stats',
+		path: dirPath
+	});
+
+	if (!response.ok) {
+		console.error('Failed to get dir date stats:', response.error);
+		return null;
+	}
+
+	return response.data as DirDateStats;
+}
+
 // ================================
 // Thumbnail Cache Types & Helpers
 // ================================
