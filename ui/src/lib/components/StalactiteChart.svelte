@@ -6,13 +6,13 @@
 		buildTreeHierarchy,
 		getChildren,
 		getRootDirectories,
-		getColorForPath,
 		queryFiles,
 		type DirectoryNode,
 		type TreeData,
 		type FileNode
 	} from '$lib/tauri';
 	import { selectDirectory, selectFile, hoverDirectory, hoverFile, clearHoveredItem } from '$lib/stores';
+	import { getFileType } from '$lib/file-types';
 
 	// ================================
 	// Types
@@ -28,6 +28,22 @@
 		color: string;
 		opacity: number;
 		depth: number;
+	}
+
+	interface ColorPalette {
+		folder: string;
+		document: string;
+		image: string;
+		video: string;
+		spreadsheet: string;
+		presentation: string;
+		publication: string;
+		email: string;
+		audio: string;
+		compressed: string;
+		other: string;
+		dateOldest: string;
+		dateNewest: string;
 	}
 
 	// ================================
@@ -56,6 +72,9 @@
 	// Computed height based on content
 	let contentHeight = $state(0);
 	let maxDepth = $state(0);
+
+	// Color mode
+	let colorMode: 'type' | 'date' = $state('type');
 
 	// Hover state
 	let hoveredRect: LayoutRect | null = $state(null);
@@ -127,6 +146,99 @@
 		});
 
 		resizeObserver.observe(container);
+	}
+
+	// ================================
+	// Color Utilities
+	// ================================
+
+	function resolveColors(): ColorPalette {
+		const s = getComputedStyle(document.documentElement);
+		const v = (name: string) => s.getPropertyValue(name).trim();
+		return {
+			folder: v('--color-type-folder'),
+			document: v('--color-type-document'),
+			image: v('--color-type-image'),
+			video: v('--color-type-video'),
+			spreadsheet: v('--color-type-spreadsheet'),
+			presentation: v('--color-type-presentation'),
+			publication: v('--color-type-publication'),
+			email: v('--color-type-email'),
+			audio: v('--color-type-audio'),
+			compressed: v('--color-type-compressed'),
+			other: v('--color-type-other'),
+			dateOldest: v('--color-date-oldest'),
+			dateNewest: v('--color-date-newest')
+		};
+	}
+
+	function computeMtimeRange(): [number, number] {
+		let min = Infinity;
+		let max = -Infinity;
+		for (const files of filesCache.values()) {
+			for (const f of files) {
+				if (f.mtime < min) min = f.mtime;
+				if (f.mtime > max) max = f.mtime;
+			}
+		}
+		return [min === Infinity ? 0 : min, max === -Infinity ? 0 : max];
+	}
+
+	function hexToRgb(hex: string): [number, number, number] {
+		const n = parseInt(hex.replace('#', ''), 16);
+		return [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff];
+	}
+
+	function interpolateHex(t: number, from: string, to: string): string {
+		const [r1, g1, b1] = hexToRgb(from);
+		const [r2, g2, b2] = hexToRgb(to);
+		return `rgb(${Math.round(r1 + (r2 - r1) * t)}, ${Math.round(g1 + (g2 - g1) * t)}, ${Math.round(b1 + (b2 - b1) * t)})`;
+	}
+
+	type PaletteTypeKey = keyof Omit<ColorPalette, 'dateOldest' | 'dateNewest'>;
+
+	function getTypeColorFor(filename: string, palette: ColorPalette): string {
+		const type = getFileType(filename) as PaletteTypeKey;
+		return palette[type];
+	}
+
+	function getDateColor(mtime: number, min: number, max: number, palette: ColorPalette): string {
+		if (min === max) return palette.other;
+		const t = Math.max(0, Math.min(1, (mtime - min) / (max - min)));
+		return interpolateHex(t, palette.dateOldest, palette.dateNewest);
+	}
+
+	function getNodeColor(
+		file: FileNode | null,
+		dir: DirectoryNode | null,
+		palette: ColorPalette,
+		minMtime: number,
+		maxMtime: number
+	): string {
+		if (dir !== null) return palette.folder;
+		if (file === null) return palette.other;
+		if (colorMode === 'date') return getDateColor(file.mtime, minMtime, maxMtime, palette);
+		return getTypeColorFor(file.name, palette);
+	}
+
+	function lightenColor(color: string, amount: number): string {
+		if (color.startsWith('#')) {
+			const num = parseInt(color.slice(1), 16);
+			const r = Math.min(255, ((num >> 16) & 0xff) + Math.round(255 * amount));
+			const g = Math.min(255, ((num >> 8) & 0xff) + Math.round(255 * amount));
+			const b = Math.min(255, (num & 0xff) + Math.round(255 * amount));
+			return `rgb(${r}, ${g}, ${b})`;
+		}
+		if (color.startsWith('rgb')) {
+			const m = color.match(/rgb\((\d+),\s*(\d+),\s*(\d+)\)/);
+			if (m) {
+				const r = Math.min(255, parseInt(m[1]) + Math.round(255 * amount));
+				const g = Math.min(255, parseInt(m[2]) + Math.round(255 * amount));
+				const b = Math.min(255, parseInt(m[3]) + Math.round(255 * amount));
+				return `rgb(${r}, ${g}, ${b})`;
+			}
+		}
+		return color;
 	}
 
 	// ================================
@@ -230,11 +342,14 @@
 			return;
 		}
 
+		const palette = resolveColors();
+		const [minMtime, maxMtime] = computeMtimeRange();
+
 		// If no directories, layout root files instead
 		if (data.directories.length === 0) {
 			const rootFilesList = filesCache.get('') || [];
 			if (rootFilesList.length > 0) {
-				computeFilesOnlyLayout(rootFilesList);
+				computeFilesOnlyLayout(rootFilesList, palette, minMtime, maxMtime);
 			} else {
 				layoutRects = [];
 				maxDepth = 0;
@@ -311,7 +426,7 @@
 						y,
 						width: nodeWidth - PADDING,
 						height: ROW_HEIGHT - PADDING,
-						color: getColorForPath(dir.path, true),
+						color: getNodeColor(null, dir, palette, minMtime, maxMtime),
 						opacity: 1,
 						depth: levelIndex
 					});
@@ -339,7 +454,7 @@
 						y,
 						width: fileWidth - PADDING,
 						height: ROW_HEIGHT - PADDING,
-						color: getColorForFile(file),
+						color: getNodeColor(file, null, palette, minMtime, maxMtime),
 						opacity: 1,
 						depth: levelIndex
 					});
@@ -354,7 +469,12 @@
 		maxDepth = currentMaxDepth;
 	}
 
-	function computeFilesOnlyLayout(files: FileNode[]) {
+	function computeFilesOnlyLayout(
+		files: FileNode[],
+		palette: ColorPalette,
+		minMtime: number,
+		maxMtime: number
+	) {
 		const dpr = window.devicePixelRatio || 1;
 		const viewWidth = canvasWidth / dpr;
 		const viewHeight = canvasHeight / dpr;
@@ -387,7 +507,7 @@
 					y: 0,
 					width: fileWidth - PADDING,
 					height: ROW_HEIGHT - PADDING,
-					color: getColorForFile(file),
+					color: getNodeColor(file, null, palette, minMtime, maxMtime),
 					opacity: 1,
 					depth: 0
 				});
@@ -399,40 +519,11 @@
 		layoutRects = rects;
 	}
 
-	function getColorForFile(file: FileNode): string {
-		// Get file extension for color coding
-		const ext = file.name.includes('.') ? file.name.split('.').pop()?.toLowerCase() || '' : '';
-
-		// Color by file type
-		const colorMap: Record<string, string> = {
-			// Documents
-			pdf: 'hsl(0, 70%, 50%)',
-			doc: 'hsl(210, 70%, 50%)',
-			docx: 'hsl(210, 70%, 50%)',
-			xls: 'hsl(120, 70%, 40%)',
-			xlsx: 'hsl(120, 70%, 40%)',
-			ppt: 'hsl(30, 70%, 50%)',
-			pptx: 'hsl(30, 70%, 50%)',
-			txt: 'hsl(0, 0%, 50%)',
-			// Images
-			jpg: 'hsl(280, 60%, 50%)',
-			jpeg: 'hsl(280, 60%, 50%)',
-			png: 'hsl(280, 60%, 55%)',
-			gif: 'hsl(280, 60%, 45%)',
-			svg: 'hsl(280, 60%, 60%)',
-			// Code
-			js: 'hsl(50, 70%, 50%)',
-			ts: 'hsl(210, 70%, 55%)',
-			py: 'hsl(210, 50%, 45%)',
-			rs: 'hsl(25, 70%, 50%)',
-			// Archives
-			zip: 'hsl(45, 60%, 45%)',
-			tar: 'hsl(45, 60%, 40%)',
-			gz: 'hsl(45, 60%, 42%)',
-			'7z': 'hsl(45, 60%, 48%)'
-		};
-
-		return colorMap[ext] || 'hsl(200, 40%, 50%)';
+	function setColorMode(mode: 'type' | 'date') {
+		colorMode = mode;
+		computeLayout();
+		updateCanvasHeight();
+		render();
 	}
 
 	// ================================
@@ -525,28 +616,6 @@
 		ctx.restore();
 	}
 
-	function lightenColor(color: string, amount: number): string {
-		// Handle HSL colors
-		if (color.startsWith('hsl')) {
-			const match = color.match(/hsl\((\d+),\s*(\d+)%,\s*(\d+)%\)/);
-			if (match) {
-				const h = parseInt(match[1]);
-				const s = parseInt(match[2]);
-				const l = Math.min(100, parseInt(match[3]) + amount * 100);
-				return `hsl(${h}, ${s}%, ${l}%)`;
-			}
-		}
-		// Handle hex colors
-		if (color.startsWith('#')) {
-			const num = parseInt(color.slice(1), 16);
-			const r = Math.min(255, ((num >> 16) & 0xff) + Math.round(255 * amount));
-			const g = Math.min(255, ((num >> 8) & 0xff) + Math.round(255 * amount));
-			const b = Math.min(255, (num & 0xff) + Math.round(255 * amount));
-			return `rgb(${r}, ${g}, ${b})`;
-		}
-		return color;
-	}
-
 	// ================================
 	// Hit Testing
 	// ================================
@@ -624,16 +693,32 @@
 	}
 </script>
 
-<div class="w-full {className}" bind:this={container}>
-	<!-- Canvas -->
-	<div class="relative w-full">
-		<canvas
-			bind:this={canvas}
-			onmousemove={handleMouseMove}
-			onmouseleave={handleMouseLeave}
-			onclick={handleClick}
-			class="block w-full cursor-pointer"
-			style="height: {contentHeight}px;"
-		></canvas>
+<div class="w-full {className}">
+	<!-- Color mode toggle -->
+	<div class="flex justify-end px-2 pb-1">
+		<div class="flex items-center gap-0.5 rounded-lg bg-muted p-[3px]">
+			<button
+				class="cursor-pointer rounded-md border-none px-2.5 py-[5px] text-xs font-medium transition-all {colorMode === 'type' ? 'bg-background text-foreground shadow-sm' : 'bg-transparent text-muted-foreground'}"
+				onclick={() => setColorMode('type')}
+			>Type</button>
+			<button
+				class="cursor-pointer rounded-md border-none px-2.5 py-[5px] text-xs font-medium transition-all {colorMode === 'date' ? 'bg-background text-foreground shadow-sm' : 'bg-transparent text-muted-foreground'}"
+				onclick={() => setColorMode('date')}
+			>Date</button>
+		</div>
+	</div>
+
+	<!-- Chart container -->
+	<div bind:this={container} class="w-full">
+		<div class="relative w-full">
+			<canvas
+				bind:this={canvas}
+				onmousemove={handleMouseMove}
+				onmouseleave={handleMouseLeave}
+				onclick={handleClick}
+				class="block w-full cursor-pointer"
+				style="height: {contentHeight}px;"
+			></canvas>
+		</div>
 	</div>
 </div>

@@ -38,6 +38,23 @@
 	--sidebar-border: oklch(0.929 0.013 255.508);
 	--sidebar-ring: oklch(0.704 0.04 256.788);
 
+	/* Visualization: file type colors */
+	--color-type-folder: #facc15;
+	--color-type-document: #3b82f6;
+	--color-type-image: #a78bfa;
+	--color-type-video: #7e22ce;
+	--color-type-spreadsheet: #22c55e;
+	--color-type-presentation: #f97316;
+	--color-type-publication: #b91c1c;
+	--color-type-email: #22d3ee;
+	--color-type-audio: #d946ef;
+	--color-type-compressed: #52525b;
+	--color-type-other: #94a3b8;
+
+	/* Visualization: date gradient endpoints */
+	--color-date-oldest: #145682;
+	--color-date-newest: #ffd89b;
+
 	/* Window styling */
 	--window-radius: 12px;
 	--window-shadow: 0 12px 20px rgba(0, 0, 0, 0.25), 0 6px 10px rgba(0, 0, 0, 0.15);
