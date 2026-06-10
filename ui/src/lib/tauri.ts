@@ -614,6 +614,7 @@ export interface ExportOptions {
 	jobId?: string;
 	fullPaths?: boolean;
 	dbName?: string;
+	deletionOnly?: boolean;
 }
 
 /**
@@ -628,11 +629,11 @@ export async function exportCsv(options: ExportOptions): Promise<CommandResult> 
  * Open a save file dialog for CSV export.
  * Returns the selected file path or null if cancelled.
  */
-export async function selectExportPath(): Promise<string | null> {
+export async function selectExportPath(type: string = 'export'): Promise<string | null> {
 	const { save } = await import('@tauri-apps/plugin-dialog');
 	const result = await save({
 		title: 'Export scan results',
-		defaultPath: `archifiltre-export-${Date.now()}.csv`,
+		defaultPath: `archifiltre-${type}-${Date.now()}.csv`,
 		filters: [{ name: 'CSV', extensions: ['csv'] }]
 	});
 	return result;

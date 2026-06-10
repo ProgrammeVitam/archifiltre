@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { DropdownMenu } from 'bits-ui';
-	import { activeScan } from '$lib/stores';
+	import { activeScan, deleteTags } from '$lib/stores';
 	import { extensionRegistry, type ExportMenuItem } from '$lib/extensions/registry';
 	import { exportCsv, selectExportPath, generateId } from '$lib/tauri';
 	import { jobsStore } from '$lib/jobs';
@@ -17,18 +17,39 @@
 		exportCsv({ outputPath, jobId, dbName: scan.dbName, fullPaths: true });
 	}
 
-	let builtinItem: ExportMenuItem = {
-		id: 'csv-export',
-		label: 'Export as CSV',
-		action: handleCsvExport
-	};
+	async function handleDeletionManifestExport(): Promise<void> {
+		const scan = $activeScan;
+		if (!scan) return;
+
+		const outputPath = await selectExportPath('bordereau-elimination');
+		if (!outputPath) return;
+
+		const jobId = generateId();
+		exportCsv({ outputPath, jobId, dbName: scan.dbName, fullPaths: true, deletionOnly: true });
+	}
+
+	let hasDeletionTags = $derived($deleteTags.size > 0);
+
+	let builtinItems: ExportMenuItem[] = $derived([
+		{
+			id: 'csv-export',
+			label: 'Export as CSV',
+			action: handleCsvExport
+		},
+		{
+			id: 'deletion-manifest',
+			label: 'Deletion manifest (CSV)',
+			action: handleDeletionManifestExport,
+			disabled: !hasDeletionTags
+		}
+	]);
 
 	let extensionItems = $derived(
 		$extensionRegistry.extensions
 			.filter((e) => $extensionRegistry.enabledIds.has(e.id))
 			.flatMap((e) => e.exportMenuItems ?? [])
 	);
-	let allItems = $derived([builtinItem, ...extensionItems]);
+	let allItems = $derived([...builtinItems, ...extensionItems]);
 </script>
 
 <DropdownMenu.Root>
@@ -54,8 +75,9 @@
 		>
 			{#each allItems as item (item.id)}
 				<DropdownMenu.Item
-					class="block w-full cursor-pointer rounded-md border-none bg-transparent px-2.5 py-1.5 text-left text-xs text-popover-foreground/80 transition-colors hover:bg-accent hover:text-accent-foreground data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground"
+					class="block w-full cursor-pointer rounded-md border-none bg-transparent px-2.5 py-1.5 text-left text-xs text-popover-foreground/80 transition-colors hover:bg-accent hover:text-accent-foreground data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-40"
 					onclick={item.action}
+					disabled={item.disabled}
 				>
 					{item.label}
 				</DropdownMenu.Item>

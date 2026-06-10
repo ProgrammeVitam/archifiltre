@@ -68,6 +68,8 @@ pub struct ExportOptions {
     #[serde(default)]
     pub full_paths: bool,
     pub db_name: Option<String>,
+    #[serde(default)]
+    pub deletion_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,6 +497,9 @@ async fn export_csv(
     ];
     if options.full_paths {
         args.push("--full-paths".to_string());
+    }
+    if options.deletion_only {
+        args.push("--deletion-only".to_string());
     }
     if let Some(ref db) = options.db_name {
         args.push("--db".to_string());

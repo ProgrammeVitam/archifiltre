@@ -9,6 +9,7 @@ export interface ExportMenuItem {
 	label: string;
 	icon?: string;
 	action: () => Promise<void>;
+	disabled?: boolean;
 }
 
 export interface UIExtension {

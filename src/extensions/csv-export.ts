@@ -417,6 +417,7 @@ interface CsvExportOptions {
   batchSize?: number;
   populatedChecksums?: ChecksumColumn[]; // Which checksum columns have data
   hasDeleteTags?: boolean; // Whether delete tags exist for this run
+  deletionOnly?: boolean; // Only emit rows tagged for deletion (no tagged_for_deletion column)
 }
 
 /**
@@ -440,6 +441,7 @@ export function exportToCsv(
     batchSize = 5000,
     populatedChecksums = [],
     hasDeleteTags = false,
+    deletionOnly = false,
   } = options;
 
   let fileHandle: FileHandle | null = null;
@@ -451,10 +453,14 @@ export function exportToCsv(
       batchSize,
       checksumColumns: populatedChecksums.join(', '),
       hasDeleteTags,
+      deletionOnly,
     });
 
-    // Load delete tag paths if the extension has been used
-    const deleteTagsPromise: Promise<Set<string>> = hasDeleteTags
+    // Load delete tag paths when needed (full export with tag column, or deletion-only export)
+    const shouldLoadDeleteTags = hasDeleteTags || deletionOnly;
+    const includeDeleteTagColumn = hasDeleteTags && !deletionOnly;
+
+    const deleteTagsPromise: Promise<Set<string>> = shouldLoadDeleteTags
       ? database.pg
           .query<{ path: string }>(`SELECT path FROM delete_tags WHERE run_id = $1`, [runId])
           .then(result => new Set(result.rows.map(r => r.path)))
@@ -467,10 +473,10 @@ export function exportToCsv(
           tap(handle => {
             fileHandle = handle;
           }),
-          // Write header (with only populated checksum columns + delete tag column)
+          // Write header (no tagged_for_deletion column in deletion-only mode)
           concatMap(handle =>
             from(
-              handle.write(`${getCsvHeader(delimiter, populatedChecksums, hasDeleteTags)}\n`)
+              handle.write(`${getCsvHeader(delimiter, populatedChecksums, includeDeleteTagColumn)}\n`)
             ).pipe(map(() => handle))
           ),
           // Start streaming batches with JOIN (only if checksums exist)
@@ -482,7 +488,9 @@ export function exportToCsv(
               populatedChecksums.length > 0
             ).pipe(
               pausable(context),
-              // Format batch to CSV lines (with only populated checksum columns + delete tags)
+              // In deletion-only mode, keep only rows whose path is tagged
+              map(batch => deletionOnly ? batch.filter(f => deleteTagPaths.has(f.path)) : batch),
+              // Format batch to CSV lines
               map(batch =>
                 batch.map(file =>
                   formatCsvRow(
@@ -490,7 +498,7 @@ export function exportToCsv(
                     delimiter,
                     populatedChecksums,
                     rootPath,
-                    hasDeleteTags ? deleteTagPaths : undefined
+                    includeDeleteTagColumn ? deleteTagPaths : undefined
                   )
                 )
               ),
@@ -552,6 +560,10 @@ class ExportCommand extends BaseCommand {
       description: 'Export full absolute paths instead of relative paths',
       default: false,
     }),
+    'deletion-only': Flags.boolean({
+      description: 'Export only items tagged for deletion (bordereau d\'élimination)',
+      default: false,
+    }),
     db: Flags.string({
       description: 'Database name to export from',
       default: 'main',
@@ -568,7 +580,8 @@ class ExportCommand extends BaseCommand {
     const { args, flags } = await this.parse(ExportCommand);
 
     const config = this.config as typeof this.config & { originalCwd: string };
-    const outputPath = args.output || generateExportFilename({ type: 'export', extension: 'csv' });
+    const fileType = flags['deletion-only'] ? 'bordereau-elimination' : 'export';
+    const outputPath = args.output || generateExportFilename({ type: fileType, extension: 'csv' });
     const resolvedOutput = path.resolve(config.originalCwd, outputPath);
     await ensureDirectory(path.dirname(resolvedOutput));
     this._resolvedOutput = resolvedOutput;
@@ -594,6 +607,7 @@ class ExportCommand extends BaseCommand {
   async runJob(context: JobContext): Promise<void> {
     const { flags } = await this.parse(ExportCommand);
     const fullPaths = flags['full-paths'];
+    const deletionOnly = flags['deletion-only'];
 
     ux.action.start('Detecting checksum columns');
     const populatedChecksums = await getPopulatedChecksumColumns(context.database, context.runId);
@@ -609,6 +623,7 @@ class ExportCommand extends BaseCommand {
     const totalFiles = await exportToCsv(exportContext, this._resolvedOutput, {
       populatedChecksums,
       hasDeleteTags,
+      deletionOnly,
     }).toPromise();
 
     ux.action.stop(`${totalFiles?.toLocaleString() ?? 0} files`);
