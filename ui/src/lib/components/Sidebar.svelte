@@ -11,6 +11,7 @@
 		Trash2 as Trash2Icon
 	} from '@lucide/svelte';
 	import ArchifiltreLogo from './ArchifiltreLogo.svelte';
+	import SettingsDialog from './SettingsDialog.svelte';
 
 	// Props
 	let {
@@ -97,9 +98,12 @@
 			<span class="sidebar-logo-text">Archifiltre</span>
 			<span class="sidebar-version">v5</span>
 		</div>
-		<button class="toggle-btn" onclick={toggleCollapsed} title="Close sidebar (Ctrl+B)">
-			<PanelLeftCloseIcon size={18} />
-		</button>
+		<div class="flex items-center gap-0.5">
+			<SettingsDialog />
+			<button class="toggle-btn" onclick={toggleCollapsed} title="Close sidebar (Ctrl+B)">
+				<PanelLeftCloseIcon size={18} />
+			</button>
+		</div>
 	</div>
 
 	<!-- Scans Section Header -->

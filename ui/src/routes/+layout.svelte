@@ -25,6 +25,14 @@
 	} from '@lucide/svelte';
 	import ExportDropdown from '$lib/components/ExportDropdown.svelte';
 	import BackgroundJobsPanel from '$lib/components/BackgroundJobsPanel.svelte';
+	import { extensionRegistry } from '$lib/extensions/registry';
+
+	const BUNDLED_EXTENSIONS = [
+		{ id: 'checksum', name: 'Checksum', description: 'Computes cryptographic checksums for scanned files' },
+		{ id: 'ai-describe', name: 'AI Describe', description: 'Generates LLM-powered descriptions for directories' },
+		{ id: 'file-thumbnails', name: 'File Thumbnails', description: 'Stores browser-generated thumbnails for files' },
+		{ id: 'delete-tags', name: 'Delete Tags', description: 'Marks files and directories for deletion' }
+	];
 
 	let { children } = $props();
 
@@ -102,6 +110,10 @@
 	}
 
 	onMount(() => {
+		for (const ext of BUNDLED_EXTENSIONS) {
+			extensionRegistry.register(ext);
+		}
+
 		const handleKeydown = (e: KeyboardEvent) => {
 			// Dev tools toggle: Ctrl+Shift+P
 			if (e.ctrlKey && e.shiftKey && e.key === 'P') {
@@ -139,7 +151,7 @@
 <!-- Window container - padding and shadow only on Linux -->
 <div class="window-container" class:window-container-linux={isLinux}>
 	<!-- Main app container with rounded corners -->
-	<div class="window-frame" class:window-frame-linux={isLinux}>
+	<div id="app-window" class="window-frame" class:window-frame-linux={isLinux}>
 		<!-- Resize handles - only needed on Linux where we have CSS shadows with padding -->
 		{#if isLinux}
 			<div

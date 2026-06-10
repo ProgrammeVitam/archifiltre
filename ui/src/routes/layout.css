@@ -169,7 +169,8 @@
 	background-color: transparent;
 	border-radius: var(--window-radius);
 	overflow: hidden;
-	border: 1px solid var(--border);
+	outline: 1px solid var(--border);
+	outline-color: var(--border);
 	position: relative;
 }
 
