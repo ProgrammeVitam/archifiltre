@@ -35,6 +35,7 @@ import {
   type FileSelect,
 } from '@lib/database.ts';
 import { fileChecksums } from '@extensions/checksum/schema.ts';
+import { ensureEnrichmentTables } from '@extensions/enrichment/index.ts';
 import type { PipelineContext } from '@lib/pipeline-context.ts';
 import { pausable } from '@lib/pausable.ts';
 import { BaseCommand } from '@lib/base-command.ts';
@@ -84,7 +85,8 @@ type ChecksumColumn = (typeof CHECKSUM_COLUMNS)[number];
  */
 function buildCsvColumns(
   populatedChecksums: ChecksumColumn[],
-  hasDeleteTags: boolean = false
+  hasDeleteTags: boolean = false,
+  enrichment?: EnrichmentExportData
 ): string[] {
   const columns: string[] = [
     ...BASE_COLUMNS_BEFORE_CHECKSUMS,
@@ -94,6 +96,10 @@ function buildCsvColumns(
   if (hasDeleteTags) {
     columns.push('tagged_for_deletion');
   }
+  const { includeAlias, includeComment, tagNames } = enrichmentColumnPlan(enrichment);
+  if (includeAlias) columns.push('newName');
+  if (includeComment) columns.push('description');
+  columns.push(...tagNames);
   return columns;
 }
 
@@ -103,9 +109,10 @@ function buildCsvColumns(
 function getCsvHeader(
   delimiter: string,
   populatedChecksums: ChecksumColumn[],
-  hasDeleteTags: boolean = false
+  hasDeleteTags: boolean = false,
+  enrichment?: EnrichmentExportData
 ): string {
-  return buildCsvColumns(populatedChecksums, hasDeleteTags).join(delimiter);
+  return buildCsvColumns(populatedChecksums, hasDeleteTags, enrichment).join(delimiter);
 }
 
 /**
@@ -148,7 +155,8 @@ function formatCsvRow(
   delimiter: string,
   populatedChecksums: ChecksumColumn[],
   rootPath?: string,
-  deleteTagPaths?: Set<string>
+  deleteTagPaths?: Set<string>,
+  enrichment?: EnrichmentExportData
 ): string {
   const filePath = rootPath ? path.join(rootPath, file.path) : file.path;
 
@@ -175,6 +183,18 @@ function formatCsvRow(
 
   if (deleteTagPaths) {
     values.push(deleteTagPaths.has(file.path) ? true : '');
+  }
+
+  // Enrichment columns (must match buildCsvColumns order: newName, description,
+  // then one column per tag name).
+  const { includeAlias, includeComment, tagNames } = enrichmentColumnPlan(enrichment);
+  if (includeAlias) values.push(enrichment?.aliases.get(file.path) ?? '');
+  if (includeComment) values.push(enrichment?.comments.get(file.path) ?? '');
+  if (tagNames.length > 0) {
+    const assigned = enrichment?.tagsByPath.get(file.path);
+    for (const name of tagNames) {
+      values.push(assigned?.has(name) ? true : '');
+    }
   }
 
   return values.map(v => escapeCsvValue(v, delimiter)).join(delimiter);
@@ -251,6 +271,92 @@ async function hasDeleteTagsForRun(
     }
     throw error;
   }
+}
+
+// === Enrichment Columns ===
+
+/**
+ * User-applied enrichment for a run, loaded once for an export.
+ * Small, user-authored data, so loading it into maps for the duration of the
+ * export is appropriate (PGlite remains the source of truth).
+ */
+interface EnrichmentExportData {
+  /** path -> alias (exported as the `newName` column) */
+  aliases: Map<string, string>;
+  /** path -> comment (exported as the `description` column) */
+  comments: Map<string, string>;
+  /** distinct tag names, sorted — one CSV column each */
+  tagNames: string[];
+  /** path -> set of tag names assigned to it */
+  tagsByPath: Map<string, Set<string>>;
+}
+
+/**
+ * Load all enrichment for a run. The enrichment tables are ensured to exist by
+ * the export command's openDatabase, so no missing-table handling is needed.
+ */
+async function loadEnrichmentForExport(
+  connection: DatabaseConnection,
+  runId: string
+): Promise<EnrichmentExportData> {
+  const [aliasRes, commentRes, tagRes, assignRes] = await Promise.all([
+    connection.pg.query<{ path: string; alias: string }>(
+      `SELECT path, alias FROM aliases WHERE run_id = $1`,
+      [runId]
+    ),
+    connection.pg.query<{ path: string; comment: string }>(
+      `SELECT path, comment FROM comments WHERE run_id = $1`,
+      [runId]
+    ),
+    connection.pg.query<{ tag_id: string; name: string }>(
+      `SELECT tag_id, name FROM tags WHERE run_id = $1`,
+      [runId]
+    ),
+    connection.pg.query<{ tag_id: string; path: string }>(
+      `SELECT tag_id, path FROM tag_assignments WHERE run_id = $1`,
+      [runId]
+    ),
+  ]);
+
+  const tagIdToName = new Map(tagRes.rows.map(r => [r.tag_id, r.name]));
+  const tagNames = [...new Set(tagIdToName.values())].sort((a, b) => a.localeCompare(b));
+
+  const tagsByPath = new Map<string, Set<string>>();
+  for (const row of assignRes.rows) {
+    const name = tagIdToName.get(row.tag_id);
+    if (!name) continue;
+    let set = tagsByPath.get(row.path);
+    if (!set) {
+      set = new Set<string>();
+      tagsByPath.set(row.path, set);
+    }
+    set.add(name);
+  }
+
+  return {
+    aliases: new Map(aliasRes.rows.map(r => [r.path, r.alias])),
+    comments: new Map(commentRes.rows.map(r => [r.path, r.comment])),
+    tagNames,
+    tagsByPath,
+  };
+}
+
+/**
+ * Which enrichment columns to emit. Mirrors the "dynamic column only when
+ * populated" rule used for checksums and the delete tag: alias/comment columns
+ * appear only if any exist, and there is one column per existing tag.
+ */
+function enrichmentColumnPlan(enrichment?: EnrichmentExportData): {
+  includeAlias: boolean;
+  includeComment: boolean;
+  tagNames: string[];
+} {
+  if (!enrichment) return { includeAlias: false, includeComment: false, tagNames: [] };
+  return {
+    includeAlias: enrichment.aliases.size > 0,
+    includeComment: enrichment.comments.size > 0,
+    tagNames: enrichment.tagNames,
+  };
 }
 
 // === Batched Query with JOIN ===
@@ -418,6 +524,7 @@ interface CsvExportOptions {
   populatedChecksums?: ChecksumColumn[]; // Which checksum columns have data
   hasDeleteTags?: boolean; // Whether delete tags exist for this run
   deletionOnly?: boolean; // Only emit rows tagged for deletion (no tagged_for_deletion column)
+  enrichment?: EnrichmentExportData; // Aliases, comments and tags to append as columns
 }
 
 /**
@@ -442,6 +549,7 @@ export function exportToCsv(
     populatedChecksums = [],
     hasDeleteTags = false,
     deletionOnly = false,
+    enrichment,
   } = options;
 
   let fileHandle: FileHandle | null = null;
@@ -476,7 +584,9 @@ export function exportToCsv(
           // Write header (no tagged_for_deletion column in deletion-only mode)
           concatMap(handle =>
             from(
-              handle.write(`${getCsvHeader(delimiter, populatedChecksums, includeDeleteTagColumn)}\n`)
+              handle.write(
+                `${getCsvHeader(delimiter, populatedChecksums, includeDeleteTagColumn, enrichment)}\n`
+              )
             ).pipe(map(() => handle))
           ),
           // Start streaming batches with JOIN (only if checksums exist)
@@ -498,7 +608,8 @@ export function exportToCsv(
                     delimiter,
                     populatedChecksums,
                     rootPath,
-                    includeDeleteTagColumn ? deleteTagPaths : undefined
+                    includeDeleteTagColumn ? deleteTagPaths : undefined,
+                    enrichment
                   )
                 )
               ),
@@ -588,6 +699,10 @@ class ExportCommand extends BaseCommand {
 
     const db = await createScanDatabase(flags.db);
 
+    // Ensure enrichment tables exist so enrichment loading/joins are safe even
+    // for scans that were never opened in the UI.
+    await ensureEnrichmentTables(db);
+
     const runId = await getLatestRunId(db).toPromise();
     if (!runId) {
       this.error(
@@ -617,6 +732,15 @@ class ExportCommand extends BaseCommand {
     const hasDeleteTags = await hasDeleteTagsForRun(context.database, context.runId);
     ux.action.stop(hasDeleteTags ? 'yes' : 'none');
 
+    ux.action.start('Loading enrichment');
+    const enrichment = await loadEnrichmentForExport(context.database, context.runId);
+    const tagColumnCount = enrichment.tagNames.length;
+    ux.action.stop(
+      enrichment.aliases.size > 0 || enrichment.comments.size > 0 || tagColumnCount > 0
+        ? `${enrichment.aliases.size} aliases, ${enrichment.comments.size} comments, ${tagColumnCount} tags`
+        : 'none'
+    );
+
     ux.action.start(`Exporting to ${this._resolvedOutput}`);
 
     const exportContext = fullPaths ? context : { ...context, rootPath: '' };
@@ -624,6 +748,7 @@ class ExportCommand extends BaseCommand {
       populatedChecksums,
       hasDeleteTags,
       deletionOnly,
+      enrichment,
     }).toPromise();
 
     ux.action.stop(`${totalFiles?.toLocaleString() ?? 0} files`);

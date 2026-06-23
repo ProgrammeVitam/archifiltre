@@ -201,4 +201,79 @@ describe('exportToCsv', () => {
     expect(calls.every(c => c.phase === 'export')).toBe(true);
     expect(calls[calls.length - 1].processed).toBeGreaterThan(0);
   });
+
+  it('appends newName, description and per-tag columns from enrichment', async () => {
+    const outFile = path.join(outDir, 'enriched.csv');
+
+    // Enrichment keyed by relative path (rootPath is ''). alpha has an alias, a
+    // comma-containing comment and the "Keep" tag; beta only has "Review".
+    const enrichment = {
+      aliases: new Map([['alpha.txt', 'Alpha Alias']]),
+      comments: new Map([['alpha.txt', 'note, with comma']]),
+      tagNames: ['Keep', 'Review'],
+      tagsByPath: new Map([
+        ['alpha.txt', new Set(['Keep'])],
+        ['beta.txt', new Set(['Review'])],
+      ]),
+    };
+
+    await lastValueFrom(
+      exportToCsv({ database: dbCtx.db, runId, rootPath: '' }, outFile, {
+        populatedChecksums: [],
+        enrichment,
+      })
+    );
+
+    const content = await fs.readFile(outFile, 'utf-8');
+    const lines = content.split('\n').filter(l => l.length > 0);
+    const cols = parseCsvLine(lines[0]);
+
+    // Enrichment columns appended in order: newName, description, then tags.
+    expect(cols.slice(-4)).toEqual(['newName', 'description', 'Keep', 'Review']);
+
+    const at = (line: string, name: string) => parseCsvLine(line)[cols.indexOf(name)];
+
+    const alpha = lines.find(l => l.startsWith('alpha.txt,'))!;
+    expect(at(alpha, 'newName')).toBe('Alpha Alias');
+    expect(at(alpha, 'description')).toBe('note, with comma'); // comma survived quoting
+    expect(at(alpha, 'Keep')).toBe('true');
+    expect(at(alpha, 'Review')).toBe('');
+
+    const beta = lines.find(l => l.startsWith('beta.txt,'))!;
+    expect(at(beta, 'newName')).toBe('');
+    expect(at(beta, 'description')).toBe('');
+    expect(at(beta, 'Keep')).toBe('');
+    expect(at(beta, 'Review')).toBe('true');
+  });
 });
+
+/** Minimal RFC-4180 line parser (handles quoted fields with commas/quotes). */
+function parseCsvLine(line: string): string[] {
+  const out: string[] = [];
+  let cur = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (line[i + 1] === '"') {
+          cur += '"';
+          i++;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        cur += c;
+      }
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ',') {
+      out.push(cur);
+      cur = '';
+    } else {
+      cur += c;
+    }
+  }
+  out.push(cur);
+  return out;
+}
