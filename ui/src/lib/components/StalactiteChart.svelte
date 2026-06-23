@@ -343,6 +343,10 @@
 				const files = filesData.files.filter((f) => !f.is_directory);
 				filesCache.set(dirPath, files);
 				computeLayout();
+				// Async file loading can deepen the tree (new rows). Resize the canvas
+				// to fit the new depth, otherwise deeper rows are clipped and the icicle
+				// renders collapsed until a resize/color-toggle/re-query forces it.
+				updateCanvasHeight();
 				render();
 			} else {
 				filesCache.set(dirPath, []);
@@ -404,6 +408,7 @@
 			void Promise.all([...toRefresh].map(refreshFilesForDirectory)).then(() => {
 				if (ctx) {
 					computeLayout();
+					updateCanvasHeight();
 					render();
 				}
 			});
