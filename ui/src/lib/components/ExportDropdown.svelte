@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { DropdownMenu } from 'bits-ui';
-	import { activeScan, deleteTags } from '$lib/stores';
+	import { activeScan } from '$lib/stores';
 	import { extensionRegistry, type ExportMenuItem } from '$lib/extensions/registry';
-	import { exportCsv, selectExportPath, generateId } from '$lib/tauri';
+	import { exportCsv, selectExportPath, generateId, getDeleteTags } from '$lib/tauri';
 	import { jobsStore } from '$lib/jobs';
 	import { DownloadIcon, ChevronDownIcon } from '@lucide/svelte';
 
@@ -28,7 +28,19 @@
 		exportCsv({ outputPath, jobId, dbName: scan.dbName, fullPaths: true, deletionOnly: true });
 	}
 
-	let hasDeletionTags = $derived($deleteTags.size > 0);
+	// Whether the active scan has any deletion marks. Queried from PGlite when
+	// the export menu opens (not cached) so the manifest option reflects current
+	// state even after marks are toggled elsewhere.
+	let hasDeletionTags = $state(false);
+
+	async function refreshDeletionTags(): Promise<void> {
+		if (!$activeScan) {
+			hasDeletionTags = false;
+			return;
+		}
+		const result = await getDeleteTags();
+		hasDeletionTags = (result?.tags.length ?? 0) > 0;
+	}
 
 	let builtinItems: ExportMenuItem[] = $derived([
 		{
@@ -52,7 +64,7 @@
 	let allItems = $derived([...builtinItems, ...extensionItems]);
 </script>
 
-<DropdownMenu.Root>
+<DropdownMenu.Root onOpenChange={(open) => open && refreshDeletionTags()}>
 	<DropdownMenu.Trigger>
 		{#snippet child({ props })}
 			<button

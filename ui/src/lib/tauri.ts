@@ -236,8 +236,18 @@ export interface QueryResponse {
 // Tree Types (matching query command output)
 // ================================
 
+/** Enrichment flags joined onto every node for the visualization. */
+export interface NodeEnrichment {
+	/** Display-name override, or null. */
+	alias: string | null;
+	has_comment: boolean;
+	has_tag: boolean;
+	/** This element or any ancestor directory is marked for deletion (cascade). */
+	tagged_for_deletion: boolean;
+}
+
 /** Directory node from get_tree query - flat structure */
-export interface DirectoryNode {
+export interface DirectoryNode extends NodeEnrichment {
 	path: string;
 	name: string;
 	depth: number;
@@ -265,7 +275,7 @@ export interface ScanStats {
 }
 
 /** File node from get_files query */
-export interface FileNode {
+export interface FileNode extends NodeEnrichment {
 	path: string;
 	name: string;
 	size: number;
@@ -600,6 +610,174 @@ export async function getDeleteTags(): Promise<GetDeleteTagsResult | null> {
 		}
 
 		return response.data as GetDeleteTagsResult;
+	} catch {
+		return null;
+	}
+}
+
+// ================================
+// Enrichment Functions
+// ================================
+//
+// Aliases, comments and tags. PGlite is the single source of truth: these
+// wrappers write through to the DB, and reads come either from get_enrichment
+// (one-shot hydration of the tag dictionary on scan load) or from
+// getElementEnrichment (query-on-select for the details panel). Per-element
+// enrichment is never cached in a long-lived store.
+
+/** A tag in the run's dictionary */
+export interface Tag {
+	tag_id: string;
+	name: string;
+}
+
+/** Full enrichment snapshot for a run (hydration) */
+export interface EnrichmentData {
+	aliases: { path: string; alias: string }[];
+	comments: { path: string; comment: string }[];
+	tags: Tag[];
+	assignments: { tag_id: string; path: string }[];
+	deleteTags: { path: string; created_at: number }[];
+}
+
+/** Enrichment for a single selected element */
+export interface ElementEnrichment {
+	alias: string | null;
+	comment: string | null;
+	tagIds: string[];
+	directlyTaggedForDeletion: boolean;
+	ancestorTaggedForDeletion: boolean;
+}
+
+/** Set or clear an element's alias. Empty/equal-to-name clears it (backend). */
+export async function setAlias(path: string, alias: string): Promise<boolean> {
+	try {
+		const response = await sendQuery({
+			id: `set_alias_${Date.now()}`,
+			action: 'set_alias',
+			path,
+			alias
+		});
+		return response.ok;
+	} catch {
+		return false;
+	}
+}
+
+/** Set or clear an element's comment. Empty clears it (backend). */
+export async function setComment(path: string, comment: string): Promise<boolean> {
+	try {
+		const response = await sendQuery({
+			id: `set_comment_${Date.now()}`,
+			action: 'set_comment',
+			path,
+			comment
+		});
+		return response.ok;
+	} catch {
+		return false;
+	}
+}
+
+/** Create a new tag; resolves to the generated tag, or null on failure. */
+export async function createTag(name: string): Promise<Tag | null> {
+	try {
+		const response = await sendQuery({
+			id: `create_tag_${Date.now()}`,
+			action: 'create_tag',
+			name
+		});
+		return response.ok ? (response.data as Tag) : null;
+	} catch {
+		return null;
+	}
+}
+
+/** Rename a tag in the dictionary. */
+export async function renameTag(tagId: string, name: string): Promise<boolean> {
+	try {
+		const response = await sendQuery({
+			id: `rename_tag_${Date.now()}`,
+			action: 'rename_tag',
+			tag_id: tagId,
+			name
+		});
+		return response.ok;
+	} catch {
+		return false;
+	}
+}
+
+/** Delete a tag from the dictionary; cascades to its assignments. */
+export async function deleteTag(tagId: string): Promise<boolean> {
+	try {
+		const response = await sendQuery({
+			id: `delete_tag_${Date.now()}`,
+			action: 'delete_tag',
+			tag_id: tagId
+		});
+		return response.ok;
+	} catch {
+		return false;
+	}
+}
+
+/** Assign an existing tag to an element. */
+export async function assignTag(tagId: string, path: string): Promise<boolean> {
+	try {
+		const response = await sendQuery({
+			id: `assign_tag_${Date.now()}`,
+			action: 'assign_tag',
+			tag_id: tagId,
+			path
+		});
+		return response.ok;
+	} catch {
+		return false;
+	}
+}
+
+/** Remove a tag from an element. */
+export async function unassignTag(tagId: string, path: string): Promise<boolean> {
+	try {
+		const response = await sendQuery({
+			id: `unassign_tag_${Date.now()}`,
+			action: 'unassign_tag',
+			tag_id: tagId,
+			path
+		});
+		return response.ok;
+	} catch {
+		return false;
+	}
+}
+
+/** Fetch the full enrichment snapshot for the current scan (hydration). */
+export async function getEnrichment(): Promise<EnrichmentData | null> {
+	try {
+		const response = await sendQuery({
+			id: `get_enrichment_${Date.now()}`,
+			action: 'get_enrichment'
+		});
+		if (!response.ok) {
+			console.error('Failed to get enrichment:', response.error);
+			return null;
+		}
+		return response.data as EnrichmentData;
+	} catch {
+		return null;
+	}
+}
+
+/** Fetch enrichment for a single element (query-on-select). */
+export async function getElementEnrichment(path: string): Promise<ElementEnrichment | null> {
+	try {
+		const response = await sendQuery({
+			id: `get_element_enrichment_${Date.now()}`,
+			action: 'get_element_enrichment',
+			path
+		});
+		return response.ok ? (response.data as ElementEnrichment) : null;
 	} catch {
 		return null;
 	}

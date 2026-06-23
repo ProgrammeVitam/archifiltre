@@ -6,6 +6,7 @@
  */
 
 import { writable, derived, get } from 'svelte/store';
+import type { Tag } from '$lib/tauri';
 
 // ================================
 // Types
@@ -874,27 +875,80 @@ export function setAppState(state: ScanState): void {
 }
 
 // ================================
-// Delete Tags
+// Enrichment — tag dictionary
 // ================================
+//
+// PGlite is the single source of truth for enrichment (see project memory
+// "PGlite is the CENTER"). The ONLY enrichment state kept in a long-lived
+// store is the tag dictionary: a small per-run lookup of tag_id -> name that
+// the tag picker and chip labels need. Per-element aliases/comments/tag
+// assignments are NOT stored here — they are read via query-on-select and, for
+// the visualization, via joins in the tree/files queries.
 
-/** Set of paths currently tagged for deletion */
-export const deleteTags = writable<Set<string>>(new Set());
+/** Tag dictionary for the active scan: tag_id -> name */
+export const tagDictionary = writable<Map<string, string>>(new Map());
 
-/** Whether a specific path (or any of its ancestors) is tagged for deletion */
-export function isTaggedForDeletion(path: string, tags: Set<string>): boolean {
-	// Direct match
-	if (tags.has(path)) return true;
-	// Check if any ancestor directory is tagged
-	const parts = path.split('/');
-	for (let i = 1; i < parts.length; i++) {
-		const ancestor = parts.slice(0, i).join('/');
-		if (tags.has(ancestor)) return true;
-	}
-	return false;
+/** Replace the dictionary from a hydration snapshot (called on scan load). */
+export function hydrateTagDictionary(tags: Tag[]): void {
+	tagDictionary.set(new Map(tags.map((t) => [t.tag_id, t.name])));
 }
 
-/** Count of items directly tagged for deletion */
-export const deleteTagCount = derived(deleteTags, ($tags) => $tags.size);
+/** Reflect a newly created tag in the dictionary. */
+export function addTagToDictionary(tagId: string, name: string): void {
+	tagDictionary.update((d) => new Map(d).set(tagId, name));
+}
+
+/** Reflect a tag rename in the dictionary. */
+export function renameTagInDictionary(tagId: string, name: string): void {
+	tagDictionary.update((d) => {
+		if (!d.has(tagId)) return d;
+		return new Map(d).set(tagId, name);
+	});
+}
+
+/** Reflect a tag deletion in the dictionary. */
+export function removeTagFromDictionary(tagId: string): void {
+	tagDictionary.update((d) => {
+		if (!d.has(tagId)) return d;
+		const next = new Map(d);
+		next.delete(tagId);
+		return next;
+	});
+}
+
+/** Tags sorted by name, for display in pickers. */
+export const sortedTags = derived(tagDictionary, ($d) =>
+	[...$d.entries()]
+		.map(([tag_id, name]) => ({ tag_id, name }))
+		.sort((a, b) => a.name.localeCompare(b.name))
+);
+
+// ================================
+// Enrichment — live invalidation
+// ================================
+//
+// After an enrichment write, the visualization must re-read the affected rows
+// from PGlite (the source of truth) so bands and alias labels update live. We
+// signal *what* changed rather than caching enrichment on nodes: the chart and
+// page re-query the DB. `cascade` is true for deletion toggles, whose effect
+// propagates to descendants (see v4 semantics); alias/comment/tag changes
+// affect only the exact element.
+
+export interface EnrichmentInvalidation {
+	path: string;
+	cascade: boolean;
+	/** Strictly increasing, so repeated edits to the same path still fire. */
+	nonce: number;
+}
+
+export const enrichmentInvalidation = writable<EnrichmentInvalidation | null>(null);
+
+let invalidationNonce = 0;
+
+/** Signal that the given path's enrichment changed and consumers should re-read. */
+export function invalidateEnrichment(path: string, cascade: boolean): void {
+	enrichmentInvalidation.set({ path, cascade, nonce: ++invalidationNonce });
+}
 
 // ================================
 // Platform Detection

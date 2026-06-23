@@ -25,6 +25,7 @@ import {
   handleRemoveDeleteTag,
   handleGetDeleteTags,
   handleGetEnrichment,
+  handleGetElementEnrichment,
 } from '@extensions/enrichment/index.ts';
 import {
   createScanDatabase,
@@ -191,6 +192,69 @@ describe('enrichment extension', () => {
       await handleSetDeleteTag(db, RUN_ID, 'trash/old.txt');
       const enrichment = await handleGetEnrichment(db, RUN_ID);
       expect(enrichment.deleteTags.map(t => t.path)).toEqual(['trash/old.txt']);
+    });
+
+    // Guards the exact cascade predicate used by the tree/files visualization
+    // joins (query.ts). Confirms PGlite supports starts_with() and that a
+    // sibling sharing a name prefix is NOT treated as a descendant.
+    it('cascades a directory deletion to descendants only (starts_with predicate)', async () => {
+      await handleSetDeleteTag(db, RUN_ID, 'a/b');
+      const res = await db.pg.query<{ path: string; tagged: boolean }>(
+        `SELECT t.path,
+           EXISTS (
+             SELECT 1 FROM delete_tags dt
+             WHERE dt.run_id = $1
+               AND (dt.path = t.path OR starts_with(t.path, dt.path || '/'))
+           ) AS tagged
+         FROM (VALUES ('a/b'), ('a/b/c.txt'), ('a/bc.txt'), ('a/x.txt')) AS t(path)`,
+        [RUN_ID]
+      );
+      const tagged = Object.fromEntries(res.rows.map(r => [r.path, r.tagged]));
+      expect(tagged['a/b']).toBe(true); // directly tagged
+      expect(tagged['a/b/c.txt']).toBe(true); // descendant — cascades
+      expect(tagged['a/bc.txt']).toBe(false); // sibling prefix — must NOT match
+      expect(tagged['a/x.txt']).toBe(false); // unrelated
+    });
+  });
+
+  describe('per-element enrichment (query-on-select)', () => {
+    it('returns alias, comment and assigned tags for a path', async () => {
+      await handleSetAlias(db, RUN_ID, 'docs/report.pdf', 'Final report');
+      await handleSetComment(db, RUN_ID, 'docs/report.pdf', 'reviewed');
+      const tag = await handleCreateTag(db, RUN_ID, 'Important');
+      await handleAssignTag(db, RUN_ID, tag.tag_id, 'docs/report.pdf');
+
+      const el = await handleGetElementEnrichment(db, RUN_ID, 'docs/report.pdf');
+      expect(el.alias).toBe('Final report');
+      expect(el.comment).toBe('reviewed');
+      expect(el.tagIds).toEqual([tag.tag_id]);
+      expect(el.directlyTaggedForDeletion).toBe(false);
+      expect(el.ancestorTaggedForDeletion).toBe(false);
+    });
+
+    it('reports an empty element with all defaults', async () => {
+      const el = await handleGetElementEnrichment(db, RUN_ID, 'untouched.txt');
+      expect(el).toEqual({
+        alias: null,
+        comment: null,
+        tagIds: [],
+        directlyTaggedForDeletion: false,
+        ancestorTaggedForDeletion: false,
+      });
+    });
+
+    it('detects a directly applied deletion mark', async () => {
+      await handleSetDeleteTag(db, RUN_ID, 'a/b.txt');
+      const el = await handleGetElementEnrichment(db, RUN_ID, 'a/b.txt');
+      expect(el.directlyTaggedForDeletion).toBe(true);
+      expect(el.ancestorTaggedForDeletion).toBe(false);
+    });
+
+    it('detects an ancestor directory deletion mark (cascade)', async () => {
+      await handleSetDeleteTag(db, RUN_ID, 'a/b');
+      const el = await handleGetElementEnrichment(db, RUN_ID, 'a/b/c/file.txt');
+      expect(el.directlyTaggedForDeletion).toBe(false);
+      expect(el.ancestorTaggedForDeletion).toBe(true);
     });
   });
 

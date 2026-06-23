@@ -55,6 +55,12 @@
 	--color-date-oldest: #145682;
 	--color-date-newest: #ffd89b;
 
+	/* Visualization: enrichment band colors (ported from Archifiltre v4) */
+	--color-enrich-delete: #fa0000; /* marked for deletion */
+	--color-enrich-alias: #91daf2; /* has an alias */
+	--color-enrich-comment: #03a1d6; /* has a comment */
+	--color-enrich-tag: #0a3264; /* has a tag */
+
 	/* Window styling */
 	--window-radius: 12px;
 	--window-shadow: 0 12px 20px rgba(0, 0, 0, 0.25), 0 6px 10px rgba(0, 0, 0, 0.15);

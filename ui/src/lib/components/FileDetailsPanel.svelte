@@ -5,8 +5,9 @@
 		hoveredItem,
 		hoveredItemX,
 		clearSelectedItem,
-		deleteTags,
-		isTaggedForDeletion
+		tagDictionary,
+		addTagToDictionary,
+		invalidateEnrichment
 	} from '$lib/stores';
 	import {
 		formatBytes,
@@ -15,7 +16,14 @@
 		type DirectoryDescription,
 		type DirDateStats,
 		setDeleteTag,
-		removeDeleteTag
+		removeDeleteTag,
+		getElementEnrichment,
+		setAlias,
+		setComment,
+		createTag,
+		assignTag,
+		unassignTag,
+		type ElementEnrichment
 	} from '$lib/tauri';
 	import { Button } from '$lib/components/ui/button';
 	import {
@@ -42,7 +50,11 @@
 		LoaderCircleIcon,
 		Trash2Icon,
 		LeafIcon,
-		CalendarIcon
+		CalendarIcon,
+		TagIcon,
+		MessageSquareTextIcon,
+		PencilIcon,
+		PlusIcon
 	} from '@lucide/svelte';
 	import FilePreview from './FilePreview.svelte';
 
@@ -61,11 +73,121 @@
 	let displayX = $derived($selectedItem ? $selectedItemX : $hoveredItemX);
 	let isPreview = $derived(!$selectedItem && !!$hoveredItem);
 
-	// Delete tag state
+	// Per-element enrichment, read on selection (query-on-select). PGlite is the
+	// source of truth; this is not a long-lived cache — it is re-read whenever the
+	// selection changes. Only the selected item is enriched (hovered previews are
+	// not, to avoid query spam).
+	let elementEnrichment = $state<ElementEnrichment | null>(null);
+	let enrichmentPath = $state<string | null>(null);
+	let aliasInput = $state('');
+	let commentInput = $state('');
+	let tagInput = $state('');
+
 	let isItemTagged = $derived(
-		displayItem ? isTaggedForDeletion(displayItem.path, $deleteTags) : false
+		!!elementEnrichment &&
+			(elementEnrichment.directlyTaggedForDeletion || elementEnrichment.ancestorTaggedForDeletion)
 	);
-	let isDirectlyTagged = $derived(displayItem ? $deleteTags.has(displayItem.path) : false);
+	let isDirectlyTagged = $derived(!!elementEnrichment && elementEnrichment.directlyTaggedForDeletion);
+
+	// Tags assigned to the selected element, resolved to names via the dictionary.
+	let assignedTags = $derived(
+		(elementEnrichment?.tagIds ?? [])
+			.map((id) => ({ tag_id: id, name: $tagDictionary.get(id) ?? '' }))
+			.filter((t) => t.name !== '')
+			.sort((a, b) => a.name.localeCompare(b.name))
+	);
+
+	// Fetch enrichment when the selected element changes.
+	$effect(() => {
+		const item = $selectedItem;
+		if (item && item.path !== enrichmentPath) {
+			enrichmentPath = item.path;
+			elementEnrichment = null;
+			aliasInput = '';
+			commentInput = '';
+			tagInput = '';
+			getElementEnrichment(item.path).then((result) => {
+				if (enrichmentPath === item.path) {
+					elementEnrichment = result;
+					aliasInput = result?.alias ?? '';
+					commentInput = result?.comment ?? '';
+				}
+			});
+		} else if (!item) {
+			enrichmentPath = null;
+			elementEnrichment = null;
+			aliasInput = '';
+			commentInput = '';
+			tagInput = '';
+		}
+	});
+
+	// The element's original (real) name, used to detect a no-op alias.
+	let originalName = $derived(($selectedItem?.path.split('/').filter(Boolean).pop() ?? '') as string);
+
+	async function commitAlias() {
+		const item = $selectedItem;
+		if (!item || !elementEnrichment) return;
+		const ok = await setAlias(item.path, aliasInput);
+		if (!ok) return;
+		// The backend clears the alias when empty or equal to the original name.
+		const trimmed = aliasInput.trim();
+		const effective = trimmed === '' || trimmed === originalName ? null : trimmed;
+		elementEnrichment = { ...elementEnrichment, alias: effective };
+		aliasInput = effective ?? '';
+		invalidateEnrichment(item.path, false);
+	}
+
+	async function commitComment() {
+		const item = $selectedItem;
+		if (!item || !elementEnrichment) return;
+		const ok = await setComment(item.path, commentInput);
+		if (!ok) return;
+		const effective = commentInput.trim() === '' ? null : commentInput;
+		elementEnrichment = { ...elementEnrichment, comment: effective };
+		commentInput = effective ?? '';
+		invalidateEnrichment(item.path, false);
+	}
+
+	async function submitTag() {
+		const item = $selectedItem;
+		const name = tagInput.trim();
+		if (!item || !elementEnrichment || name === '') return;
+
+		// Reuse an existing tag of the same name (case-insensitive), else create one.
+		const existing = [...$tagDictionary.entries()].find(
+			([, n]) => n.toLowerCase() === name.toLowerCase()
+		);
+		let tagId: string;
+		if (existing) {
+			tagId = existing[0];
+		} else {
+			const created = await createTag(name);
+			if (!created) return;
+			addTagToDictionary(created.tag_id, created.name);
+			tagId = created.tag_id;
+		}
+
+		const ok = await assignTag(tagId, item.path);
+		if (ok && !elementEnrichment.tagIds.includes(tagId)) {
+			elementEnrichment = { ...elementEnrichment, tagIds: [...elementEnrichment.tagIds, tagId] };
+		}
+		tagInput = '';
+		if (ok) invalidateEnrichment(item.path, false);
+	}
+
+	async function removeTagAssignment(tagId: string) {
+		const item = $selectedItem;
+		if (!item || !elementEnrichment) return;
+		const ok = await unassignTag(tagId, item.path);
+		if (ok) {
+			elementEnrichment = {
+				...elementEnrichment,
+				tagIds: elementEnrichment.tagIds.filter((id) => id !== tagId)
+			};
+			invalidateEnrichment(item.path, false);
+		}
+	}
 
 	// Parse path into breadcrumb segments
 	let breadcrumbs = $derived(() => {
@@ -225,28 +347,20 @@
 	}
 
 	async function toggleDeleteTag() {
-		if (!displayItem) return;
+		const item = $selectedItem;
+		if (!item || !elementEnrichment) return;
 
-		const path = displayItem.path;
-		if ($deleteTags.has(path)) {
-			// Remove the tag
-			const success = await removeDeleteTag(path);
+		if (elementEnrichment.directlyTaggedForDeletion) {
+			const success = await removeDeleteTag(item.path);
 			if (success) {
-				deleteTags.update((tags) => {
-					const next = new Set(tags);
-					next.delete(path);
-					return next;
-				});
+				elementEnrichment = { ...elementEnrichment, directlyTaggedForDeletion: false };
+				invalidateEnrichment(item.path, true);
 			}
 		} else {
-			// Set the tag
-			const success = await setDeleteTag(path);
+			const success = await setDeleteTag(item.path);
 			if (success) {
-				deleteTags.update((tags) => {
-					const next = new Set(tags);
-					next.add(path);
-					return next;
-				});
+				elementEnrichment = { ...elementEnrichment, directlyTaggedForDeletion: true };
+				invalidateEnrichment(item.path, true);
 			}
 		}
 	}
@@ -490,25 +604,115 @@
 							{/if}
 						{/if}
 
-						<!-- Delete Tag Toggle -->
-						<div class="col-span-2 mt-3 border-t border-border pt-3">
-							<Button
-								variant={isDirectlyTagged ? 'destructive' : 'outline'}
-								size="sm"
-								onclick={toggleDeleteTag}
-								class="w-full gap-2"
-							>
-								<Trash2Icon class="h-4 w-4" />
-								{#if isDirectlyTagged}
-									Unmark for deletion
-								{:else}
-									Mark for deletion
-								{/if}
-							</Button>
-							{#if isItemTagged && !isDirectlyTagged}
-								<p class="mt-2 text-xs text-red-500">A parent directory is marked for deletion</p>
-							{/if}
-						</div>
+						<!-- Enrichment (editable only for the selected item) -->
+						{#if $selectedItem}
+							<div class="col-span-2 mt-3 flex flex-col gap-4 border-t border-border pt-4">
+								<!-- Alias -->
+								<label class="flex flex-col gap-1.5">
+									<span class="flex items-center gap-2 text-xs text-muted-foreground">
+										<PencilIcon class="h-3.5 w-3.5" />
+										Alias
+									</span>
+									<input
+										type="text"
+										bind:value={aliasInput}
+										onblur={commitAlias}
+										onkeydown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+										placeholder={originalName}
+										class="w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-ring focus:outline-none"
+									/>
+								</label>
+
+								<!-- Comment -->
+								<label class="flex flex-col gap-1.5">
+									<span class="flex items-center gap-2 text-xs text-muted-foreground">
+										<MessageSquareTextIcon class="h-3.5 w-3.5" />
+										Comment
+									</span>
+									<textarea
+										bind:value={commentInput}
+										onblur={commitComment}
+										rows="2"
+										placeholder="Add a comment…"
+										class="w-full resize-y rounded-md border border-border bg-background px-2.5 py-1.5 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-ring focus:outline-none"
+									></textarea>
+								</label>
+
+								<!-- Tags -->
+								<div class="flex flex-col gap-1.5">
+									<span class="flex items-center gap-2 text-xs text-muted-foreground">
+										<TagIcon class="h-3.5 w-3.5" />
+										Tags
+									</span>
+									{#if assignedTags.length > 0}
+										<div class="flex flex-wrap gap-1.5">
+											{#each assignedTags as tag (tag.tag_id)}
+												<span
+													class="flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs font-medium text-foreground"
+												>
+													{tag.name}
+													<button
+														type="button"
+														onclick={() => removeTagAssignment(tag.tag_id)}
+														class="rounded-full text-muted-foreground hover:text-foreground"
+														aria-label={`Remove tag ${tag.name}`}
+													>
+														<XIcon class="h-3 w-3" />
+													</button>
+												</span>
+											{/each}
+										</div>
+									{/if}
+									<div class="flex items-center gap-1.5">
+										<input
+											type="text"
+											bind:value={tagInput}
+											onkeydown={(e) => e.key === 'Enter' && (e.preventDefault(), submitTag())}
+											list="tag-suggestions"
+											placeholder="Add a tag…"
+											class="min-w-0 flex-1 rounded-md border border-border bg-background px-2.5 py-1.5 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-ring focus:outline-none"
+										/>
+										<datalist id="tag-suggestions">
+											{#each [...$tagDictionary.values()] as name}
+												<option value={name}></option>
+											{/each}
+										</datalist>
+										<Button
+											variant="outline"
+											size="sm"
+											onclick={submitTag}
+											disabled={tagInput.trim() === ''}
+											class="shrink-0 gap-1"
+										>
+											<PlusIcon class="h-3.5 w-3.5" />
+											Add
+										</Button>
+									</div>
+								</div>
+
+								<!-- Mark for deletion -->
+								<div class="border-t border-border pt-3">
+									<Button
+										variant={isDirectlyTagged ? 'destructive' : 'outline'}
+										size="sm"
+										onclick={toggleDeleteTag}
+										class="w-full gap-2"
+									>
+										<Trash2Icon class="h-4 w-4" />
+										{#if isDirectlyTagged}
+											Unmark for deletion
+										{:else}
+											Mark for deletion
+										{/if}
+									</Button>
+									{#if isItemTagged && !isDirectlyTagged}
+										<p class="mt-2 text-xs text-red-500">
+											A parent directory is marked for deletion
+										</p>
+									{/if}
+								</div>
+							</div>
+						{/if}
 					</div>
 				</div>
 			</div>

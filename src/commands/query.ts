@@ -44,6 +44,8 @@ import {
   handleAssignTag,
   handleUnassignTag,
   handleGetEnrichment,
+  handleGetElementEnrichment,
+  ensureEnrichmentTables,
 } from '@extensions/enrichment/index.ts';
 
 // === Types ===
@@ -61,7 +63,17 @@ interface QueryResponse {
   error?: string;
 }
 
-interface DirectoryNode {
+/** Enrichment flags joined onto every node for the visualization. */
+interface NodeEnrichment {
+  /** Display-name override, or null. */
+  alias: string | null;
+  has_comment: boolean;
+  has_tag: boolean;
+  /** This element or any ancestor directory is marked for deletion (cascade). */
+  tagged_for_deletion: boolean;
+}
+
+interface DirectoryNode extends NodeEnrichment {
   path: string;
   name: string;
   depth: number;
@@ -70,7 +82,7 @@ interface DirectoryNode {
   dir_count: number;
 }
 
-interface FileNode {
+interface FileNode extends NodeEnrichment {
   path: string;
   name: string;
   size: number;
@@ -130,12 +142,21 @@ async function handleGetTree(
       GROUP BY d.path
     )
     SELECT
-      dir_path as path,
-      total_size,
-      file_count,
-      dir_count
-    FROM dir_stats
-    ORDER BY dir_path
+      ds.dir_path as path,
+      ds.total_size,
+      ds.file_count,
+      ds.dir_count,
+      al.alias as alias,
+      EXISTS (SELECT 1 FROM comments cm WHERE cm.run_id = ${runId} AND cm.path = ds.dir_path) as has_comment,
+      EXISTS (SELECT 1 FROM tag_assignments tg WHERE tg.run_id = ${runId} AND tg.path = ds.dir_path) as has_tag,
+      EXISTS (
+        SELECT 1 FROM delete_tags dt
+        WHERE dt.run_id = ${runId}
+          AND (dt.path = ds.dir_path OR starts_with(ds.dir_path, dt.path || '/'))
+      ) as tagged_for_deletion
+    FROM dir_stats ds
+    LEFT JOIN aliases al ON al.run_id = ${runId} AND al.path = ds.dir_path
+    ORDER BY ds.dir_path
   `);
 
   const directories: DirectoryNode[] = (
@@ -144,6 +165,10 @@ async function handleGetTree(
       total_size: string | number;
       file_count: string | number;
       dir_count: string | number;
+      alias: string | null;
+      has_comment: boolean;
+      has_tag: boolean;
+      tagged_for_deletion: boolean;
     }>
   ).map(row => {
     const path = row.path;
@@ -161,6 +186,10 @@ async function handleGetTree(
       total_size: Number(row.total_size) || 0,
       file_count: Number(row.file_count) || 0,
       dir_count: Number(row.dir_count) || 0,
+      alias: row.alias ?? null,
+      has_comment: Boolean(row.has_comment),
+      has_tag: Boolean(row.has_tag),
+      tagged_for_deletion: Boolean(row.tagged_for_deletion),
     };
   });
 
@@ -200,6 +229,16 @@ async function handleGetFiles(
       hash: files.hash,
       is_archive_container: files.is_archive_container,
       archive_format: files.archive_format,
+      // Enrichment, joined per row. NOTE: the outer column is written literally
+      // as "files"."path" — drizzle renders an embedded ${files.path} as the
+      // UNqualified "path", which inside these subqueries binds to the inner
+      // table's own column (always-true) instead of correlating. Keep it literal.
+      alias: sql<
+        string | null
+      >`(SELECT a.alias FROM aliases a WHERE a.run_id = ${runId} AND a.path = "files"."path")`,
+      has_comment: sql<boolean>`EXISTS (SELECT 1 FROM comments c WHERE c.run_id = ${runId} AND c.path = "files"."path")`,
+      has_tag: sql<boolean>`EXISTS (SELECT 1 FROM tag_assignments tg WHERE tg.run_id = ${runId} AND tg.path = "files"."path")`,
+      tagged_for_deletion: sql<boolean>`EXISTS (SELECT 1 FROM delete_tags dt WHERE dt.run_id = ${runId} AND (dt.path = "files"."path" OR starts_with("files"."path", dt.path || '/')))`,
     })
     .from(files)
     .where(
@@ -232,6 +271,10 @@ async function handleGetFiles(
       hash: row.hash,
       is_archive: row.is_archive_container || false,
       archive_format: row.archive_format,
+      alias: row.alias ?? null,
+      has_comment: Boolean(row.has_comment),
+      has_tag: Boolean(row.has_tag),
+      tagged_for_deletion: Boolean(row.tagged_for_deletion),
     };
   });
 
@@ -339,6 +382,16 @@ async function handleSearch(
       hash: files.hash,
       is_archive_container: files.is_archive_container,
       archive_format: files.archive_format,
+      // Enrichment, joined per row. NOTE: the outer column is written literally
+      // as "files"."path" — drizzle renders an embedded ${files.path} as the
+      // UNqualified "path", which inside these subqueries binds to the inner
+      // table's own column (always-true) instead of correlating. Keep it literal.
+      alias: sql<
+        string | null
+      >`(SELECT a.alias FROM aliases a WHERE a.run_id = ${runId} AND a.path = "files"."path")`,
+      has_comment: sql<boolean>`EXISTS (SELECT 1 FROM comments c WHERE c.run_id = ${runId} AND c.path = "files"."path")`,
+      has_tag: sql<boolean>`EXISTS (SELECT 1 FROM tag_assignments tg WHERE tg.run_id = ${runId} AND tg.path = "files"."path")`,
+      tagged_for_deletion: sql<boolean>`EXISTS (SELECT 1 FROM delete_tags dt WHERE dt.run_id = ${runId} AND (dt.path = "files"."path" OR starts_with("files"."path", dt.path || '/')))`,
     })
     .from(files)
     .where(
@@ -369,6 +422,10 @@ async function handleSearch(
       hash: row.hash,
       is_archive: row.is_archive_container || false,
       archive_format: row.archive_format,
+      alias: row.alias ?? null,
+      has_comment: Boolean(row.has_comment),
+      has_tag: Boolean(row.has_tag),
+      tagged_for_deletion: Boolean(row.tagged_for_deletion),
     };
   });
 
@@ -628,6 +685,14 @@ export default class Query extends Command {
           data = await handleGetEnrichment(this.database!, this.runId!);
           break;
 
+        case 'get_element_enrichment':
+          data = await handleGetElementEnrichment(
+            this.database!,
+            this.runId!,
+            (request.path as string) ?? ''
+          );
+          break;
+
         default:
           this.sendResponse({
             id: request.id,
@@ -667,6 +732,10 @@ export default class Query extends Command {
     try {
       // Open database
       this.database = await createScanDatabase(flags.db);
+
+      // Ensure enrichment tables exist so the tree/files queries can LEFT JOIN
+      // them even on a fresh scan that has no enrichment yet.
+      await ensureEnrichmentTables(this.database);
 
       // Determine run ID
       if (flags['run-id']) {

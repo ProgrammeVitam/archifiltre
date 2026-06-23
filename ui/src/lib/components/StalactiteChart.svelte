@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { onMount, onDestroy } from 'svelte';
+	import { onMount, onDestroy, untrack } from 'svelte';
 	import { SvelteMap, SvelteSet } from 'svelte/reactivity';
 	import {
 		formatBytes,
@@ -11,7 +11,14 @@
 		type TreeData,
 		type FileNode
 	} from '$lib/tauri';
-	import { selectDirectory, selectFile, hoverDirectory, hoverFile, clearHoveredItem } from '$lib/stores';
+	import {
+		selectDirectory,
+		selectFile,
+		hoverDirectory,
+		hoverFile,
+		clearHoveredItem,
+		enrichmentInvalidation
+	} from '$lib/stores';
 	import { getFileType } from '$lib/file-types';
 
 	// ================================
@@ -44,6 +51,10 @@
 		other: string;
 		dateOldest: string;
 		dateNewest: string;
+		enrichDelete: string;
+		enrichAlias: string;
+		enrichComment: string;
+		enrichTag: string;
 	}
 
 	// ================================
@@ -168,8 +179,26 @@
 			compressed: v('--color-type-compressed'),
 			other: v('--color-type-other'),
 			dateOldest: v('--color-date-oldest'),
-			dateNewest: v('--color-date-newest')
+			dateNewest: v('--color-date-newest'),
+			enrichDelete: v('--color-enrich-delete'),
+			enrichAlias: v('--color-enrich-alias'),
+			enrichComment: v('--color-enrich-comment'),
+			enrichTag: v('--color-enrich-tag')
 		};
+	}
+
+	// Ordered enrichment bands present on a node, following v4's order:
+	// to-delete, alias, comment, tag. `tagged_for_deletion` already accounts for
+	// the ancestor cascade (computed in SQL); alias/comment/tag are per-element.
+	function getNodeBands(rect: LayoutRect, palette: ColorPalette): string[] {
+		const enr = rect.node ?? rect.file;
+		if (!enr) return [];
+		const bands: string[] = [];
+		if (enr.tagged_for_deletion) bands.push(palette.enrichDelete);
+		if (enr.alias) bands.push(palette.enrichAlias);
+		if (enr.has_comment) bands.push(palette.enrichComment);
+		if (enr.has_tag) bands.push(palette.enrichTag);
+		return bands;
 	}
 
 	function computeMtimeRange(): [number, number] {
@@ -319,6 +348,49 @@
 			loadFilesForDirectory(dir.path);
 		}
 	}
+
+	/**
+	 * Re-fetch a directory's files in place (bypassing the cache guard) so their
+	 * enrichment flags refresh after an edit. Only refreshes directories already
+	 * loaded, so nothing visible flickers out.
+	 */
+	async function refreshFilesForDirectory(dirPath: string): Promise<void> {
+		if (!filesCache.has(dirPath)) return;
+		try {
+			const filesData = await queryFiles(dirPath, 1000);
+			const files = (filesData?.files ?? []).filter((f) => !f.is_directory);
+			filesCache.set(dirPath, files);
+		} catch (e) {
+			console.error('Failed to refresh files for', dirPath, e);
+		}
+	}
+
+	// React to enrichment edits: re-read the affected file rows from PGlite and
+	// redraw. Directory nodes are refreshed separately by the page re-querying the
+	// tree. Depends only on the invalidation signal (DB reads are untracked to
+	// avoid re-running when filesCache mutates).
+	$effect(() => {
+		const inv = $enrichmentInvalidation;
+		if (!inv) return;
+		untrack(() => {
+			const lastSlash = inv.path.lastIndexOf('/');
+			const parent = lastSlash >= 0 ? inv.path.slice(0, lastSlash) : '';
+			const toRefresh = new Set<string>([parent]);
+			if (inv.cascade) {
+				// Deletion cascades to descendants: refresh every loaded page under it.
+				const prefix = inv.path + '/';
+				for (const key of filesCache.keys()) {
+					if (key === inv.path || key.startsWith(prefix)) toRefresh.add(key);
+				}
+			}
+			void Promise.all([...toRefresh].map(refreshFilesForDirectory)).then(() => {
+				if (ctx) {
+					computeLayout();
+					render();
+				}
+			});
+		});
+	});
 
 	function updateCanvasHeight() {
 		if (!canvas || !container) return;
@@ -567,6 +639,9 @@
 		// Draw rectangles
 		ctx.save();
 
+		// Enrichment band colors (resolved once per render).
+		const bandPalette = resolveColors();
+
 		// Draw each rectangle
 		for (const rect of layoutRects) {
 			const rectPath = rect.node?.path ?? rect.file?.path ?? '';
@@ -582,6 +657,22 @@
 			ctx.lineWidth = 1;
 			ctx.strokeRect(rect.x, rect.y, rect.width, rect.height);
 
+			// Draw enrichment bands (v4 layout): stacked strips from the top edge,
+			// each occupying dy/heightDivider so they never cover more than half the
+			// block and the underlying type/date fill stays visible.
+			if (rect.width > 4 && rect.height > 6) {
+				const bands = getNodeBands(rect, bandPalette);
+				if (bands.length > 0) {
+					const heightDivider = Math.max(bands.length * 2, 3);
+					const bandHeight = rect.height / heightDivider;
+					const bandWidth = rect.width - 2;
+					for (let i = 0; i < bands.length; i++) {
+						ctx.fillStyle = bands[i];
+						ctx.fillRect(rect.x + 1, rect.y + 1 + i * bandHeight, bandWidth, bandHeight);
+					}
+				}
+			}
+
 			// Draw text if there's enough space
 			const scaledWidth = rect.width;
 			const scaledHeight = rect.height;
@@ -593,7 +684,10 @@
 				ctx.textAlign = 'left';
 				ctx.textBaseline = 'middle';
 
-				const text = rect.node?.name ?? rect.file?.name ?? '';
+				// Prefer the alias over the real name for display (alias renames the
+				// display without changing the real file name).
+				const enr = rect.node ?? rect.file;
+				const text = enr?.alias ?? enr?.name ?? '';
 				const maxWidth = rect.width - 8;
 				const textWidth = ctx.measureText(text).width;
 

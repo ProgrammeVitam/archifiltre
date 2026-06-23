@@ -90,6 +90,20 @@ export interface GetEnrichmentResult {
   deleteTags: Array<{ path: string; created_at: number }>;
 }
 
+/**
+ * Enrichment for a single element, fetched on selection (query-on-select).
+ * The UI does not cache this — it re-reads when the selection changes.
+ */
+export interface GetElementEnrichmentResult {
+  alias: string | null;
+  comment: string | null;
+  tagIds: string[];
+  /** This exact path is marked for deletion */
+  directlyTaggedForDeletion: boolean;
+  /** An ancestor directory is marked for deletion (cascades visually) */
+  ancestorTaggedForDeletion: boolean;
+}
+
 // === Helpers ===
 
 /**
@@ -103,6 +117,21 @@ function originalName(path: string): string {
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
+}
+
+/**
+ * Ancestor directory paths of an element, nearest-root first, excluding the
+ * element itself. e.g. "a/b/c.txt" -> ["a", "a/b"]. Used to test whether a
+ * parent directory is marked for deletion (the membership test itself is done
+ * in SQL — no enrichment data is held in JS).
+ */
+function ancestorPaths(path: string): string[] {
+  const parts = path.split('/').filter(Boolean);
+  const ancestors: string[] = [];
+  for (let i = 1; i < parts.length; i++) {
+    ancestors.push(parts.slice(0, i).join('/'));
+  }
+  return ancestors;
 }
 
 // === Table Initialization ===
@@ -414,6 +443,50 @@ export async function handleGetEnrichment(
     tags: tagRows.rows.map(r => ({ tag_id: r.tag_id, name: r.name })),
     assignments: assignmentRows.rows.map(r => ({ tag_id: r.tag_id, path: r.path })),
     deleteTags: deleteRows.rows.map(r => ({ path: r.path, created_at: r.created_at })),
+  };
+}
+
+/**
+ * Return enrichment for a single element, fetched when the selection changes.
+ */
+export async function handleGetElementEnrichment(
+  db: DatabaseConnection,
+  runId: string,
+  path: string
+): Promise<GetElementEnrichmentResult> {
+  await ensureEnrichmentTables(db);
+
+  const candidates = [path, ...ancestorPaths(path)];
+  const placeholders = candidates.map((_, i) => `$${i + 2}`).join(', ');
+
+  const [aliasRes, commentRes, tagRes, deleteRes] = await Promise.all([
+    db.pg.query<{ alias: string }>(`SELECT alias FROM aliases WHERE run_id = $1 AND path = $2`, [
+      runId,
+      path,
+    ]),
+    db.pg.query<{ comment: string }>(
+      `SELECT comment FROM comments WHERE run_id = $1 AND path = $2`,
+      [runId, path]
+    ),
+    db.pg.query<{ tag_id: string }>(
+      `SELECT tag_id FROM tag_assignments WHERE run_id = $1 AND path = $2`,
+      [runId, path]
+    ),
+    db.pg.query<{ path: string }>(
+      `SELECT path FROM delete_tags WHERE run_id = $1 AND path IN (${placeholders})`,
+      [runId, ...candidates]
+    ),
+  ]);
+
+  const directlyTaggedForDeletion = deleteRes.rows.some(r => r.path === path);
+  const ancestorTaggedForDeletion = deleteRes.rows.some(r => r.path !== path);
+
+  return {
+    alias: aliasRes.rows[0]?.alias ?? null,
+    comment: commentRes.rows[0]?.comment ?? null,
+    tagIds: tagRes.rows.map(r => r.tag_id),
+    directlyTaggedForDeletion,
+    ancestorTaggedForDeletion,
   };
 }
 

@@ -14,7 +14,9 @@
 		viewMode,
 		selectedItem,
 		hoveredItem,
-		clearSelectedItem
+		clearSelectedItem,
+		hydrateTagDictionary,
+		enrichmentInvalidation
 	} from '$lib/stores';
 	import {
 		healthCheck,
@@ -26,6 +28,7 @@
 		stopQuerySession,
 		queryTree,
 		queryStats,
+		getEnrichment,
 		formatBytes,
 		type TreeData,
 		type ScanStats
@@ -187,6 +190,15 @@
 			// Fetch tree and stats in parallel
 			const [tree, stats] = await Promise.all([queryTree(), queryStats()]);
 
+			// Hydrate the tag dictionary for this scan (the only enrichment state
+			// kept client-side — see "PGlite is the CENTER"). Per-element enrichment
+			// is read on demand via joins / query-on-select, not cached here.
+			getEnrichment().then((data) => {
+				if (data && loadedForScanId === scanId) {
+					hydrateTagDictionary(data.tags);
+				}
+			});
+
 			// Only update if we're still loading for this scan
 			if (loadedForScanId === scanId) {
 				if (tree) {
@@ -210,6 +222,16 @@
 			}
 		}
 	}
+
+	// Re-query the tree when enrichment changes so directory bands and the
+	// deletion cascade update live. The flat tree is one cheap query; the chart
+	// refreshes its own (lazily loaded) file rows. Depends only on the signal.
+	$effect(() => {
+		if (!$enrichmentInvalidation) return;
+		queryTree().then((tree) => {
+			if (tree) treeData = tree;
+		});
+	});
 
 	// ================================
 	// Actions
