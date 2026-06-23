@@ -31,7 +31,7 @@
 		{ id: 'checksum', name: 'Checksum', description: 'Computes cryptographic checksums for scanned files' },
 		{ id: 'ai-describe', name: 'AI Describe', description: 'Generates LLM-powered descriptions for directories' },
 		{ id: 'file-thumbnails', name: 'File Thumbnails', description: 'Stores browser-generated thumbnails for files' },
-		{ id: 'delete-tags', name: 'Delete Tags', description: 'Marks files and directories for deletion' }
+		{ id: 'enrichment', name: 'Enrichment', description: 'Aliases, comments, tags and deletion marks for files and directories' }
 	];
 
 	let { children } = $props();

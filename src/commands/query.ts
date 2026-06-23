@@ -36,7 +36,15 @@ import {
   handleSetDeleteTag,
   handleRemoveDeleteTag,
   handleGetDeleteTags,
-} from '@extensions/delete-tags/index.ts';
+  handleSetAlias,
+  handleSetComment,
+  handleCreateTag,
+  handleRenameTag,
+  handleDeleteTag,
+  handleAssignTag,
+  handleUnassignTag,
+  handleGetEnrichment,
+} from '@extensions/enrichment/index.ts';
 
 // === Types ===
 
@@ -553,6 +561,71 @@ export default class Query extends Command {
 
         case 'get_delete_tags':
           data = await handleGetDeleteTags(this.database!, this.runId!);
+          break;
+
+        case 'set_alias':
+          data = await handleSetAlias(
+            this.database!,
+            this.runId!,
+            (request.path as string) ?? '',
+            (request.alias as string) ?? ''
+          );
+          break;
+
+        case 'set_comment':
+          data = await handleSetComment(
+            this.database!,
+            this.runId!,
+            (request.path as string) ?? '',
+            (request.comment as string) ?? ''
+          );
+          break;
+
+        case 'create_tag':
+          data = await handleCreateTag(
+            this.database!,
+            this.runId!,
+            (request.name as string) ?? ''
+          );
+          break;
+
+        case 'rename_tag':
+          data = await handleRenameTag(
+            this.database!,
+            this.runId!,
+            (request.tag_id as string) ?? '',
+            (request.name as string) ?? ''
+          );
+          break;
+
+        case 'delete_tag':
+          data = await handleDeleteTag(
+            this.database!,
+            this.runId!,
+            (request.tag_id as string) ?? ''
+          );
+          break;
+
+        case 'assign_tag':
+          data = await handleAssignTag(
+            this.database!,
+            this.runId!,
+            (request.tag_id as string) ?? '',
+            (request.path as string) ?? ''
+          );
+          break;
+
+        case 'unassign_tag':
+          data = await handleUnassignTag(
+            this.database!,
+            this.runId!,
+            (request.tag_id as string) ?? '',
+            (request.path as string) ?? ''
+          );
+          break;
+
+        case 'get_enrichment':
+          data = await handleGetEnrichment(this.database!, this.runId!);
           break;
 
         default:

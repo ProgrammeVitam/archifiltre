@@ -39,7 +39,7 @@ import * as csvExport from './csv-export.ts';
 import * as checksum from './checksum/index.ts';
 import * as aiDescribe from './ai-describe/index.ts';
 import * as fileThumbnails from './file-thumbnails/index.ts';
-import * as deleteTags from './delete-tags/index.ts';
+import * as enrichment from './enrichment/index.ts';
 
 // === Extension Registry ===
 
@@ -53,7 +53,7 @@ const EXTENSIONS: Record<string, unknown>[] = [
   checksum,
   aiDescribe,
   fileThumbnails,
-  deleteTags,
+  enrichment,
   // Future extensions go here:
   // jsonExport,
   // etc.
@@ -123,4 +123,4 @@ export const EXTENSION_MANIFESTS: Extension[] = EXTENSIONS.filter(hasManifest).m
 // === Re-export Extension Functions ===
 // Export individual extensions for direct use by other commands
 
-export { summary, csvExport, checksum, aiDescribe, fileThumbnails, deleteTags };
+export { summary, csvExport, checksum, aiDescribe, fileThumbnails, enrichment };
