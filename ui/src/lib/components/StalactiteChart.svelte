@@ -218,6 +218,24 @@
 		return [(n >> 16) & 0xff, (n >> 8) & 0xff, n & 0xff];
 	}
 
+	/** Parse '#rrggbb' or 'rgb(r,g,b)' into [r,g,b]. */
+	function parseRgb(color: string): [number, number, number] {
+		if (color.startsWith('#')) return hexToRgb(color);
+		const m = color.match(/\d+/g);
+		return m && m.length >= 3 ? [Number(m[0]), Number(m[1]), Number(m[2])] : [128, 128, 128];
+	}
+
+	/**
+	 * A 1px separator color that contrasts with the given fill, so enrichment
+	 * bands stay legible even when a band's hue matches the fill — e.g. the red
+	 * deletion band on a red .pdf block. White on dark fills, dark on light fills.
+	 */
+	function bandSeparatorColor(fill: string): string {
+		const [r, g, b] = parseRgb(fill);
+		const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+		return luminance < 140 ? 'rgba(255, 255, 255, 0.9)' : 'rgba(0, 0, 0, 0.55)';
+	}
+
 	function interpolateHex(t: number, from: string, to: string): string {
 		const [r1, g1, b1] = hexToRgb(from);
 		const [r2, g2, b2] = hexToRgb(to);
@@ -670,6 +688,20 @@
 						ctx.fillStyle = bands[i];
 						ctx.fillRect(rect.x + 1, rect.y + 1 + i * bandHeight, bandWidth, bandHeight);
 					}
+					// Contrast-aware hairlines between bands and below the band stack, so each
+					// band reads as a distinct strip even when its hue matches the fill (the red
+					// deletion band on a red .pdf block was invisible without this).
+					ctx.strokeStyle = bandSeparatorColor(
+						isHovered ? lightenColor(rect.color, 0.15) : rect.color
+					);
+					ctx.lineWidth = 1;
+					ctx.beginPath();
+					for (let i = 1; i <= bands.length; i++) {
+						const y = Math.round(rect.y + 1 + i * bandHeight) + 0.5;
+						ctx.moveTo(rect.x + 1, y);
+						ctx.lineTo(rect.x + 1 + bandWidth, y);
+					}
+					ctx.stroke();
 				}
 			}
 

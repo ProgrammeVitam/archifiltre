@@ -26,6 +26,9 @@
 		type ElementEnrichment
 	} from '$lib/tauri';
 	import { Button } from '$lib/components/ui/button';
+	import { Badge } from '$lib/components/ui/badge';
+	import { Input } from '$lib/components/ui/input';
+	import { Textarea } from '$lib/components/ui/textarea';
 	import {
 		XIcon,
 		ChevronRightIcon,
@@ -123,7 +126,7 @@
 	});
 
 	// The element's original (real) name, used to detect a no-op alias.
-	let originalName = $derived(($selectedItem?.path.split('/').filter(Boolean).pop() ?? '') as string);
+	let originalName = $derived($selectedItem?.path.split('/').filter(Boolean).pop() ?? '');
 
 	async function commitAlias() {
 		const item = $selectedItem;
@@ -613,13 +616,12 @@
 										<PencilIcon class="h-3.5 w-3.5" />
 										Alias
 									</span>
-									<input
+									<Input
 										type="text"
 										bind:value={aliasInput}
 										onblur={commitAlias}
 										onkeydown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
 										placeholder={originalName}
-										class="w-full rounded-md border border-border bg-background px-2.5 py-1.5 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-ring focus:outline-none"
 									/>
 								</label>
 
@@ -629,13 +631,12 @@
 										<MessageSquareTextIcon class="h-3.5 w-3.5" />
 										Comment
 									</span>
-									<textarea
+									<Textarea
 										bind:value={commentInput}
 										onblur={commitComment}
-										rows="2"
+										rows={2}
 										placeholder="Add a comment…"
-										class="w-full resize-y rounded-md border border-border bg-background px-2.5 py-1.5 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-ring focus:outline-none"
-									></textarea>
+									/>
 								</label>
 
 								<!-- Tags -->
@@ -647,9 +648,7 @@
 									{#if assignedTags.length > 0}
 										<div class="flex flex-wrap gap-1.5">
 											{#each assignedTags as tag (tag.tag_id)}
-												<span
-													class="flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs font-medium text-foreground"
-												>
+												<Badge variant="secondary" class="gap-1 pr-1">
 													{tag.name}
 													<button
 														type="button"
@@ -659,18 +658,18 @@
 													>
 														<XIcon class="h-3 w-3" />
 													</button>
-												</span>
+												</Badge>
 											{/each}
 										</div>
 									{/if}
 									<div class="flex items-center gap-1.5">
-										<input
+										<Input
 											type="text"
 											bind:value={tagInput}
 											onkeydown={(e) => e.key === 'Enter' && (e.preventDefault(), submitTag())}
 											list="tag-suggestions"
 											placeholder="Add a tag…"
-											class="min-w-0 flex-1 rounded-md border border-border bg-background px-2.5 py-1.5 text-sm text-foreground placeholder:text-muted-foreground/50 focus:border-ring focus:outline-none"
+											class="flex-1"
 										/>
 										<datalist id="tag-suggestions">
 											{#each [...$tagDictionary.values()] as name}
