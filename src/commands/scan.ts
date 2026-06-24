@@ -174,14 +174,20 @@ export default class Scan extends BaseCommand {
     }
 
     lastProgress = await lastValueFrom(
-      scanDirectory(context.database, scanConfig, (event: ScanProgressEvent) => {
-        context.onProgress?.(event.phase, event.filesDiscovered, null, event.status);
-        if (isTTY) {
-          ux.action.status = event.status;
-        } else if (!context.onProgress) {
-          process.stdout.write(`${JSON.stringify(event)}\n`);
-        }
-      })
+      scanDirectory(
+        context.database,
+        scanConfig,
+        (event: ScanProgressEvent) => {
+          context.onProgress?.(event.phase, event.filesDiscovered, null, event.status);
+          if (isTTY) {
+            ux.action.status = event.status;
+          } else if (!context.onProgress) {
+            process.stdout.write(`${JSON.stringify(event)}\n`);
+          }
+        },
+        // Live provisional directory tree → the UI grows the icicle during the scan.
+        (directories) => context.onTree?.(directories)
+      )
     );
 
     const duration = Date.now() - startTime;

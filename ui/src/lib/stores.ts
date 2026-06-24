@@ -6,7 +6,7 @@
  */
 
 import { writable, derived, get } from 'svelte/store';
-import type { Tag } from '$lib/tauri';
+import type { Tag, TreeData, DirectoryNode } from '$lib/tauri';
 
 // ================================
 // Types
@@ -921,6 +921,64 @@ export const sortedTags = derived(tagDictionary, ($d) =>
 	[...$d.entries()]
 		.map(([tag_id, name]) => ({ tag_id, name }))
 		.sort((a, b) => a.name.localeCompare(b.name))
+);
+
+// ================================
+// Provisional scan tree (live icicle during a scan)
+// ================================
+//
+// Coarse, depth-capped directory aggregates streamed by the scanner (scan:tree
+// events) while a scan runs, so the icicle grows live without reading the
+// being-written DB. Keyed by scan id; cleared on completion when the real
+// DB-backed tree takes over.
+
+export const provisionalTrees = writable<Map<string, TreeData>>(new Map());
+
+interface ProvisionalDirInput {
+	path: string;
+	total_size: number;
+	file_count: number;
+	dir_count: number;
+}
+
+/** Build/replace the provisional tree for a scan from a scan:tree snapshot. */
+export function setProvisionalTree(scanId: string, directories: ProvisionalDirInput[]): void {
+	const treeData: TreeData = {
+		root: null,
+		directories: directories.map((d) => {
+			const parts = d.path.split('/').filter(Boolean);
+			return {
+				path: d.path,
+				name: parts[parts.length - 1] ?? d.path,
+				depth: parts.length, // top-level = 1 → min-depth roots; consistent with buildTreeHierarchy
+				total_size: d.total_size,
+				file_count: d.file_count,
+				dir_count: d.dir_count,
+				// no enrichment during a fresh scan
+				alias: null,
+				has_comment: false,
+				has_tag: false,
+				tagged_for_deletion: false
+			} satisfies DirectoryNode;
+		})
+	};
+	provisionalTrees.update((m) => new Map(m).set(scanId, treeData));
+}
+
+/** Drop a scan's provisional tree (on completion/error/restart). */
+export function clearProvisionalTree(scanId: string): void {
+	provisionalTrees.update((m) => {
+		if (!m.has(scanId)) return m;
+		const next = new Map(m);
+		next.delete(scanId);
+		return next;
+	});
+}
+
+/** The active scan's provisional tree, or null. */
+export const activeProvisionalTree = derived(
+	[provisionalTrees, activeScan],
+	([$trees, $scan]) => ($scan ? ($trees.get($scan.id) ?? null) : null)
 );
 
 // ================================

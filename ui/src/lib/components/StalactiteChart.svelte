@@ -64,9 +64,12 @@
 	interface Props {
 		data: TreeData | null;
 		class?: string;
+		/** Provisional (live-scan) mode: render the streamed directory tree only;
+		 *  do NOT query files (the DB is being written and can't be read). */
+		provisional?: boolean;
 	}
 
-	let { data, class: className = '' }: Props = $props();
+	let { data, class: className = '', provisional = false }: Props = $props();
 
 	// ================================
 	// State
@@ -360,7 +363,7 @@
 	}
 
 	function loadFilesForAllDirectories() {
-		if (!data) return;
+		if (!data || provisional) return; // provisional: dirs-only, the DB isn't readable mid-scan
 
 		// Load root files
 		loadFilesForDirectory('');
@@ -393,7 +396,7 @@
 	// avoid re-running when filesCache mutates).
 	$effect(() => {
 		const inv = $enrichmentInvalidation;
-		if (!inv) return;
+		if (!inv || provisional) return; // no DB queries while a scan is writing
 		untrack(() => {
 			const lastSlash = inv.path.lastIndexOf('/');
 			const parent = lastSlash >= 0 ? inv.path.slice(0, lastSlash) : '';

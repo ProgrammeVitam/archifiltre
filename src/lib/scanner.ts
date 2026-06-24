@@ -29,6 +29,7 @@ import {
   isNotNull as _isNotNull,
 } from 'drizzle-orm';
 import { logger } from '@lib/logging.ts';
+import type { ProvisionalDir } from '@lib/job-context.ts';
 import {
   cleanDatabase,
   insertFileBatch,
@@ -470,7 +471,8 @@ export interface ScanProgressEvent {
 export function scanDirectory(
   connection: DatabaseConnection,
   config: ScanConfig,
-  progressCallback?: (event: ScanProgressEvent) => void
+  progressCallback?: (event: ScanProgressEvent) => void,
+  treeCallback?: (directories: ProvisionalDir[]) => void
 ): Observable<ScanResult> {
   let filesDiscovered = 0;
   let filesIngested = 0;
@@ -487,6 +489,64 @@ export function scanDirectory(
       status,
       ...extra,
     });
+  };
+
+  // Shallow, depth-capped provisional directory aggregate, emitted (throttled)
+  // during ingestion so the UI can grow a live icicle without reading the DB.
+  const PROVISIONAL_DEPTH_CAP = 4;
+  const PROVISIONAL_THROTTLE_MS = 750;
+  const provisionalDirs = new Map<
+    string,
+    { total_size: number; file_count: number; dir_count: number }
+  >();
+  let lastTreeEmit = 0;
+
+  const ensureDir = (p: string) => {
+    let agg = provisionalDirs.get(p);
+    if (!agg) {
+      agg = { total_size: 0, file_count: 0, dir_count: 0 };
+      provisionalDirs.set(p, agg);
+    }
+    return agg;
+  };
+
+  const accumulate = (row: FileRow) => {
+    const parts = row.path.split('/').filter(Boolean);
+    if (parts.length === 0) return;
+    if (row.is_directory) {
+      if (parts.length <= PROVISIONAL_DEPTH_CAP) ensureDir(parts.join('/'));
+      if (parts.length >= 2 && parts.length - 1 <= PROVISIONAL_DEPTH_CAP) {
+        ensureDir(parts.slice(0, parts.length - 1).join('/')).dir_count += 1;
+      }
+    } else {
+      const size = row.physical_size ?? 0;
+      const maxDepth = Math.min(parts.length - 1, PROVISIONAL_DEPTH_CAP);
+      for (let d = 1; d <= maxDepth; d++) {
+        const agg = ensureDir(parts.slice(0, d).join('/'));
+        agg.total_size += size;
+        agg.file_count += 1;
+      }
+    }
+  };
+
+  const emitTree = () => {
+    if (!treeCallback) return;
+    treeCallback(
+      [...provisionalDirs.entries()].map(([path, a]) => ({
+        path,
+        total_size: a.total_size,
+        file_count: a.file_count,
+        dir_count: a.dir_count,
+      }))
+    );
+  };
+  const maybeEmitTree = () => {
+    if (!treeCallback) return;
+    const now = Date.now();
+    if (now - lastTreeEmit >= PROVISIONAL_THROTTLE_MS) {
+      lastTreeEmit = now;
+      emitTree();
+    }
   };
 
   // Phase 1: Clean database first (hot observable, no defer)
@@ -544,6 +604,14 @@ export function scanDirectory(
         // Convert to database row format
         map(entry => toFileRow(config.runId, entry)),
 
+        // Feed the provisional (live) directory aggregate, throttled emit
+        tap(row => {
+          if (treeCallback) {
+            accumulate(row);
+            maybeEmitTree();
+          }
+        }),
+
         // Batch for efficient database writes
         bufferCount(config.batchSize || 1000),
 
@@ -585,6 +653,7 @@ export function scanDirectory(
             filesIngested,
           });
           emitProgress('ingestion', `ingested ${filesIngested.toLocaleString()} files`);
+          emitTree(); // force a final provisional snapshot (full structure so far)
         })
       )
     ),

@@ -16,7 +16,10 @@
 		hoveredItem,
 		clearSelectedItem,
 		hydrateTagDictionary,
-		enrichmentInvalidation
+		enrichmentInvalidation,
+		activeProvisionalTree,
+		setProvisionalTree,
+		clearProvisionalTree
 	} from '$lib/stores';
 	import {
 		healthCheck,
@@ -37,11 +40,12 @@
 	import { Button } from '$lib/components/ui/button';
 	import { Alert, AlertDescription, AlertTitle } from '$lib/components/ui/alert';
 	import DropZone from '$lib/components/DropZone.svelte';
-	import ScanProgress from '$lib/components/ScanProgress.svelte';
+	import SkeletonIcicle from '$lib/components/SkeletonIcicle.svelte';
 	import StalactiteChart from '$lib/components/StalactiteChart.svelte';
 	import FileTable from '$lib/components/FileTable.svelte';
 	import TreeView from '$lib/components/TreeView.svelte';
 	import FileDetailsPanel from '$lib/components/FileDetailsPanel.svelte';
+	import StatusBar from '$lib/components/StatusBar.svelte';
 	import { LoaderCircle, CircleAlert, RefreshCw, Plus } from '@lucide/svelte';
 	import type { UnlistenFn } from '@tauri-apps/api/event';
 
@@ -90,9 +94,15 @@
 							addTerminalLineToScan(scan.id, line, 'stdout');
 						}
 
+						// Live directory tree → grow the provisional icicle during the scan
+						if (parsed?.event === 'scan:tree' && Array.isArray(parsed.directories)) {
+							setProvisionalTree(scan.id, parsed.directories as Parameters<typeof setProvisionalTree>[1]);
+						}
+
 						// Handle scan completion via job:complete
 						if (parsed?.event === 'job:complete') {
 							addTerminalLineToScan(scan.id, '✓ Scan completed successfully', 'success');
+							clearProvisionalTree(scan.id); // real DB-backed tree takes over
 							finishScanningScan(scan.id, true);
 							if (scan.id === $activeScan?.id) {
 								loadVisualizationData(scan.dbName, scan.id);
@@ -103,6 +113,7 @@
 						if (parsed?.event === 'job:error') {
 							const msg = (parsed.error as string) ?? 'Scan failed';
 							addTerminalLineToScan(scan.id, `✗ ${msg}`, 'error');
+							clearProvisionalTree(scan.id);
 							finishScanningScan(scan.id, false);
 						}
 					}
@@ -251,6 +262,7 @@
 		treeData = null;
 		statsData = null;
 		visualizationError = null;
+		clearProvisionalTree(scan.id); // drop any stale live-scan tree
 
 		// Generate job ID used for both event routing and job protocol
 		const jobId = generateId();
@@ -318,6 +330,8 @@
 
 <!-- Main Container -->
 <div class="flex h-full flex-col">
+	<!-- Content area: fills the space above the persistent status bar -->
+	<div class="flex min-h-0 flex-1 flex-col">
 	{#if !isInitialized && !initError}
 		<!-- Loading State -->
 		<div class="flex h-full items-center justify-center">
@@ -340,8 +354,14 @@
 			<DropZone onStartAnalysis={handleStartAnalysis} disabled={false} class="max-w-3xl" />
 		</div>
 	{:else if $activeScan?.state === 'scanning'}
-		<!-- Scanning State (Analysis in Progress) -->
-		<ScanProgress path={$activeScan?.path ?? ''} class="h-full" />
+		<!-- Scanning: the icicle grows live from streamed directory aggregates; until the
+		     first snapshot arrives, a chart-area skeleton stands in (no blocking splash).
+		     Live phase/progress is reported in the status bar. -->
+		{#if $activeProvisionalTree}
+			<StalactiteChart data={$activeProvisionalTree} provisional class="h-full w-full" />
+		{:else}
+			<SkeletonIcicle class="h-full" />
+		{/if}
 	{:else if $activeScan?.state === 'complete'}
 		<!-- Analysis Complete State with Visualization -->
 		<div class="flex h-full flex-col">
@@ -400,19 +420,6 @@
 				{#if $selectedItem || $hoveredItem}
 					<FileDetailsPanel />
 				{/if}
-
-				<!-- Minimal Status Bar -->
-				<div
-					class="flex h-5.5 shrink-0 items-center gap-1.5 border-t border-border bg-muted px-3 text-[11px] text-muted-foreground"
-				>
-					<span class="whitespace-nowrap">{fileCount.toLocaleString()} files</span>
-					<span class="text-[8px] opacity-40">•</span>
-					<span class="whitespace-nowrap">{folderCount.toLocaleString()} folders</span>
-					<span class="text-[8px] opacity-40">•</span>
-					<span class="whitespace-nowrap">{duplicateCount.toLocaleString()} duplicates</span>
-					<span class="text-[8px] opacity-40">•</span>
-					<span class="whitespace-nowrap">{formatBytes(totalSize)}</span>
-				</div>
 			{/if}
 		</div>
 	{:else if $activeScan?.state === 'error'}
@@ -435,6 +442,11 @@
 				Try again
 			</Button>
 		</div>
+	{/if}
+	</div>
+
+	{#if isInitialized && !initError}
+		<StatusBar {fileCount} {folderCount} {duplicateCount} {totalSize} />
 	{/if}
 </div>
 

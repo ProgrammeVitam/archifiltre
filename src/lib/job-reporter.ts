@@ -75,6 +75,9 @@ export class JobReporter {
           detail: detail ?? '',
         });
       },
+      onTree(directories) {
+        reporter.emit({ event: 'scan:tree', jobId: reporter.jobId, directories });
+      },
     };
   }
 
