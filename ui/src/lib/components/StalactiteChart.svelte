@@ -18,7 +18,8 @@
 		hoverFile,
 		clearHoveredItem,
 		enrichmentInvalidation,
-		selectedItem
+		selectedItem,
+		selectedItemSpan
 	} from '$lib/stores';
 	import { getFileType } from '$lib/file-types';
 	import { FolderOpenIcon } from '@lucide/svelte';
@@ -91,6 +92,25 @@
 	let contentHeight = $state(0);
 	let maxDepth = $state(0);
 
+	// Fixed-viewport zoom/pan. The canvas is a window onto content-space; the
+	// wheel zooms toward the cursor and dragging pans. zoom = 1 fits the current
+	// root to the viewport width (the floor — you can't dezoom past "see the whole
+	// root"). screen = content * zoom + pan.
+	let canvasWrapper: HTMLDivElement | undefined = $state();
+	let viewportHeight = $state(0);
+	let zoom = $state(1);
+	let panX = $state(0);
+	let panY = $state(0);
+	const MIN_ZOOM = 1;
+	const MAX_ZOOM = 40;
+	// Pointer state: pan on drag, select on a click that didn't drag.
+	let pointerDown = $state(false);
+	let dragged = false;
+	let pointerStartX = 0;
+	let pointerStartY = 0;
+	let panStartX = 0;
+	let panStartY = 0;
+
 	// Color mode
 	let colorMode: 'type' | 'date' = $state('type');
 
@@ -158,17 +178,16 @@
 	let resizeObserver: ResizeObserver | null = null;
 
 	onMount(() => {
-		if (canvas && container) {
+		if (canvas && canvasWrapper) {
 			ctx = canvas.getContext('2d');
-			// Initialize canvas size immediately
-			const rect = container.getBoundingClientRect();
+			// Initialise canvas to the viewport (the wrapper), not the content.
+			const rect = canvasWrapper.getBoundingClientRect();
 			const dpr = window.devicePixelRatio || 1;
 			canvasWidth = rect.width * dpr;
 			canvasHeight = rect.height * dpr;
+			viewportHeight = rect.height;
 			canvas.width = canvasWidth;
 			canvas.height = canvasHeight;
-			canvas.style.width = `${rect.width}px`;
-			canvas.style.height = `${rect.height}px`;
 			setupResizeObserver();
 			// Initial render
 			if (data) {
@@ -184,25 +203,27 @@
 	});
 
 	function setupResizeObserver() {
-		if (!container) return;
+		if (!canvasWrapper) return;
 
 		resizeObserver = new ResizeObserver((entries) => {
 			for (const entry of entries) {
-				const { width } = entry.contentRect;
+				const { width, height } = entry.contentRect;
 				const dpr = window.devicePixelRatio || 1;
-				if (canvas) {
-					canvas.width = width * dpr;
+				if (canvas && width > 0 && height > 0) {
+					canvas.width = Math.round(width * dpr);
+					canvas.height = Math.round(height * dpr);
 					canvasWidth = canvas.width;
-					canvas.style.width = `${width}px`;
-					// Height will be set based on content
-					updateCanvasHeight();
+					canvasHeight = canvas.height;
+					viewportHeight = height;
 				}
 				computeLayout();
+				clampView();
+				updateSelectedSpanFromTransform();
 				render();
 			}
 		});
 
-		resizeObserver.observe(container);
+		resizeObserver.observe(canvasWrapper);
 	}
 
 	// ================================
@@ -353,6 +374,10 @@
 			childrenMap = childrenMapDerived;
 			filesCache = new SvelteMap();
 			loadingFiles = new SvelteSet();
+			// Fresh tree → reset the view to fully zoomed out (root fills the width).
+			zoom = 1;
+			panX = 0;
+			panY = 0;
 		} else {
 			childrenMap = childrenMapDerived;
 		}
@@ -360,6 +385,7 @@
 		if (ctx && canvasWidth > 0) {
 			computeLayout();
 			updateCanvasHeight();
+			clampView();
 			render();
 			// Load files for all directories
 			loadFilesForAllDirectories();
@@ -389,10 +415,11 @@
 				const files = filesData.files.filter((f) => !f.is_directory);
 				filesCache.set(dirPath, files);
 				computeLayout();
-				// Async file loading can deepen the tree (new rows). Resize the canvas
-				// to fit the new depth, otherwise deeper rows are clipped and the icicle
-				// renders collapsed until a resize/color-toggle/re-query forces it.
+				// Async file loading can deepen the tree (new rows); refresh the content
+				// metric and re-clamp the pan so deeper rows stay reachable.
 				updateCanvasHeight();
+				clampView();
+				updateSelectedSpanFromTransform();
 				render();
 			} else {
 				filesCache.set(dirPath, []);
@@ -455,25 +482,72 @@
 				if (ctx) {
 					computeLayout();
 					updateCanvasHeight();
+					clampView();
+					updateSelectedSpanFromTransform();
 					render();
 				}
 			});
 		});
 	});
 
+	// Content metric only (CSS px). The canvas itself is the viewport (sized by
+	// the resize observer); this is the full height of the laid-out content,
+	// used to clamp panning so you can't drag the tree off-screen.
 	function updateCanvasHeight() {
-		if (!canvas || !container) return;
-
-		const dpr = window.devicePixelRatio || 1;
-		// Calculate height based on max depth, minimum 1 row
 		const rows = Math.max(1, maxDepth + 1);
 		contentHeight = rows * ROW_HEIGHT;
+	}
 
-		const newHeight = contentHeight * dpr;
-		if (canvas.height !== newHeight) {
-			canvas.height = newHeight;
-			canvasHeight = newHeight;
-		}
+	// ================================
+	// Zoom / pan (fixed viewport)
+	// ================================
+
+	function viewportCss(): { w: number; h: number } {
+		const dpr = window.devicePixelRatio || 1;
+		return { w: canvasWidth / dpr, h: canvasHeight / dpr };
+	}
+
+	// Keep the content anchored to the viewport: no zooming below MIN_ZOOM, and
+	// no panning that pulls a content edge inside the viewport (centre if smaller).
+	function clampView() {
+		zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom));
+		const { w: vw, h: vh } = viewportCss();
+		const scaledW = vw * zoom; // content width == viewport width at zoom 1
+		const scaledH = contentHeight * zoom;
+		panX = scaledW <= vw ? (vw - scaledW) / 2 : Math.min(0, Math.max(vw - scaledW, panX));
+		panY = scaledH <= vh ? 0 : Math.min(0, Math.max(vh - scaledH, panY));
+	}
+
+	// The selection conduit is the elastic joint: as the view zooms/pans, re-read
+	// the selected block's on-screen span so the panel ribbon tracks it live.
+	function updateSelectedSpanFromTransform() {
+		const path = selectedPath;
+		if (!path) return; // root / nothing → full-width conduit, nothing to track
+		const rect = layoutRects.find((r) => (r.node?.path ?? r.file?.path) === path);
+		if (!rect) return;
+		selectedItemSpan.set({
+			left: rect.x * zoom + panX,
+			right: (rect.x + rect.width) * zoom + panX,
+			color: rect.color
+		});
+	}
+
+	function handleWheel(e: WheelEvent) {
+		e.preventDefault();
+		if (!canvas) return;
+		const r = canvas.getBoundingClientRect();
+		const px = e.clientX - r.left;
+		const py = e.clientY - r.top;
+		const factor = Math.exp(-e.deltaY * 0.0015);
+		const newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom * factor));
+		const k = newZoom / zoom;
+		// Keep the point under the cursor fixed while scaling.
+		panX = px - (px - panX) * k;
+		panY = py - (py - panY) * k;
+		zoom = newZoom;
+		clampView();
+		updateSelectedSpanFromTransform();
+		render();
 	}
 
 	function computeLayout() {
@@ -664,6 +738,8 @@
 		colorMode = mode;
 		computeLayout();
 		updateCanvasHeight();
+		clampView();
+		updateSelectedSpanFromTransform(); // colours changed → refresh conduit tint
 		render();
 	}
 
@@ -678,13 +754,15 @@
 		const viewWidth = canvasWidth / dpr;
 		const viewHeight = canvasHeight / dpr;
 
-		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-		// Clear canvas with transparent background
-		ctx.clearRect(0, 0, viewWidth, viewHeight);
+		// Clear the whole viewport (device space), then apply the zoom/pan view
+		// transform so all content-space drawing below lands in the right place.
+		ctx.setTransform(1, 0, 0, 1, 0, 0);
+		ctx.clearRect(0, 0, canvasWidth, canvasHeight);
+		ctx.setTransform(dpr * zoom, 0, 0, dpr * zoom, dpr * panX, dpr * panY);
 
 		if (layoutRects.length === 0) {
-			// Show empty state
+			// Show empty state (in untransformed viewport space, centred)
+			ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 			ctx.fillStyle = '#64748b';
 			ctx.font = '14px system-ui, sans-serif';
 			ctx.textAlign = 'center';
@@ -729,9 +807,9 @@
 			ctx.fillStyle = isHovered ? lightenColor(rect.color, 0.15) : rect.color;
 			ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
 
-			// Draw border
+			// Draw border (keep ~1px on screen regardless of zoom)
 			ctx.strokeStyle = 'rgba(0, 0, 0, 0.3)';
-			ctx.lineWidth = 1;
+			ctx.lineWidth = 1 / zoom;
 			ctx.strokeRect(rect.x, rect.y, rect.width, rect.height);
 
 			// Draw enrichment bands (v4 layout): stacked strips from the top edge,
@@ -753,7 +831,7 @@
 					ctx.strokeStyle = bandSeparatorColor(
 						isHovered ? lightenColor(rect.color, 0.15) : rect.color
 					);
-					ctx.lineWidth = 1;
+					ctx.lineWidth = 1 / zoom;
 					ctx.beginPath();
 					for (let i = 1; i <= bands.length; i++) {
 						const y = Math.round(rect.y + 1 + i * bandHeight) + 0.5;
@@ -764,9 +842,11 @@
 				}
 			}
 
-			// Draw text if there's enough space
-			const scaledWidth = rect.width;
-			const scaledHeight = rect.height;
+			// Draw text if there's enough space ON SCREEN — labels reveal as you
+			// zoom in (progressive disclosure), so a block too narrow for its name
+			// at one zoom shows it once magnified.
+			const scaledWidth = rect.width * zoom;
+			const scaledHeight = rect.height * zoom;
 
 			if (scaledWidth > 40 && scaledHeight > 14) {
 				ctx.fillStyle = '#ffffff';
@@ -805,81 +885,117 @@
 	// Hit Testing
 	// ================================
 
-	function findRectAt(screenX: number, screenY: number): LayoutRect | null {
-		// Use screen coordinates directly (no pan/zoom)
-		const x = screenX;
-		const y = screenY;
-
-		// Check rectangles in reverse order (top-most first)
-		// Search in reverse (topmost first)
+	function findRectAt(contentX: number, contentY: number): LayoutRect | null {
+		// Coordinates are in content space (the caller inverts the view transform).
+		// Search in reverse (topmost first).
 		for (let i = layoutRects.length - 1; i >= 0; i--) {
 			const rect = layoutRects[i];
-			if (x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height) {
+			if (
+				contentX >= rect.x &&
+				contentX <= rect.x + rect.width &&
+				contentY >= rect.y &&
+				contentY <= rect.y + rect.height
+			) {
 				return rect;
 			}
 		}
 		return null;
 	}
 
+	// Screen (canvas CSS px) → content space, inverting the zoom/pan transform.
+	function toContent(e: { clientX: number; clientY: number }): { x: number; y: number } {
+		const r = canvas!.getBoundingClientRect();
+		return {
+			x: (e.clientX - r.left - panX) / zoom,
+			y: (e.clientY - r.top - panY) / zoom
+		};
+	}
+
+	// On-screen span of a hit block (canvas CSS px), for the conduit.
+	function spanOf(hit: LayoutRect) {
+		return {
+			left: hit.x * zoom + panX,
+			right: (hit.x + hit.width) * zoom + panX,
+			color: hit.color
+		};
+	}
+
 	// ================================
 	// Event Handlers
 	// ================================
 
-	function handleMouseMove(e: MouseEvent) {
+	const DRAG_THRESHOLD = 4; // px before a press becomes a pan rather than a click
+
+	function handlePointerDown(e: PointerEvent) {
+		if (!canvas) return;
+		pointerDown = true;
+		dragged = false;
+		pointerStartX = e.clientX;
+		pointerStartY = e.clientY;
+		panStartX = panX;
+		panStartY = panY;
+		canvas.setPointerCapture(e.pointerId);
+	}
+
+	function handlePointerMove(e: PointerEvent) {
 		if (!canvas) return;
 
-		const rect = canvas.getBoundingClientRect();
-		mouseX = e.clientX - rect.left;
-		mouseY = e.clientY - rect.top;
+		if (pointerDown) {
+			const dx = e.clientX - pointerStartX;
+			const dy = e.clientY - pointerStartY;
+			if (!dragged && Math.hypot(dx, dy) > DRAG_THRESHOLD) dragged = true;
+			if (dragged) {
+				panX = panStartX + dx;
+				panY = panStartY + dy;
+				clampView();
+				updateSelectedSpanFromTransform();
+				render();
+				return;
+			}
+		}
 
-		// Hit test for hover
-		const hit = findRectAt(mouseX, mouseY);
+		// Hover hit-test (content space)
+		const { x, y } = toContent(e);
+		const hit = findRectAt(x, y);
 		if (hit !== hoveredRect) {
 			hoveredRect = hit;
 			render();
-
-			// Update hover stores for drawer preview
 			if (hit) {
-				const span = { left: hit.x, right: hit.x + hit.width, color: hit.color };
-				if (hit.node) {
-					hoverDirectory(hit.node, span);
-				} else if (hit.file) {
-					hoverFile(hit.file, span);
-				}
+				const span = spanOf(hit);
+				if (hit.node) hoverDirectory(hit.node, span);
+				else if (hit.file) hoverFile(hit.file, span);
 			} else {
 				clearHoveredItem();
 			}
 		}
 	}
 
-	function handleMouseLeave() {
+	function handlePointerUp(e: PointerEvent) {
+		if (!canvas) return;
+		canvas.releasePointerCapture(e.pointerId);
+		const wasDrag = dragged;
+		pointerDown = false;
+		dragged = false;
+		if (wasDrag) return; // a pan, not a selection
+
+		// Click → select the block under the pointer.
+		const { x, y } = toContent(e);
+		const hit = findRectAt(x, y);
+		if (hit) {
+			const span = spanOf(hit);
+			if (hit.node) selectDirectory(hit.node, span);
+			else if (hit.file) selectFile(hit.file, span);
+		}
+	}
+
+	function handlePointerLeave() {
 		hoveredRect = null;
 		clearHoveredItem();
 		render();
 	}
-
-	function handleClick(e: MouseEvent) {
-		if (!canvas) return;
-
-		const rect = canvas.getBoundingClientRect();
-		const clickX = e.clientX - rect.left;
-		const clickY = e.clientY - rect.top;
-
-		const hit = findRectAt(clickX, clickY);
-		if (hit) {
-			// On-screen horizontal span of the block, in canvas CSS pixels (which the
-			// panel shares) — the conduit connector flares from this span to the panel.
-			const span = { left: hit.x, right: hit.x + hit.width, color: hit.color };
-			if (hit.node) {
-				selectDirectory(hit.node, span);
-			} else if (hit.file) {
-				selectFile(hit.file, span);
-			}
-		}
-	}
 </script>
 
-<div class="w-full {className}">
+<div class="flex w-full flex-col {className}">
 	<!-- Top bar: persistent root-folder label (the corner the chart unfolds from) + color mode toggle -->
 	<div class="flex items-center justify-between gap-2 px-2 pb-1">
 		{#if rootName}
@@ -912,13 +1028,13 @@
 		</div>
 	</div>
 
-	<!-- Chart container -->
-	<div bind:this={container} class="w-full">
+	<!-- Chart container: fills the pane; the canvas below is a fixed viewport -->
+	<div bind:this={container} class="relative flex min-h-0 w-full flex-1 flex-col">
 		<!-- Ambient "black hole" conduit: the icicle unfolds from the corner label.
 		     Faint by design so it frames rather than competes with the selection conduit. -->
 		<svg
 			bind:clientWidth={chartWidth}
-			class="pointer-events-none block w-full overflow-visible"
+			class="pointer-events-none block w-full shrink-0 overflow-visible"
 			style="height: {CORNER_CONDUIT_HEIGHT}px; color: var(--color-type-folder);"
 			aria-hidden="true"
 		>
@@ -939,14 +1055,15 @@
 			</defs>
 			<path d={cornerConduitPath} fill="url(#corner-conduit)" />
 		</svg>
-		<div class="relative w-full">
+		<div bind:this={canvasWrapper} class="relative min-h-0 w-full flex-1 overflow-hidden">
 			<canvas
 				bind:this={canvas}
-				onmousemove={handleMouseMove}
-				onmouseleave={handleMouseLeave}
-				onclick={handleClick}
-				class="block w-full cursor-pointer"
-				style="height: {contentHeight}px;"
+				onwheel={handleWheel}
+				onpointerdown={handlePointerDown}
+				onpointermove={handlePointerMove}
+				onpointerup={handlePointerUp}
+				onpointerleave={handlePointerLeave}
+				class="absolute inset-0 block h-full w-full {pointerDown ? 'cursor-grabbing' : 'cursor-grab'}"
 			></canvas>
 		</div>
 	</div>

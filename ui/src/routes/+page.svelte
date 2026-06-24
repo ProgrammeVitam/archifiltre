@@ -423,11 +423,13 @@
 					</div>
 				</div>
 			{:else if treeData}
-				<!-- Visualization Content -->
+				<!-- Visualization + details, split top-to-bottom. The chart is the finder,
+				     the panel the workspace, so when the panel is open the split follows the
+				     golden ratio: chart ~38.2% (top), panel ~61.8% (bottom). With no selection
+				     the chart fills the height. -->
 				<div
-					class="flex flex-col overflow-auto p-4 pb-0"
-					class:flex-1={!$selectedItem && !$hoveredItem}
-					class:shrink-0={$selectedItem || $hoveredItem}
+					class="flex min-h-0 flex-col overflow-hidden p-4 pb-0"
+					style:flex={$selectedItem || $hoveredItem ? '0 0 38.2%' : '1 1 0%'}
 				>
 					{#if $viewMode === 'stalactite'}
 						<StalactiteChart data={treeData} onRootClick={selectRoot} class="h-full w-full" />
