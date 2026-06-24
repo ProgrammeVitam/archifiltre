@@ -647,6 +647,8 @@ export interface ElementEnrichment {
 	tagIds: string[];
 	directlyTaggedForDeletion: boolean;
 	ancestorTaggedForDeletion: boolean;
+	/** Aliases for this element and its ancestors, keyed by path (breadcrumb display). */
+	pathAliases: Record<string, string>;
 }
 
 /** Set or clear an element's alias. Empty/equal-to-name clears it (backend). */

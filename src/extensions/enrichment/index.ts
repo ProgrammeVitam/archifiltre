@@ -102,6 +102,12 @@ export interface GetElementEnrichmentResult {
   directlyTaggedForDeletion: boolean;
   /** An ancestor directory is marked for deletion (cascades visually) */
   ancestorTaggedForDeletion: boolean;
+  /**
+   * Aliases for this element and any ancestor that has one, keyed by path, so
+   * the breadcrumb can display the alias for every segment (matching the chart
+   * labels and v4). Only paths that actually have an alias are present.
+   */
+  pathAliases: Record<string, string>;
 }
 
 // === Helpers ===
@@ -460,10 +466,12 @@ export async function handleGetElementEnrichment(
   const placeholders = candidates.map((_, i) => `$${i + 2}`).join(', ');
 
   const [aliasRes, commentRes, tagRes, deleteRes] = await Promise.all([
-    db.pg.query<{ alias: string }>(`SELECT alias FROM aliases WHERE run_id = $1 AND path = $2`, [
-      runId,
-      path,
-    ]),
+    // Aliases for this path AND its ancestors, so the breadcrumb can alias every
+    // segment (not just the selected one).
+    db.pg.query<{ path: string; alias: string }>(
+      `SELECT path, alias FROM aliases WHERE run_id = $1 AND path IN (${placeholders})`,
+      [runId, ...candidates]
+    ),
     db.pg.query<{ comment: string }>(
       `SELECT comment FROM comments WHERE run_id = $1 AND path = $2`,
       [runId, path]
@@ -481,12 +489,16 @@ export async function handleGetElementEnrichment(
   const directlyTaggedForDeletion = deleteRes.rows.some(r => r.path === path);
   const ancestorTaggedForDeletion = deleteRes.rows.some(r => r.path !== path);
 
+  const pathAliases: Record<string, string> = {};
+  for (const row of aliasRes.rows) pathAliases[row.path] = row.alias;
+
   return {
-    alias: aliasRes.rows[0]?.alias ?? null,
+    alias: pathAliases[path] ?? null,
     comment: commentRes.rows[0]?.comment ?? null,
     tagIds: tagRes.rows.map(r => r.tag_id),
     directlyTaggedForDeletion,
     ancestorTaggedForDeletion,
+    pathAliases,
   };
 }
 

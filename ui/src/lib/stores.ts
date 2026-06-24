@@ -924,6 +924,47 @@ export const sortedTags = derived(tagDictionary, ($d) =>
 );
 
 // ================================
+// Enrichment — save status (feedback)
+// ================================
+//
+// Ephemeral UI feedback for enrichment writes, driven by the actual DB ack (never
+// optimistic, so it can't lie). The details panel reports each write; the status
+// bar reflects the latest. 'saved' auto-clears after a moment; 'error' persists
+// until the next write.
+
+export type SaveState = 'idle' | 'saving' | 'saved' | 'error';
+
+export interface EnrichmentSaveStatus {
+	state: SaveState;
+	/** Which field the status refers to: 'alias' | 'comment' | 'tag' | 'deletion'. */
+	field: string | null;
+	at: number;
+}
+
+export const enrichmentSaveStatus = writable<EnrichmentSaveStatus>({
+	state: 'idle',
+	field: null,
+	at: 0
+});
+
+let saveStatusResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+/** Report the outcome of an enrichment write. Drives the status bar + per-field UI. */
+export function reportSaveStatus(state: SaveState, field: string | null = null): void {
+	enrichmentSaveStatus.set({ state, field, at: Date.now() });
+	if (saveStatusResetTimer) {
+		clearTimeout(saveStatusResetTimer);
+		saveStatusResetTimer = null;
+	}
+	// 'saved' is transient; 'saving' resolves to saved/error; 'error' persists.
+	if (state === 'saved') {
+		saveStatusResetTimer = setTimeout(() => {
+			enrichmentSaveStatus.set({ state: 'idle', field: null, at: Date.now() });
+		}, 2000);
+	}
+}
+
+// ================================
 // Enrichment — live invalidation
 // ================================
 //

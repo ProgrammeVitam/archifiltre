@@ -61,6 +61,9 @@
 	--color-enrich-comment: #03a1d6; /* has a comment */
 	--color-enrich-tag: #0a3264; /* has a tag */
 
+	/* Feedback: successful save (green border-settle + status bar "Saved") */
+	--color-success: #22c55e;
+
 	/* Window styling */
 	--window-radius: 12px;
 	--window-shadow: 0 12px 20px rgba(0, 0, 0, 0.25), 0 6px 10px rgba(0, 0, 0, 0.15);

@@ -7,7 +7,8 @@
 		clearSelectedItem,
 		tagDictionary,
 		addTagToDictionary,
-		invalidateEnrichment
+		invalidateEnrichment,
+		reportSaveStatus
 	} from '$lib/stores';
 	import {
 		formatBytes,
@@ -86,6 +87,27 @@
 	let commentInput = $state('');
 	let tagInput = $state('');
 
+	// Per-field save feedback: 'saved' = brief green border-settle, 'error' = red
+	// border + inline message (persists until re-edit). Driven by the DB ack.
+	type FieldState = 'idle' | 'saved' | 'error';
+	let aliasFieldState = $state<FieldState>('idle');
+	let commentFieldState = $state<FieldState>('idle');
+	let tagError = $state(false);
+	let aliasSettleTimer: ReturnType<typeof setTimeout> | null = null;
+	let commentSettleTimer: ReturnType<typeof setTimeout> | null = null;
+
+	function settleSaved(field: 'alias' | 'comment') {
+		if (field === 'alias') {
+			aliasFieldState = 'saved';
+			if (aliasSettleTimer) clearTimeout(aliasSettleTimer);
+			aliasSettleTimer = setTimeout(() => (aliasFieldState = 'idle'), 700);
+		} else {
+			commentFieldState = 'saved';
+			if (commentSettleTimer) clearTimeout(commentSettleTimer);
+			commentSettleTimer = setTimeout(() => (commentFieldState = 'idle'), 700);
+		}
+	}
+
 	let isItemTagged = $derived(
 		!!elementEnrichment &&
 			(elementEnrichment.directlyTaggedForDeletion || elementEnrichment.ancestorTaggedForDeletion)
@@ -109,6 +131,9 @@
 			aliasInput = '';
 			commentInput = '';
 			tagInput = '';
+			aliasFieldState = 'idle';
+			commentFieldState = 'idle';
+			tagError = false;
 			getElementEnrichment(item.path).then((result) => {
 				if (enrichmentPath === item.path) {
 					elementEnrichment = result;
@@ -131,25 +156,54 @@
 	async function commitAlias() {
 		const item = $selectedItem;
 		if (!item || !elementEnrichment) return;
-		const ok = await setAlias(item.path, aliasInput);
-		if (!ok) return;
 		// The backend clears the alias when empty or equal to the original name.
 		const trimmed = aliasInput.trim();
 		const effective = trimmed === '' || trimmed === originalName ? null : trimmed;
-		elementEnrichment = { ...elementEnrichment, alias: effective };
+		// No-op: unchanged → no write, no flash.
+		if (effective === (elementEnrichment.alias ?? null)) {
+			aliasFieldState = 'idle';
+			return;
+		}
+		reportSaveStatus('saving', 'alias');
+		const ok = await setAlias(item.path, aliasInput);
+		if (!ok) {
+			aliasInput = elementEnrichment.alias ?? ''; // revert to last-saved
+			aliasFieldState = 'error';
+			reportSaveStatus('error', 'alias');
+			return;
+		}
+		// Keep pathAliases (used by the breadcrumb) in sync with the edit.
+		const pathAliases = { ...elementEnrichment.pathAliases };
+		if (effective === null) delete pathAliases[item.path];
+		else pathAliases[item.path] = effective;
+		elementEnrichment = { ...elementEnrichment, alias: effective, pathAliases };
 		aliasInput = effective ?? '';
 		invalidateEnrichment(item.path, false);
+		settleSaved('alias');
+		reportSaveStatus('saved', 'alias');
 	}
 
 	async function commitComment() {
 		const item = $selectedItem;
 		if (!item || !elementEnrichment) return;
-		const ok = await setComment(item.path, commentInput);
-		if (!ok) return;
 		const effective = commentInput.trim() === '' ? null : commentInput;
+		if (effective === (elementEnrichment.comment ?? null)) {
+			commentFieldState = 'idle';
+			return;
+		}
+		reportSaveStatus('saving', 'comment');
+		const ok = await setComment(item.path, commentInput);
+		if (!ok) {
+			commentInput = elementEnrichment.comment ?? ''; // revert
+			commentFieldState = 'error';
+			reportSaveStatus('error', 'comment');
+			return;
+		}
 		elementEnrichment = { ...elementEnrichment, comment: effective };
 		commentInput = effective ?? '';
 		invalidateEnrichment(item.path, false);
+		settleSaved('comment');
+		reportSaveStatus('saved', 'comment');
 	}
 
 	async function submitTag() {
@@ -157,6 +211,7 @@
 		const name = tagInput.trim();
 		if (!item || !elementEnrichment || name === '') return;
 
+		reportSaveStatus('saving', 'tag');
 		// Reuse an existing tag of the same name (case-insensitive), else create one.
 		const existing = [...$tagDictionary.entries()].find(
 			([, n]) => n.toLowerCase() === name.toLowerCase()
@@ -166,37 +221,62 @@
 			tagId = existing[0];
 		} else {
 			const created = await createTag(name);
-			if (!created) return;
+			if (!created) {
+				tagError = true;
+				reportSaveStatus('error', 'tag');
+				return;
+			}
 			addTagToDictionary(created.tag_id, created.name);
 			tagId = created.tag_id;
 		}
 
 		const ok = await assignTag(tagId, item.path);
-		if (ok && !elementEnrichment.tagIds.includes(tagId)) {
+		if (!ok) {
+			tagError = true;
+			reportSaveStatus('error', 'tag');
+			return;
+		}
+		tagError = false;
+		if (!elementEnrichment.tagIds.includes(tagId)) {
 			elementEnrichment = { ...elementEnrichment, tagIds: [...elementEnrichment.tagIds, tagId] };
 		}
 		tagInput = '';
-		if (ok) invalidateEnrichment(item.path, false);
+		invalidateEnrichment(item.path, false);
+		reportSaveStatus('saved', 'tag');
 	}
 
 	async function removeTagAssignment(tagId: string) {
 		const item = $selectedItem;
 		if (!item || !elementEnrichment) return;
+		reportSaveStatus('saving', 'tag');
 		const ok = await unassignTag(tagId, item.path);
-		if (ok) {
-			elementEnrichment = {
-				...elementEnrichment,
-				tagIds: elementEnrichment.tagIds.filter((id) => id !== tagId)
-			};
-			invalidateEnrichment(item.path, false);
+		if (!ok) {
+			tagError = true;
+			reportSaveStatus('error', 'tag');
+			return;
 		}
+		tagError = false;
+		elementEnrichment = {
+			...elementEnrichment,
+			tagIds: elementEnrichment.tagIds.filter((id) => id !== tagId)
+		};
+		invalidateEnrichment(item.path, false);
+		reportSaveStatus('saved', 'tag');
 	}
 
-	// Parse path into breadcrumb segments
+	// Parse path into breadcrumb segments, displaying the alias for any segment
+	// that has one (matching the chart labels and v4). Aliases come from the
+	// selected element's enrichment (self + ancestors); only applied when the
+	// loaded enrichment matches the displayed item (not a transient hover preview).
 	let breadcrumbs = $derived(() => {
 		if (!displayItem) return [];
 		const parts = displayItem.path.split('/').filter(Boolean);
-		return parts;
+		const aliases =
+			enrichmentPath === displayItem.path ? (elementEnrichment?.pathAliases ?? {}) : {};
+		return parts.map((segment, i) => {
+			const cumulativePath = parts.slice(0, i + 1).join('/');
+			return { segment, display: aliases[cumulativePath] ?? segment };
+		});
 	});
 
 	// Fetch AI description when a directory is selected
@@ -353,19 +433,17 @@
 		const item = $selectedItem;
 		if (!item || !elementEnrichment) return;
 
-		if (elementEnrichment.directlyTaggedForDeletion) {
-			const success = await removeDeleteTag(item.path);
-			if (success) {
-				elementEnrichment = { ...elementEnrichment, directlyTaggedForDeletion: false };
-				invalidateEnrichment(item.path, true);
-			}
-		} else {
-			const success = await setDeleteTag(item.path);
-			if (success) {
-				elementEnrichment = { ...elementEnrichment, directlyTaggedForDeletion: true };
-				invalidateEnrichment(item.path, true);
-			}
+		reportSaveStatus('saving', 'deletion');
+		const wasTagged = elementEnrichment.directlyTaggedForDeletion;
+		const success = wasTagged ? await removeDeleteTag(item.path) : await setDeleteTag(item.path);
+		if (!success) {
+			reportSaveStatus('error', 'deletion');
+			return;
 		}
+		// The badge + red band are the positive ack; the status bar mirrors it.
+		elementEnrichment = { ...elementEnrichment, directlyTaggedForDeletion: !wasTagged };
+		invalidateEnrichment(item.path, true);
+		reportSaveStatus('saved', 'deletion');
 	}
 </script>
 
@@ -393,7 +471,7 @@
 				<div
 					class="flex min-w-0 flex-1 items-center gap-1.5 overflow-x-auto text-sm text-muted-foreground"
 				>
-					{#each breadcrumbs() as segment, i}
+					{#each breadcrumbs() as crumb, i}
 						{#if i > 0}
 							<ChevronRightIcon class="h-3 w-3 shrink-0 text-muted-foreground/50" />
 						{/if}
@@ -410,11 +488,11 @@
 									{@const TypeIcon = getFileTypeIcon(displayItem.name)}
 									<TypeIcon class="h-4 w-4 shrink-0" />
 								{/if}
-								{segment}
+								{crumb.display}
 							</span>
 						{:else}
 							<span class="shrink-0 rounded px-1.5 py-0.5 transition-colors hover:bg-muted">
-								{segment}
+								{crumb.display}
 							</span>
 						{/if}
 					{/each}
@@ -620,9 +698,18 @@
 										type="text"
 										bind:value={aliasInput}
 										onblur={commitAlias}
+										oninput={() => aliasFieldState === 'error' && (aliasFieldState = 'idle')}
 										onkeydown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
 										placeholder={originalName}
+										class={aliasFieldState === 'saved'
+											? 'border-[var(--color-success)]'
+											: aliasFieldState === 'error'
+												? 'border-destructive'
+												: 'transition-colors duration-700'}
 									/>
+									{#if aliasFieldState === 'error'}
+										<span class="text-xs text-destructive">Couldn't save alias — try again</span>
+									{/if}
 								</label>
 
 								<!-- Comment -->
@@ -634,9 +721,18 @@
 									<Textarea
 										bind:value={commentInput}
 										onblur={commitComment}
+										oninput={() => commentFieldState === 'error' && (commentFieldState = 'idle')}
 										rows={2}
 										placeholder="Add a comment…"
+										class={commentFieldState === 'saved'
+											? 'border-[var(--color-success)]'
+											: commentFieldState === 'error'
+												? 'border-destructive'
+												: 'transition-colors duration-700'}
 									/>
+									{#if commentFieldState === 'error'}
+										<span class="text-xs text-destructive">Couldn't save comment — try again</span>
+									{/if}
 								</label>
 
 								<!-- Tags -->
@@ -666,10 +762,12 @@
 										<Input
 											type="text"
 											bind:value={tagInput}
+											oninput={() => tagError && (tagError = false)}
 											onkeydown={(e) => e.key === 'Enter' && (e.preventDefault(), submitTag())}
 											list="tag-suggestions"
 											placeholder="Add a tag…"
-											class="flex-1"
+											class={'flex-1 transition-colors duration-300 ' +
+												(tagError ? 'border-destructive' : '')}
 										/>
 										<datalist id="tag-suggestions">
 											{#each [...$tagDictionary.values()] as name}
@@ -687,6 +785,9 @@
 											Add
 										</Button>
 									</div>
+									{#if tagError}
+										<span class="text-xs text-destructive">Couldn't save tag — try again</span>
+									{/if}
 								</div>
 
 								<!-- Mark for deletion -->

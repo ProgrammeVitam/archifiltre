@@ -240,6 +240,20 @@ describe('enrichment extension', () => {
         tagIds: [],
         directlyTaggedForDeletion: false,
         ancestorTaggedForDeletion: false,
+        pathAliases: {},
+      });
+    });
+
+    it('returns aliases for the element and its ancestors (for the breadcrumb)', async () => {
+      await handleSetAlias(db, RUN_ID, 'docs', 'Documents'); // ancestor alias
+      await handleSetAlias(db, RUN_ID, 'docs/report.pdf', 'Final report'); // self alias
+      // docs/sub has no alias → absent from the map
+
+      const el = await handleGetElementEnrichment(db, RUN_ID, 'docs/report.pdf');
+      expect(el.alias).toBe('Final report');
+      expect(el.pathAliases).toEqual({
+        docs: 'Documents',
+        'docs/report.pdf': 'Final report',
       });
     });
 

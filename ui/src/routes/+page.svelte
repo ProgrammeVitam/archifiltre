@@ -335,12 +335,12 @@
 			</Alert>
 		</div>
 	{:else if $activeScan?.state === 'idle'}
-		<!-- Drop Zone State  -->
+		<!-- Drop Zone State (Selecting a Folder) -->
 		<div class="flex h-full items-center justify-center p-8">
 			<DropZone onStartAnalysis={handleStartAnalysis} disabled={false} class="max-w-3xl" />
 		</div>
 	{:else if $activeScan?.state === 'scanning'}
-		<!-- Scanning State  -->
+		<!-- Scanning State (Analysis in Progress) -->
 		<ScanProgress path={$activeScan?.path ?? ''} class="h-full" />
 	{:else if $activeScan?.state === 'complete'}
 		<!-- Analysis Complete State with Visualization -->
