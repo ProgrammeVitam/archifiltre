@@ -83,21 +83,30 @@
 	// root folder, or any positionless selection) flares from the full width —
 	// near-parallel walls reading "you're looking at everything". Two cubic
 	// beziers with vertical end-tangents (k = 0.5) give the smooth AC-hose curve.
-	const CONDUIT_HEIGHT = 72;
+	// The conduit reaches from the selected item's bottom edge (a stem the length
+	// of the gap up to the seam) down into a fixed flare that opens to the panel
+	// width. So it touches the item, however high in the finder it sits.
+	const CONDUIT_FLARE = 64;
+	const ROOT_STEM = 24; // fallback stem when there's no block (root)
 	let connectorWidth = $state(0);
+	let conduitGap = $derived(displaySpan?.gap ?? ROOT_STEM);
 	let conduitPath = $derived.by(() => {
 		const w = connectorWidth;
 		if (w <= 0) return '';
 		const topLeft = displaySpan?.left ?? 0;
 		const topRight = displaySpan?.right ?? w;
-		const h = CONDUIT_HEIGHT;
-		const k = 0.5 * h;
-		// topLeft → bottom-left (0), across to bottom-right (w), → topRight, close.
+		const s = conduitGap; // stem length = distance up to the item's bottom
+		const h = s + CONDUIT_FLARE;
+		const k = 0.5 * CONDUIT_FLARE; // curvature over the flare (vertical tangents)
+		// Stem up at the item's width to touch it, then flare to the full width
+		// (0..w spans the drawer card exactly, since both share the content inset).
 		return (
 			`M ${topLeft} 0 ` +
-			`C ${topLeft} ${k}, 0 ${h - k}, 0 ${h} ` +
+			`L ${topLeft} ${s} ` +
+			`C ${topLeft} ${s + k}, 0 ${h - k}, 0 ${h} ` +
 			`L ${w} ${h} ` +
-			`C ${w} ${h - k}, ${topRight} ${k}, ${topRight} 0 Z`
+			`C ${w} ${h - k}, ${topRight} ${s + k}, ${topRight} ${s} ` +
+			`L ${topRight} 0 Z`
 		);
 	});
 	// Tint the conduit toward the block's colour, strongest where it meets the
@@ -485,28 +494,29 @@
 
 {#if displayItem}
 	<div class="relative flex min-h-0 flex-1 flex-col px-4" class:opacity-80={isPreview}>
-		<!-- Conduit connector: a ribbon flaring from the selected block's span in the
-		     chart down to the full panel width. The chart and this svg share the same
-		     left inset and width, so the block's screen-x maps straight in. -->
-		<svg
+		<!-- Conduit connector. The flare's height is reserved in-flow by a spacer;
+		     the svg itself is absolute and reaches UP by the gap so its stem touches
+		     the selected block's bottom edge in the chart (painting over the finder,
+		     which sits above this panel). The chart and this svg share the same left
+		     inset and width, so the block's screen-x maps straight in. -->
+		<div class="w-full shrink-0" style="height: {CONDUIT_FLARE}px;"></div>
+		<div
 			bind:clientWidth={connectorWidth}
-			class="pointer-events-none h-[72px] w-full shrink-0 overflow-visible text-muted-foreground"
-			style="margin-top: -20px;"
+			class="pointer-events-none absolute left-4 right-4"
+			style="top: {-conduitGap}px; height: {conduitGap + CONDUIT_FLARE}px;"
 		>
-			<defs>
-				<linearGradient id="conduit-tint" x1="0" y1="0" x2="0" y2="1">
-					<stop offset="0%" stop-color={conduitTint} stop-opacity="0.5" />
-					<stop offset="100%" stop-color={conduitTint} stop-opacity="0.04" />
-				</linearGradient>
-			</defs>
-			<path
-				d={conduitPath}
-				fill="url(#conduit-tint)"
-				stroke={conduitTint}
-				stroke-opacity="0.4"
-				stroke-width="1"
-			/>
-		</svg>
+			<svg class="h-full w-full overflow-visible text-muted-foreground">
+				<defs>
+					<!-- Bottom-to-top: strongest where it meets the panel (the workspace),
+					     fading out toward the item, so it grows into the panel. -->
+					<linearGradient id="conduit-tint" x1="0" y1="0" x2="0" y2="1">
+						<stop offset="0%" stop-color={conduitTint} stop-opacity="0.04" />
+						<stop offset="100%" stop-color={conduitTint} stop-opacity="0.5" />
+					</linearGradient>
+				</defs>
+				<path d={conduitPath} fill="url(#conduit-tint)" />
+			</svg>
+		</div>
 
 		<!-- Drawer. No drop shadow: the conduit ties this to the chart as one
 		     surface, so a floating-card lift would fight that; the border and the

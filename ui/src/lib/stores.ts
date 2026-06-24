@@ -445,6 +445,10 @@ export interface ItemSpan {
 	/** The block's fill colour, so the conduit can tint toward it (a gradient
 	 *  "pour" of the block's identity into the detail view). Absent for the root. */
 	color?: string;
+	/** Distance (CSS px) from the block's on-screen bottom edge up to the chart's
+	 *  bottom (the seam). The conduit's stem extends up by this much so it touches
+	 *  the item. Updated live as the view zooms/pans. Absent for the root. */
+	gap?: number;
 }
 
 /** Span of the selected item (for drawing the conduit connector) */

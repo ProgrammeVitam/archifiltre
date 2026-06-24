@@ -520,6 +520,14 @@
 
 	// The selection conduit is the elastic joint: as the view zooms/pans, re-read
 	// the selected block's on-screen span so the panel ribbon tracks it live.
+	// Distance (CSS px) from a block's on-screen bottom edge up to the seam (the
+	// chart's bottom). The conduit stem extends up by this so it touches the item.
+	function gapToSeam(rect: LayoutRect): number {
+		const vh = viewportCss().h;
+		const bottom = (rect.y + rect.height) * zoom + panY;
+		return Math.max(0, Math.min(vh, vh - bottom));
+	}
+
 	function updateSelectedSpanFromTransform() {
 		const path = selectedPath;
 		if (!path) return; // root / nothing → full-width conduit, nothing to track
@@ -528,6 +536,7 @@
 		selectedItemSpan.set({
 			left: rect.x * zoom + panX,
 			right: (rect.x + rect.width) * zoom + panX,
+			gap: gapToSeam(rect),
 			color: rect.color
 		});
 	}
@@ -911,11 +920,13 @@
 		};
 	}
 
-	// On-screen span of a hit block (canvas CSS px), for the conduit.
+	// On-screen span of a hit block (canvas CSS px) + how far it sits above the
+	// seam, so the conduit can flare from the block's bottom down to the panel.
 	function spanOf(hit: LayoutRect) {
 		return {
 			left: hit.x * zoom + panX,
 			right: (hit.x + hit.width) * zoom + panX,
+			gap: gapToSeam(hit),
 			color: hit.color
 		};
 	}
