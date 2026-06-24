@@ -451,10 +451,12 @@ async function handleGetDirDateStats(
   runId: string,
   dirPath: string
 ): Promise<{ min: number | null; max: number | null; median: number | null; count: number }> {
+  // Root ('') aggregates the whole scan; any other directory matches its subtree.
+  const pattern = dirPath === '' ? '%' : dirPath + '/%';
   const result = await db.db.execute(sql`
     SELECT mtime FROM files
     WHERE run_id = ${runId}
-      AND path LIKE ${dirPath + '/%'}
+      AND path LIKE ${pattern}
       AND is_directory = false
       AND mtime > 0
     ORDER BY mtime ASC

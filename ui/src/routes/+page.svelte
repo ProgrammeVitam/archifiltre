@@ -15,6 +15,7 @@
 		selectedItem,
 		hoveredItem,
 		clearSelectedItem,
+		selectDirectory,
 		hydrateTagDictionary,
 		enrichmentInvalidation,
 		activeProvisionalTree,
@@ -221,6 +222,10 @@
 				if (stats) {
 					statsData = stats;
 				}
+
+				// Open the root folder in the details panel by default, so the user
+				// lands on a summary of the whole scan instead of a bare canvas.
+				selectRoot();
 			}
 		} catch (error) {
 			if (loadedForScanId === scanId) {
@@ -232,6 +237,23 @@
 				isLoadingVisualization = false;
 			}
 		}
+	}
+
+	// Select the scanned root folder: the empty relative path (parent of every
+	// top-level entry), with whole-scan totals from the stats. Used both as the
+	// default selection on load and when the chart's root label is clicked.
+	function selectRoot() {
+		const tree = treeData;
+		const stats = statsData;
+		if (!tree || !stats) return;
+		const rootName = (tree.root ?? '').split(/[/\\]/).filter(Boolean).pop() ?? 'Root';
+		selectDirectory({
+			path: '',
+			name: rootName,
+			total_size: stats.totalPhysicalSize,
+			file_count: stats.totalFiles,
+			dir_count: tree.directories.length
+		});
 	}
 
 	// Re-query the tree when enrichment changes so directory bands and the
@@ -408,7 +430,7 @@
 					class:shrink-0={$selectedItem || $hoveredItem}
 				>
 					{#if $viewMode === 'stalactite'}
-						<StalactiteChart data={treeData} class="h-full w-full" />
+						<StalactiteChart data={treeData} onRootClick={selectRoot} class="h-full w-full" />
 					{:else if $viewMode === 'tree'}
 						<TreeView data={treeData} class="h-full w-full" />
 					{:else}

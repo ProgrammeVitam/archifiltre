@@ -433,25 +433,39 @@ export interface SelectedItem {
 
 export const selectedItem = writable<SelectedItem | null>(null);
 
-/** X position of the selected item (for drawing picker line) */
-export const selectedItemX = writable<number | null>(null);
+/**
+ * On-screen horizontal span [left, right] of the selected block, in the chart's
+ * CSS-pixel space (which the details panel shares). The panel draws its conduit
+ * connector from this span down to the full panel width. `null` = no chart
+ * position (e.g. the root folder) → the connector spans the full width.
+ */
+export interface ItemSpan {
+	left: number;
+	right: number;
+	/** The block's fill colour, so the conduit can tint toward it (a gradient
+	 *  "pour" of the block's identity into the detail view). Absent for the root. */
+	color?: string;
+}
+
+/** Span of the selected item (for drawing the conduit connector) */
+export const selectedItemSpan = writable<ItemSpan | null>(null);
 
 /** Hovered item for preview in drawer */
 export const hoveredItem = writable<SelectedItem | null>(null);
 
-/** X position of the hovered item */
-export const hoveredItemX = writable<number | null>(null);
+/** Span of the hovered item */
+export const hoveredItemSpan = writable<ItemSpan | null>(null);
 
 /** Clear the selected item */
 export function clearSelectedItem(): void {
 	selectedItem.set(null);
-	selectedItemX.set(null);
+	selectedItemSpan.set(null);
 }
 
 /** Clear the hovered item */
 export function clearHoveredItem(): void {
 	hoveredItem.set(null);
-	hoveredItemX.set(null);
+	hoveredItemSpan.set(null);
 }
 
 /** Set the hovered item from a directory node */
@@ -463,7 +477,7 @@ export function hoverDirectory(
 		file_count: number;
 		dir_count: number;
 	},
-	xPosition?: number
+	span?: ItemSpan
 ): void {
 	hoveredItem.set({
 		type: 'directory',
@@ -474,8 +488,8 @@ export function hoverDirectory(
 		fileCount: node.file_count,
 		dirCount: node.dir_count
 	});
-	if (xPosition !== undefined) {
-		hoveredItemX.set(xPosition);
+	if (span) {
+		hoveredItemSpan.set(span);
 	}
 }
 
@@ -492,7 +506,7 @@ export function hoverFile(
 		is_archive?: boolean;
 		archive_format?: string | null;
 	},
-	xPosition?: number
+	span?: ItemSpan
 ): void {
 	hoveredItem.set({
 		type: 'file',
@@ -506,8 +520,8 @@ export function hoverFile(
 		isArchive: file.is_archive,
 		archiveFormat: file.archive_format
 	});
-	if (xPosition !== undefined) {
-		hoveredItemX.set(xPosition);
+	if (span) {
+		hoveredItemSpan.set(span);
 	}
 }
 
@@ -520,7 +534,7 @@ export function selectDirectory(
 		file_count: number;
 		dir_count: number;
 	},
-	xPosition?: number
+	span?: ItemSpan
 ): void {
 	selectedItem.set({
 		type: 'directory',
@@ -531,8 +545,8 @@ export function selectDirectory(
 		fileCount: node.file_count,
 		dirCount: node.dir_count
 	});
-	if (xPosition !== undefined) {
-		selectedItemX.set(xPosition);
+	if (span) {
+		selectedItemSpan.set(span);
 	}
 }
 
@@ -549,7 +563,7 @@ export function selectFile(
 		is_archive?: boolean;
 		archive_format?: string | null;
 	},
-	xPosition?: number
+	span?: ItemSpan
 ): void {
 	selectedItem.set({
 		type: 'file',
@@ -563,8 +577,8 @@ export function selectFile(
 		isArchive: file.is_archive,
 		archiveFormat: file.archive_format
 	});
-	if (xPosition !== undefined) {
-		selectedItemX.set(xPosition);
+	if (span) {
+		selectedItemSpan.set(span);
 	}
 }
 

@@ -17,9 +17,11 @@
 		hoverDirectory,
 		hoverFile,
 		clearHoveredItem,
-		enrichmentInvalidation
+		enrichmentInvalidation,
+		selectedItem
 	} from '$lib/stores';
 	import { getFileType } from '$lib/file-types';
+	import { FolderOpenIcon } from '@lucide/svelte';
 
 	// ================================
 	// Types
@@ -67,9 +69,11 @@
 		/** Provisional (live-scan) mode: render the streamed directory tree only;
 		 *  do NOT query files (the DB is being written and can't be read). */
 		provisional?: boolean;
+		/** Select the root folder (clicking the corner label). */
+		onRootClick?: () => void;
 	}
 
-	let { data, class: className = '', provisional = false }: Props = $props();
+	let { data, class: className = '', provisional = false, onRootClick }: Props = $props();
 
 	// ================================
 	// State
@@ -89,6 +93,45 @@
 
 	// Color mode
 	let colorMode: 'type' | 'date' = $state('type');
+
+	// Path of the current selection. Non-empty → spotlight that subtree (the node
+	// and its descendants stay vivid, the rest of the chart dims into context).
+	// '' (root) or null (nothing selected) → no dimming, the whole chart is lit.
+	let selectedPath = $derived($selectedItem?.path ?? null);
+	$effect(() => {
+		selectedPath; // re-render when the selection changes
+		render();
+	});
+
+	// The scanned root's display name (basename of the absolute root path),
+	// shown as a persistent corner label — the anchor the chart unfolds from.
+	let rootName = $derived(
+		data?.root ? (data.root.split(/[/\\]/).filter(Boolean).pop() ?? data.root) : ''
+	);
+	// Root is "selected" when nothing else is — highlight the corner label then.
+	let rootIsActive = $derived(($selectedItem?.path ?? '') === '');
+
+	// Ambient "black hole" conduit: a faint asymmetric ribbon flaring from the
+	// top-left corner (a singularity) out to the full chart width, so the icicle
+	// reads as unfolding from the root label. Same conduit grammar as the panel
+	// connector, mirrored into the seam above the chart. Mouth is a narrow corner
+	// slot; left edge hugs the margin, right edge sweeps to full width.
+	const CORNER_CONDUIT_HEIGHT = 30;
+	const CORNER_MOUTH = 52;
+	let chartWidth = $state(0);
+	let cornerConduitPath = $derived.by(() => {
+		const w = chartWidth;
+		if (w <= 0) return '';
+		const h = CORNER_CONDUIT_HEIGHT;
+		const k = 0.55 * h;
+		// mouth [0, CORNER_MOUTH] at top → base [0, w] at bottom.
+		return (
+			`M 0 0 ` +
+			`C 0 ${k}, 0 ${h - k}, 0 ${h} ` +
+			`L ${w} ${h} ` +
+			`C ${w} ${h - k}, ${CORNER_MOUTH} ${k}, ${CORNER_MOUTH} 0 Z`
+		);
+	});
 
 	// Hover state
 	let hoveredRect: LayoutRect | null = $state(null);
@@ -674,6 +717,14 @@
 			const isHovered =
 				hoveredRect && (hoveredRect.node?.path ?? hoveredRect.file?.path) === rectPath;
 
+			// Spotlight the selected subtree: when a non-root node is selected, dim
+			// everything outside it (the node itself and its descendants stay vivid).
+			const inSelection =
+				!selectedPath ||
+				rectPath === selectedPath ||
+				rectPath.startsWith(selectedPath + '/');
+			ctx.globalAlpha = inSelection ? 1 : 0.35;
+
 			// Draw background
 			ctx.fillStyle = isHovered ? lightenColor(rect.color, 0.15) : rect.color;
 			ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
@@ -789,11 +840,11 @@
 
 			// Update hover stores for drawer preview
 			if (hit) {
-				const centerX = hit.x + hit.width / 2;
+				const span = { left: hit.x, right: hit.x + hit.width, color: hit.color };
 				if (hit.node) {
-					hoverDirectory(hit.node, centerX);
+					hoverDirectory(hit.node, span);
 				} else if (hit.file) {
-					hoverFile(hit.file, centerX);
+					hoverFile(hit.file, span);
 				}
 			} else {
 				clearHoveredItem();
@@ -816,20 +867,39 @@
 
 		const hit = findRectAt(clickX, clickY);
 		if (hit) {
-			// Calculate center X of the selected item (in screen coordinates)
-			const centerX = hit.x + hit.width / 2;
+			// On-screen horizontal span of the block, in canvas CSS pixels (which the
+			// panel shares) — the conduit connector flares from this span to the panel.
+			const span = { left: hit.x, right: hit.x + hit.width, color: hit.color };
 			if (hit.node) {
-				selectDirectory(hit.node, centerX);
+				selectDirectory(hit.node, span);
 			} else if (hit.file) {
-				selectFile(hit.file, centerX);
+				selectFile(hit.file, span);
 			}
 		}
 	}
 </script>
 
 <div class="w-full {className}">
-	<!-- Color mode toggle -->
-	<div class="flex justify-end px-2 pb-1">
+	<!-- Top bar: persistent root-folder label (the corner the chart unfolds from) + color mode toggle -->
+	<div class="flex items-center justify-between gap-2 px-2 pb-1">
+		{#if rootName}
+			<button
+				type="button"
+				onclick={() => onRootClick?.()}
+				class="flex min-w-0 items-center gap-1.5 rounded-md border px-2 py-0.5 text-sm font-medium text-foreground transition-colors"
+				style="border-color: color-mix(in srgb, var(--color-type-folder) {rootIsActive
+					? '55%'
+					: '30%'}, transparent); background: color-mix(in srgb, var(--color-type-folder) {rootIsActive
+					? '22%'
+					: '10%'}, transparent);"
+				title="Root folder — {rootName}"
+			>
+				<FolderOpenIcon class="h-4 w-4 shrink-0" style="color: var(--color-type-folder);" />
+				<span class="truncate">{rootName}</span>
+			</button>
+		{:else}
+			<span></span>
+		{/if}
 		<div class="flex items-center gap-0.5 rounded-lg bg-muted p-[3px]">
 			<button
 				class="cursor-pointer rounded-md border-none px-2.5 py-[5px] text-xs font-medium transition-all {colorMode === 'type' ? 'bg-background text-foreground shadow-sm' : 'bg-transparent text-muted-foreground'}"
@@ -844,6 +914,31 @@
 
 	<!-- Chart container -->
 	<div bind:this={container} class="w-full">
+		<!-- Ambient "black hole" conduit: the icicle unfolds from the corner label.
+		     Faint by design so it frames rather than competes with the selection conduit. -->
+		<svg
+			bind:clientWidth={chartWidth}
+			class="pointer-events-none block w-full overflow-visible"
+			style="height: {CORNER_CONDUIT_HEIGHT}px; color: var(--color-type-folder);"
+			aria-hidden="true"
+		>
+			<defs>
+				<!-- Energy concentrated at the top-left corner (the singularity), spilling
+				     out and fading across the chart — gravitational, not a flat band. -->
+				<radialGradient
+					id="corner-conduit"
+					gradientUnits="userSpaceOnUse"
+					cx="0"
+					cy="0"
+					r={Math.max(chartWidth * 0.85, 1)}
+				>
+					<stop offset="0%" stop-color="currentColor" stop-opacity="0.42" />
+					<stop offset="45%" stop-color="currentColor" stop-opacity="0.10" />
+					<stop offset="100%" stop-color="currentColor" stop-opacity="0" />
+				</radialGradient>
+			</defs>
+			<path d={cornerConduitPath} fill="url(#corner-conduit)" />
+		</svg>
 		<div class="relative w-full">
 			<canvas
 				bind:this={canvas}

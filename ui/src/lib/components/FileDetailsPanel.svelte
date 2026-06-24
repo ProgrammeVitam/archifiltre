@@ -1,9 +1,9 @@
 <script lang="ts">
 	import {
 		selectedItem,
-		selectedItemX,
+		selectedItemSpan,
 		hoveredItem,
-		hoveredItemX,
+		hoveredItemSpan,
 		clearSelectedItem,
 		tagDictionary,
 		addTagToDictionary,
@@ -74,8 +74,36 @@
 
 	// Determine which item to display: selected takes priority, then hovered
 	let displayItem = $derived($selectedItem ?? $hoveredItem);
-	let displayX = $derived($selectedItem ? $selectedItemX : $hoveredItemX);
+	let displaySpan = $derived($selectedItem ? $selectedItemSpan : $hoveredItemSpan);
 	let isPreview = $derived(!$selectedItem && !!$hoveredItem);
+
+	// Conduit connector geometry. The ribbon flares from the selected block's
+	// on-screen span (top) down to the full panel width (bottom), so its mouth
+	// reflects how much of the parent the selection occupies. A null span (the
+	// root folder, or any positionless selection) flares from the full width —
+	// near-parallel walls reading "you're looking at everything". Two cubic
+	// beziers with vertical end-tangents (k = 0.5) give the smooth AC-hose curve.
+	const CONDUIT_HEIGHT = 72;
+	let connectorWidth = $state(0);
+	let conduitPath = $derived.by(() => {
+		const w = connectorWidth;
+		if (w <= 0) return '';
+		const topLeft = displaySpan?.left ?? 0;
+		const topRight = displaySpan?.right ?? w;
+		const h = CONDUIT_HEIGHT;
+		const k = 0.5 * h;
+		// topLeft → bottom-left (0), across to bottom-right (w), → topRight, close.
+		return (
+			`M ${topLeft} 0 ` +
+			`C ${topLeft} ${k}, 0 ${h - k}, 0 ${h} ` +
+			`L ${w} ${h} ` +
+			`C ${w} ${h - k}, ${topRight} ${k}, ${topRight} 0 Z`
+		);
+	});
+	// Tint the conduit toward the block's colour, strongest where it meets the
+	// block (top) and fading out at the panel (bottom) so the block's identity
+	// "pours" into the detail view. Root (no colour) falls back to neutral slate.
+	let conduitTint = $derived(displaySpan?.color ?? 'currentColor');
 
 	// Per-element enrichment, read on selection (query-on-select). PGlite is the
 	// source of truth; this is not a long-lived cache — it is re-read whenever the
@@ -150,8 +178,11 @@
 		}
 	});
 
-	// The element's original (real) name, used to detect a no-op alias.
-	let originalName = $derived($selectedItem?.path.split('/').filter(Boolean).pop() ?? '');
+	// The element's original (real) name, used to detect a no-op alias. Falls back
+	// to the item's own name for the root folder (empty path has no last segment).
+	let originalName = $derived(
+		$selectedItem ? ($selectedItem.path.split('/').filter(Boolean).pop() ?? $selectedItem.name) : ''
+	);
 
 	async function commitAlias() {
 		const item = $selectedItem;
@@ -273,6 +304,11 @@
 		const parts = displayItem.path.split('/').filter(Boolean);
 		const aliases =
 			enrichmentPath === displayItem.path ? (elementEnrichment?.pathAliases ?? {}) : {};
+		// Root folder (empty path): a single crumb for the scanned directory itself.
+		if (parts.length === 0) {
+			const alias = enrichmentPath === displayItem.path ? elementEnrichment?.alias : null;
+			return [{ segment: displayItem.name, display: alias ?? displayItem.name }];
+		}
 		return parts.map((segment, i) => {
 			const cumulativePath = parts.slice(0, i + 1).join('/');
 			return { segment, display: aliases[cumulativePath] ?? segment };
@@ -447,22 +483,36 @@
 	}
 </script>
 
-{#if displayItem && displayX !== null}
+{#if displayItem}
 	<div class="relative flex min-h-0 flex-1 flex-col px-4" class:opacity-80={isPreview}>
-		<!-- Picker line - connector from chart to drawer -->
+		<!-- Conduit connector: a ribbon flaring from the selected block's span in the
+		     chart down to the full panel width. The chart and this svg share the same
+		     left inset and width, so the block's screen-x maps straight in. -->
 		<svg
-			class="pointer-events-none h-[75px] w-full shrink-0 overflow-visible"
+			bind:clientWidth={connectorWidth}
+			class="pointer-events-none h-[72px] w-full shrink-0 overflow-visible text-muted-foreground"
 			style="margin-top: -20px;"
 		>
-			<!-- Circle at top (near the selected item) -->
-			<circle cx={displayX} cy="8" r="5" fill="none" stroke="#94a3b8" stroke-width="2" />
-			<!-- Vertical line going down -->
-			<line x1={displayX} y1="13" x2={displayX} y2="95" stroke="#94a3b8" stroke-width="2" />
+			<defs>
+				<linearGradient id="conduit-tint" x1="0" y1="0" x2="0" y2="1">
+					<stop offset="0%" stop-color={conduitTint} stop-opacity="0.5" />
+					<stop offset="100%" stop-color={conduitTint} stop-opacity="0.04" />
+				</linearGradient>
+			</defs>
+			<path
+				d={conduitPath}
+				fill="url(#conduit-tint)"
+				stroke={conduitTint}
+				stroke-opacity="0.4"
+				stroke-width="1"
+			/>
 		</svg>
 
-		<!-- Drawer -->
+		<!-- Drawer. No drop shadow: the conduit ties this to the chart as one
+		     surface, so a floating-card lift would fight that; the border and the
+		     conduit's own edge already separate it. -->
 		<div
-			class="mb-4 flex flex-1 flex-col overflow-hidden rounded-lg border border-border bg-background shadow-xl"
+			class="mb-4 flex flex-1 flex-col overflow-hidden rounded-lg border border-border bg-background"
 		>
 			<!-- Breadcrumbs header -->
 			<div
