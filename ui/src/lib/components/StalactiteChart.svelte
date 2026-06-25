@@ -5,7 +5,6 @@
 		formatBytes,
 		buildTreeHierarchy,
 		getChildren,
-		getRootDirectories,
 		queryFiles,
 		type DirectoryNode,
 		type TreeData,
@@ -620,13 +619,13 @@
 
 		const rects: LayoutRect[] = [];
 
-		// Determine starting directories based on focus
-		let startDirs: DirectoryNode[];
-		let startDepth: number;
-
-		// Always start from root to show complete structure
-		startDirs = getRootDirectories(data.directories);
-		startDepth = startDirs.length > 0 ? startDirs[0].depth : 0;
+		// Start from the TRUE top-level directories (those whose parent is the
+		// scanned root) using the path-based hierarchy. The backend's `depth` field
+		// is unreliable (currently 0 for every dir), so getRootDirectories would
+		// treat nested dirs as roots and lay each one out twice — once nested, once
+		// flattened at the top. childrenMap[''] holds exactly the real top level.
+		const startDirs: DirectoryNode[] = getChildren('', childrenMap);
+		const startDepth = 0;
 
 		const totalSize = startDirs.reduce((sum, d) => sum + d.total_size, 0);
 		if (totalSize === 0) {
