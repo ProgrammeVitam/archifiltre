@@ -85,7 +85,11 @@ function resolveModel(optionModel?: string): string {
   if (envModel) return envModel;
 
   if (!defaultModelLogged) {
-    console.log(`[ai-describe] LLM_MODEL not set, using default model: ${DEFAULT_MODEL}`);
+    // MUST go to stderr, never stdout: the query sidecar's stdout is the
+    // JSON-lines protocol, and any stray line there is read as a (malformed)
+    // response by the Tauri host, breaking the query (this showed up as
+    // "No description available" for the first uncached folder).
+    console.error(`[ai-describe] LLM_MODEL not set, using default model: ${DEFAULT_MODEL}`);
     defaultModelLogged = true;
   }
   return DEFAULT_MODEL;
