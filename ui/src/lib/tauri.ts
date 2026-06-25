@@ -480,6 +480,31 @@ export async function queryDirDateStats(dirPath: string): Promise<DirDateStats |
 	return response.data as DirDateStats;
 }
 
+export interface CompositionEntry {
+	ext: string | null;
+	count: number;
+	size: number;
+}
+
+/**
+ * File-type composition (bytes + count grouped by extension) of a subtree.
+ * Requires an active query session. Pass '' for the whole scan.
+ */
+export async function queryComposition(dirPath: string): Promise<CompositionEntry[] | null> {
+	const response = await sendQuery({
+		id: `get_composition_${Date.now()}`,
+		action: 'get_composition',
+		path: dirPath
+	});
+
+	if (!response.ok) {
+		console.error('Failed to get composition:', response.error);
+		return null;
+	}
+
+	return response.data as CompositionEntry[];
+}
+
 // ================================
 // Thumbnail Cache Types & Helpers
 // ================================

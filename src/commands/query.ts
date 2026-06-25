@@ -479,6 +479,35 @@ async function handleGetDirDateStats(
   return { min, max, median, count: mtimes.length };
 }
 
+/**
+ * File-type composition of a subtree: bytes + count grouped by extension. The UI
+ * maps extensions to types for the audit's "what is this made of" breakdown.
+ * Root ('') covers the whole scan; any other directory covers its subtree.
+ */
+async function handleGetComposition(
+  db: DatabaseConnection,
+  runId: string,
+  dirPath: string
+): Promise<Array<{ ext: string | null; count: number; size: number }>> {
+  const pattern = dirPath === '' ? '%' : dirPath + '/%';
+  const result = await db.db.execute(sql`
+    SELECT
+      lower(substring(path from '\\.([^./]+)$')) as ext,
+      COUNT(*)::int as count,
+      COALESCE(SUM(physical_size), 0)::bigint as size
+    FROM files
+    WHERE run_id = ${runId}
+      AND is_directory = false
+      AND path LIKE ${pattern}
+    GROUP BY ext
+    ORDER BY size DESC
+  `);
+
+  return (result.rows as Array<{ ext: string | null; count: number | string; size: number | string }>).map(
+    r => ({ ext: r.ext ?? null, count: Number(r.count), size: Number(r.size) })
+  );
+}
+
 // === Main Command ===
 
 export default class Query extends Command {
@@ -564,6 +593,14 @@ export default class Query extends Command {
 
         case 'get_dir_date_stats':
           data = await handleGetDirDateStats(
+            this.database,
+            this.runId,
+            (request.path as string) ?? ''
+          );
+          break;
+
+        case 'get_composition':
+          data = await handleGetComposition(
             this.database,
             this.runId,
             (request.path as string) ?? ''

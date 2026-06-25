@@ -61,6 +61,10 @@
 	// Visualization state
 	let treeData = $state<TreeData | null>(null);
 	let statsData = $state<ScanStats | null>(null);
+	// Scanned root's display name (basename), used as the leading panel breadcrumb.
+	let rootDisplayName = $derived(
+		treeData?.root ? (treeData.root.split(/[/\\]/).filter(Boolean).pop() ?? treeData.root) : ''
+	);
 	let isLoadingVisualization = $state(false);
 	let visualizationError = $state<string | null>(null);
 
@@ -432,7 +436,7 @@
 					style:flex={$selectedItem || $hoveredItem ? '0 0 38.2%' : '1 1 0%'}
 				>
 					{#if $viewMode === 'stalactite'}
-						<StalactiteChart data={treeData} onRootClick={selectRoot} class="h-full w-full" />
+						<StalactiteChart data={treeData} class="h-full w-full" />
 					{:else if $viewMode === 'tree'}
 						<TreeView data={treeData} class="h-full w-full" />
 					{:else}
@@ -442,7 +446,7 @@
 
 				<!-- File/Folder Details Panel with Picker -->
 				{#if $selectedItem || $hoveredItem}
-					<FileDetailsPanel />
+					<FileDetailsPanel onGoHome={selectRoot} rootName={rootDisplayName} />
 				{/if}
 			{/if}
 		</div>

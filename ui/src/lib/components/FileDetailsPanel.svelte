@@ -1,10 +1,7 @@
 <script lang="ts">
 	import {
 		selectedItem,
-		selectedItemSpan,
 		hoveredItem,
-		hoveredItemSpan,
-		clearSelectedItem,
 		tagDictionary,
 		addTagToDictionary,
 		invalidateEnrichment,
@@ -14,8 +11,10 @@
 		formatBytes,
 		queryDirectoryDescription,
 		queryDirDateStats,
+		queryComposition,
 		type DirectoryDescription,
 		type DirDateStats,
+		type CompositionEntry,
 		setDeleteTag,
 		removeDeleteTag,
 		getElementEnrichment,
@@ -30,6 +29,7 @@
 	import { Badge } from '$lib/components/ui/badge';
 	import { Input } from '$lib/components/ui/input';
 	import { Textarea } from '$lib/components/ui/textarea';
+	import { getFileType, type FileType } from '$lib/file-types';
 	import {
 		XIcon,
 		ChevronRightIcon,
@@ -72,47 +72,44 @@
 	let isLoadingDateStats = $state(false);
 	let lastDateStatsPath: string | null = $state(null);
 
+	// Composition (file-type breakdown) of the displayed subtree.
+	let composition = $state<CompositionEntry[] | null>(null);
+	let lastCompositionPath: string | null = $state(null);
+	// Aggregate the extension breakdown into file-type segments, by size.
+	let typeBreakdown = $derived.by(() => {
+		if (!composition || composition.length === 0) return { total: 0, segments: [] };
+		const byType = new Map<FileType, { size: number; count: number }>();
+		let total = 0;
+		for (const e of composition) {
+			const type = getFileType(`f.${e.ext ?? ''}`);
+			const cur = byType.get(type) ?? { size: 0, count: 0 };
+			cur.size += e.size;
+			cur.count += e.count;
+			byType.set(type, cur);
+			total += e.size;
+		}
+		const segments = [...byType.entries()]
+			.map(([type, v]) => ({
+				type,
+				size: v.size,
+				count: v.count,
+				pct: total > 0 ? (v.size / total) * 100 : 0
+			}))
+			.sort((a, b) => b.size - a.size);
+		return { total, segments };
+	});
+
+	// onGoHome (× / root crumb): return to the whole-scan home state.
+	// rootName: the scanned folder's display name, always the first breadcrumb.
+	let { onGoHome, rootName = '' }: { onGoHome?: () => void; rootName?: string } = $props();
+
 	// Determine which item to display: selected takes priority, then hovered
 	let displayItem = $derived($selectedItem ?? $hoveredItem);
-	let displaySpan = $derived($selectedItem ? $selectedItemSpan : $hoveredItemSpan);
 	let isPreview = $derived(!$selectedItem && !!$hoveredItem);
-
-	// Conduit connector geometry. The ribbon flares from the selected block's
-	// on-screen span (top) down to the full panel width (bottom), so its mouth
-	// reflects how much of the parent the selection occupies. A null span (the
-	// root folder, or any positionless selection) flares from the full width —
-	// near-parallel walls reading "you're looking at everything". Two cubic
-	// beziers with vertical end-tangents (k = 0.5) give the smooth AC-hose curve.
-	// The conduit reaches from the selected item's bottom edge (a stem the length
-	// of the gap up to the seam) down into a fixed flare that opens to the panel
-	// width. So it touches the item, however high in the finder it sits.
-	const CONDUIT_FLARE = 64;
-	const ROOT_STEM = 24; // fallback stem when there's no block (root)
-	let connectorWidth = $state(0);
-	let conduitGap = $derived(displaySpan?.gap ?? ROOT_STEM);
-	let conduitPath = $derived.by(() => {
-		const w = connectorWidth;
-		if (w <= 0) return '';
-		const topLeft = displaySpan?.left ?? 0;
-		const topRight = displaySpan?.right ?? w;
-		const s = conduitGap; // stem length = distance up to the item's bottom
-		const h = s + CONDUIT_FLARE;
-		const k = 0.5 * CONDUIT_FLARE; // curvature over the flare (vertical tangents)
-		// Stem up at the item's width to touch it, then flare to the full width
-		// (0..w spans the drawer card exactly, since both share the content inset).
-		return (
-			`M ${topLeft} 0 ` +
-			`L ${topLeft} ${s} ` +
-			`C ${topLeft} ${s + k}, 0 ${h - k}, 0 ${h} ` +
-			`L ${w} ${h} ` +
-			`C ${w} ${h - k}, ${topRight} ${s + k}, ${topRight} ${s} ` +
-			`L ${topRight} 0 Z`
-		);
-	});
-	// Tint the conduit toward the block's colour, strongest where it meets the
-	// block (top) and fading out at the panel (bottom) so the block's identity
-	// "pours" into the detail view. Root (no colour) falls back to neutral slate.
-	let conduitTint = $derived(displaySpan?.color ?? 'currentColor');
+	// The root / home state (the whole scan) is not a folder: no enrichment, no
+	// close button — it IS the close target. (The connector itself is drawn by the
+	// chart, behind the blocks; the panel no longer renders it.)
+	let isRootSelected = $derived(($selectedItem?.path ?? '') === '');
 
 	// Per-element enrichment, read on selection (query-on-select). PGlite is the
 	// source of truth; this is not a long-lived cache — it is re-read whenever the
@@ -310,18 +307,19 @@
 	// loaded enrichment matches the displayed item (not a transient hover preview).
 	let breadcrumbs = $derived(() => {
 		if (!displayItem) return [];
-		const parts = displayItem.path.split('/').filter(Boolean);
 		const aliases =
 			enrichmentPath === displayItem.path ? (elementEnrichment?.pathAliases ?? {}) : {};
-		// Root folder (empty path): a single crumb for the scanned directory itself.
-		if (parts.length === 0) {
-			const alias = enrichmentPath === displayItem.path ? elementEnrichment?.alias : null;
-			return [{ segment: displayItem.name, display: alias ?? displayItem.name }];
-		}
-		return parts.map((segment, i) => {
+		// The scanned root is always the first crumb, so you can return home from
+		// anywhere; its path is '' (home).
+		const crumbs: { display: string; path: string; isRoot: boolean }[] = [
+			{ display: rootName || 'Home', path: '', isRoot: true }
+		];
+		const parts = displayItem.path.split('/').filter(Boolean);
+		parts.forEach((segment, i) => {
 			const cumulativePath = parts.slice(0, i + 1).join('/');
-			return { segment, display: aliases[cumulativePath] ?? segment };
+			crumbs.push({ display: aliases[cumulativePath] ?? segment, path: cumulativePath, isRoot: false });
 		});
+		return crumbs;
 	});
 
 	// Fetch AI description when a directory is selected
@@ -361,6 +359,21 @@
 			dirDateStats = null;
 			isLoadingDateStats = false;
 			lastDateStatsPath = null;
+		}
+	});
+
+	// Fetch composition when a directory (incl. the whole-scan root) is selected
+	$effect(() => {
+		const item = $selectedItem;
+		if (item && item.type === 'directory' && item.path !== lastCompositionPath) {
+			lastCompositionPath = item.path;
+			composition = null;
+			queryComposition(item.path).then((result) => {
+				if (lastCompositionPath === item.path) composition = result;
+			});
+		} else if (!item || item.type !== 'directory') {
+			composition = null;
+			lastCompositionPath = null;
 		}
 	});
 
@@ -494,33 +507,9 @@
 
 {#if displayItem}
 	<div class="relative flex min-h-0 flex-1 flex-col px-4" class:opacity-80={isPreview}>
-		<!-- Conduit connector. The flare's height is reserved in-flow by a spacer;
-		     the svg itself is absolute and reaches UP by the gap so its stem touches
-		     the selected block's bottom edge in the chart (painting over the finder,
-		     which sits above this panel). The chart and this svg share the same left
-		     inset and width, so the block's screen-x maps straight in. -->
-		<div class="w-full shrink-0" style="height: {CONDUIT_FLARE}px;"></div>
-		<div
-			bind:clientWidth={connectorWidth}
-			class="pointer-events-none absolute left-4 right-4"
-			style="top: {-conduitGap}px; height: {conduitGap + CONDUIT_FLARE}px;"
-		>
-			<svg class="h-full w-full overflow-visible text-muted-foreground">
-				<defs>
-					<!-- Bottom-to-top: strongest where it meets the panel (the workspace),
-					     fading out toward the item, so it grows into the panel. -->
-					<linearGradient id="conduit-tint" x1="0" y1="0" x2="0" y2="1">
-						<stop offset="0%" stop-color={conduitTint} stop-opacity="0.04" />
-						<stop offset="100%" stop-color={conduitTint} stop-opacity="0.5" />
-					</linearGradient>
-				</defs>
-				<path d={conduitPath} fill="url(#conduit-tint)" />
-			</svg>
-		</div>
-
-		<!-- Drawer. No drop shadow: the conduit ties this to the chart as one
-		     surface, so a floating-card lift would fight that; the border and the
-		     conduit's own edge already separate it. -->
+		<!-- Drawer (the workspace card, a clean golden-ratio share of the height). The
+		     connector that ties it to the chart is drawn by the chart, behind the
+		     blocks — it's purely graphical and has no claim on this layout. -->
 		<div
 			class="mb-4 flex flex-1 flex-col overflow-hidden rounded-lg border border-border bg-background"
 		>
@@ -550,6 +539,16 @@
 								{/if}
 								{crumb.display}
 							</span>
+						{:else if crumb.isRoot}
+							<!-- Root crumb is always present and always clickable → home. -->
+							<button
+								type="button"
+								onclick={() => onGoHome?.()}
+								class="shrink-0 rounded px-1.5 py-0.5 transition-colors hover:bg-muted hover:text-foreground"
+								title="Back to the whole scan"
+							>
+								{crumb.display}
+							</button>
 						{:else}
 							<span class="shrink-0 rounded px-1.5 py-0.5 transition-colors hover:bg-muted">
 								{crumb.display}
@@ -567,16 +566,18 @@
 					</span>
 				{/if}
 
-				<!-- Close button - only show when item is selected -->
-				{#if $selectedItem}
+				<!-- Close button → home (the whole-scan state). Hidden on root, since
+				     root IS home — there's nowhere further back to go. -->
+				{#if $selectedItem && !isRootSelected}
 					<Button
 						variant="ghost"
 						size="sm"
-						onclick={() => clearSelectedItem()}
+						onclick={() => onGoHome?.()}
 						class="-mr-2 shrink-0"
+						title="Back to the whole scan"
 					>
 						<XIcon class="h-4 w-4" />
-						<span class="sr-only">Close details</span>
+						<span class="sr-only">Back to the whole scan</span>
 					</Button>
 				{/if}
 			</div>
@@ -617,6 +618,39 @@
 							<p class="text-sm text-muted-foreground/60 italic">{aiDescription.error}</p>
 						{:else}
 							<p class="text-sm text-muted-foreground/40 italic">No description available.</p>
+						{/if}
+
+						<!-- Composition: file-type breakdown of this subtree (same colours as
+						     the chart). Shown at every level — the whole scan and any folder. -->
+						{#if typeBreakdown.segments.length > 0}
+							<div class="mt-5 flex shrink-0 flex-col gap-2 border-t border-border pt-4">
+								<div class="flex items-center gap-2 text-sm font-medium text-muted-foreground">
+									<FilesIcon class="h-4 w-4" />
+									<span>Composition</span>
+								</div>
+								<div class="flex h-3 w-full overflow-hidden rounded-full">
+									{#each typeBreakdown.segments as seg (seg.type)}
+										<div
+											style="width: {seg.pct}%; background: var(--color-type-{seg.type});"
+											title="{seg.type}: {formatBytes(seg.size)} · {seg.count} file{seg.count === 1
+												? ''
+												: 's'}"
+										></div>
+									{/each}
+								</div>
+								<div class="flex flex-wrap gap-x-3 gap-y-1 text-xs">
+									{#each typeBreakdown.segments as seg (seg.type)}
+										<span class="flex items-center gap-1.5">
+											<span
+												class="h-2.5 w-2.5 shrink-0 rounded-sm"
+												style="background: var(--color-type-{seg.type});"
+											></span>
+											<span class="capitalize text-foreground">{seg.type}</span>
+											<span class="text-muted-foreground">{Math.round(seg.pct)}%</span>
+										</span>
+									{/each}
+								</div>
+							</div>
 						{/if}
 					</div>
 				{/if}
@@ -745,8 +779,8 @@
 							{/if}
 						{/if}
 
-						<!-- Enrichment (editable only for the selected item) -->
-						{#if $selectedItem}
+						<!-- Enrichment (editable for a selected element — never the whole scan) -->
+						{#if $selectedItem && !isRootSelected}
 							<div class="col-span-2 mt-3 flex flex-col gap-4 border-t border-border pt-4">
 								<!-- Alias -->
 								<label class="flex flex-col gap-1.5">

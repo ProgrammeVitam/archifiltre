@@ -18,11 +18,9 @@
 		hoverFile,
 		clearHoveredItem,
 		enrichmentInvalidation,
-		selectedItem,
-		selectedItemSpan
+		selectedItem
 	} from '$lib/stores';
 	import { getFileType } from '$lib/file-types';
-	import { FolderOpenIcon } from '@lucide/svelte';
 
 	// ================================
 	// Types
@@ -70,11 +68,9 @@
 		/** Provisional (live-scan) mode: render the streamed directory tree only;
 		 *  do NOT query files (the DB is being written and can't be read). */
 		provisional?: boolean;
-		/** Select the root folder (clicking the corner label). */
-		onRootClick?: () => void;
 	}
 
-	let { data, class: className = '', provisional = false, onRootClick }: Props = $props();
+	let { data, class: className = '', provisional = false }: Props = $props();
 
 	// ================================
 	// State
@@ -123,34 +119,10 @@
 		render();
 	});
 
-	// The scanned root's display name (basename of the absolute root path),
-	// shown as a persistent corner label — the anchor the chart unfolds from.
-	let rootName = $derived(
-		data?.root ? (data.root.split(/[/\\]/).filter(Boolean).pop() ?? data.root) : ''
-	);
-	// Root is "selected" when nothing else is — highlight the corner label then.
-	let rootIsActive = $derived(($selectedItem?.path ?? '') === '');
-
-	// Ambient "black hole" conduit: a faint asymmetric ribbon flaring from the
-	// top-left corner (a singularity) out to the full chart width, so the icicle
-	// reads as unfolding from the root label. Same conduit grammar as the panel
-	// connector, mirrored into the seam above the chart. Mouth is a narrow corner
-	// slot; left edge hugs the margin, right edge sweeps to full width.
-	const CORNER_CONDUIT_HEIGHT = 30;
-	const CORNER_MOUTH = 52;
-	let chartWidth = $state(0);
-	let cornerConduitPath = $derived.by(() => {
-		const w = chartWidth;
-		if (w <= 0) return '';
-		const h = CORNER_CONDUIT_HEIGHT;
-		const k = 0.55 * h;
-		// mouth [0, CORNER_MOUTH] at top → base [0, w] at bottom.
-		return (
-			`M 0 0 ` +
-			`C 0 ${k}, 0 ${h - k}, 0 ${h} ` +
-			`L ${w} ${h} ` +
-			`C ${w} ${h - k}, ${CORNER_MOUTH} ${k}, ${CORNER_MOUTH} 0 Z`
-		);
+	// Returning to the home state (root selected, e.g. via the panel's × ) eases
+	// the finder back out to the whole tree.
+	$effect(() => {
+		if (($selectedItem?.path ?? null) === '') snapToRoot();
 	});
 
 	// Hover state
@@ -200,6 +172,8 @@
 
 	onDestroy(() => {
 		resizeObserver?.disconnect();
+		if (snapTimer) clearTimeout(snapTimer);
+		if (animFrame) cancelAnimationFrame(animFrame);
 	});
 
 	function setupResizeObserver() {
@@ -218,7 +192,6 @@
 				}
 				computeLayout();
 				clampView();
-				updateSelectedSpanFromTransform();
 				render();
 			}
 		});
@@ -419,7 +392,6 @@
 				// metric and re-clamp the pan so deeper rows stay reachable.
 				updateCanvasHeight();
 				clampView();
-				updateSelectedSpanFromTransform();
 				render();
 			} else {
 				filesCache.set(dirPath, []);
@@ -483,7 +455,6 @@
 					computeLayout();
 					updateCanvasHeight();
 					clampView();
-					updateSelectedSpanFromTransform();
 					render();
 				}
 			});
@@ -520,30 +491,86 @@
 
 	// The selection conduit is the elastic joint: as the view zooms/pans, re-read
 	// the selected block's on-screen span so the panel ribbon tracks it live.
-	// Distance (CSS px) from a block's on-screen bottom edge up to the seam (the
-	// chart's bottom). The conduit stem extends up by this so it touches the item.
-	function gapToSeam(rect: LayoutRect): number {
-		const vh = viewportCss().h;
-		const bottom = (rect.y + rect.height) * zoom + panY;
-		return Math.max(0, Math.min(vh, vh - bottom));
+	// ── Magnetic snap ────────────────────────────────────────────────────────
+	// On release (wheel idle / drag end) the view eases into the nearest clean
+	// frame — a directory filling the width with its row at the top. The target
+	// is the directory under the viewport centre whose "fill" zoom is closest
+	// (in log space) to the current zoom, so you snap in or out to whichever
+	// folder you're nearest; the root frame (zoom 1) is always a candidate.
+	const SNAP_DELAY = 180;
+	let snapTimer: ReturnType<typeof setTimeout> | null = null;
+	let animFrame: number | null = null;
+
+	function computeSnapTarget(): { zoom: number; panX: number; panY: number } {
+		const vw = viewportCss().w;
+		if (vw <= 0 || layoutRects.length === 0) return { zoom: MIN_ZOOM, panX: 0, panY: 0 };
+		const centerXContent = (vw / 2 - panX) / zoom;
+		const logZoom = Math.log(zoom);
+		// Root frame (whole tree) is always in the running.
+		let best = { zoom: MIN_ZOOM, panX: 0, panY: 0 };
+		let bestDist = Math.abs(Math.log(MIN_ZOOM) - logZoom);
+		for (const rect of layoutRects) {
+			if (!rect.node) continue; // directories are the frames
+			if (centerXContent < rect.x || centerXContent > rect.x + rect.width) continue;
+			const fz = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, vw / rect.width));
+			const dist = Math.abs(Math.log(fz) - logZoom);
+			if (dist < bestDist) {
+				bestDist = dist;
+				best = { zoom: fz, panX: -rect.x * fz, panY: -rect.y * fz };
+			}
+		}
+		return best;
 	}
 
-	function updateSelectedSpanFromTransform() {
-		const path = selectedPath;
-		if (!path) return; // root / nothing → full-width conduit, nothing to track
-		const rect = layoutRects.find((r) => (r.node?.path ?? r.file?.path) === path);
-		if (!rect) return;
-		selectedItemSpan.set({
-			left: rect.x * zoom + panX,
-			right: (rect.x + rect.width) * zoom + panX,
-			gap: gapToSeam(rect),
-			color: rect.color
-		});
+	function cancelAnim() {
+		if (animFrame) {
+			cancelAnimationFrame(animFrame);
+			animFrame = null;
+		}
+	}
+
+	function animateTo(target: { zoom: number; panX: number; panY: number }) {
+		cancelAnim();
+		const start = { zoom, panX, panY };
+		const t0 = performance.now();
+		const DUR = 260;
+		const ease = (t: number) => 1 - Math.pow(1 - t, 3); // ease-out cubic
+		const lz0 = Math.log(start.zoom);
+		const lz1 = Math.log(target.zoom);
+		const step = (now: number) => {
+			const t = Math.min(1, (now - t0) / DUR);
+			const e = ease(t);
+			zoom = Math.exp(lz0 + (lz1 - lz0) * e); // zoom interpolates in log space
+			panX = start.panX + (target.panX - start.panX) * e;
+			panY = start.panY + (target.panY - start.panY) * e;
+			clampView();
+			render();
+			animFrame = t < 1 ? requestAnimationFrame(step) : null;
+		};
+		animFrame = requestAnimationFrame(step);
+	}
+
+	function scheduleSnap() {
+		if (snapTimer) clearTimeout(snapTimer);
+		snapTimer = setTimeout(() => {
+			snapTimer = null;
+			animateTo(computeSnapTarget());
+		}, SNAP_DELAY);
+	}
+
+	// Ease the finder back out to the whole tree (the home view).
+	function snapToRoot() {
+		if (snapTimer) {
+			clearTimeout(snapTimer);
+			snapTimer = null;
+		}
+		animateTo({ zoom: MIN_ZOOM, panX: 0, panY: 0 });
 	}
 
 	function handleWheel(e: WheelEvent) {
 		e.preventDefault();
 		if (!canvas) return;
+		cancelAnim(); // user took over mid-snap
 		const r = canvas.getBoundingClientRect();
 		const px = e.clientX - r.left;
 		const py = e.clientY - r.top;
@@ -555,8 +582,8 @@
 		panY = py - (py - panY) * k;
 		zoom = newZoom;
 		clampView();
-		updateSelectedSpanFromTransform();
 		render();
+		scheduleSnap(); // settle into the nearest frame once scrolling stops
 	}
 
 	function computeLayout() {
@@ -748,13 +775,60 @@
 		computeLayout();
 		updateCanvasHeight();
 		clampView();
-		updateSelectedSpanFromTransform(); // colours changed → refresh conduit tint
 		render();
 	}
 
 	// ================================
 	// Rendering
 	// ================================
+
+	// The connector ribbon, drawn on the canvas BEHIND the blocks so it never
+	// covers a selected folder's children — it shows in the gaps and the seam and
+	// grows out of the item. Colour comes from the item (strongest at the item,
+	// fading into the panel below). A leaf curves straight out of the item; a
+	// directory holds its width as a column behind its subtree, then flares.
+	function drawConnector(dpr: number, vw: number, vh: number) {
+		if (!ctx) return;
+		const path = selectedPath;
+		if (!path) return; // root / nothing selected → no connector
+		const rect = layoutRects.find((r) => (r.node?.path ?? r.file?.path) === path);
+		if (!rect) return;
+
+		const itemLeft = rect.x * zoom + panX;
+		const itemRight = (rect.x + rect.width) * zoom + panX;
+		const itemBottom = (rect.y + rect.height) * zoom + panY;
+
+		// The column extends only while there's a subtree to thread behind.
+		let subBottom = itemBottom;
+		if (rect.node) {
+			for (const r of layoutRects) {
+				const p = r.node?.path ?? r.file?.path ?? '';
+				if (p === path || p.startsWith(path + '/')) {
+					subBottom = Math.max(subBottom, (r.y + r.height) * zoom + panY);
+				}
+			}
+		}
+		const stemBottom = Math.max(itemBottom, Math.min(subBottom, vh));
+		const flareH = Math.max(0, vh - stemBottom);
+		const k = flareH * 0.5; // vertical tangents for the flare
+
+		const [cr, cg, cb] = parseRgb(rect.color);
+		const grad = ctx.createLinearGradient(0, Math.max(0, itemBottom), 0, vh);
+		grad.addColorStop(0, `rgba(${cr}, ${cg}, ${cb}, 0.5)`); // from the item
+		grad.addColorStop(1, `rgba(${cr}, ${cg}, ${cb}, 0.04)`); // into the panel
+
+		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+		ctx.fillStyle = grad;
+		ctx.beginPath();
+		ctx.moveTo(itemLeft, itemBottom);
+		ctx.lineTo(itemLeft, stemBottom);
+		ctx.bezierCurveTo(itemLeft, stemBottom + k, 0, vh - k, 0, vh);
+		ctx.lineTo(vw, vh);
+		ctx.bezierCurveTo(vw, vh - k, itemRight, stemBottom + k, itemRight, stemBottom);
+		ctx.lineTo(itemRight, itemBottom);
+		ctx.closePath();
+		ctx.fill();
+	}
 
 	function render() {
 		if (!ctx || !canvas || canvasWidth === 0 || canvasHeight === 0) return;
@@ -791,6 +865,10 @@
 			ctx.fillText(msg, viewWidth / 2, viewHeight / 2);
 			return;
 		}
+
+		// Connector first, so the blocks paint over it (it stays in the background).
+		drawConnector(dpr, viewWidth, viewHeight);
+		ctx.setTransform(dpr * zoom, 0, 0, dpr * zoom, dpr * panX, dpr * panY);
 
 		// Draw rectangles
 		ctx.save();
@@ -920,17 +998,6 @@
 		};
 	}
 
-	// On-screen span of a hit block (canvas CSS px) + how far it sits above the
-	// seam, so the conduit can flare from the block's bottom down to the panel.
-	function spanOf(hit: LayoutRect) {
-		return {
-			left: hit.x * zoom + panX,
-			right: (hit.x + hit.width) * zoom + panX,
-			gap: gapToSeam(hit),
-			color: hit.color
-		};
-	}
-
 	// ================================
 	// Event Handlers
 	// ================================
@@ -939,6 +1006,11 @@
 
 	function handlePointerDown(e: PointerEvent) {
 		if (!canvas) return;
+		cancelAnim(); // grabbing interrupts a snap in progress
+		if (snapTimer) {
+			clearTimeout(snapTimer);
+			snapTimer = null;
+		}
 		pointerDown = true;
 		dragged = false;
 		pointerStartX = e.clientX;
@@ -959,7 +1031,6 @@
 				panX = panStartX + dx;
 				panY = panStartY + dy;
 				clampView();
-				updateSelectedSpanFromTransform();
 				render();
 				return;
 			}
@@ -972,9 +1043,8 @@
 			hoveredRect = hit;
 			render();
 			if (hit) {
-				const span = spanOf(hit);
-				if (hit.node) hoverDirectory(hit.node, span);
-				else if (hit.file) hoverFile(hit.file, span);
+				if (hit.node) hoverDirectory(hit.node);
+				else if (hit.file) hoverFile(hit.file);
 			} else {
 				clearHoveredItem();
 			}
@@ -987,15 +1057,17 @@
 		const wasDrag = dragged;
 		pointerDown = false;
 		dragged = false;
-		if (wasDrag) return; // a pan, not a selection
+		if (wasDrag) {
+			scheduleSnap(); // settle the pan into the nearest frame
+			return; // a pan, not a selection
+		}
 
 		// Click → select the block under the pointer.
 		const { x, y } = toContent(e);
 		const hit = findRectAt(x, y);
 		if (hit) {
-			const span = spanOf(hit);
-			if (hit.node) selectDirectory(hit.node, span);
-			else if (hit.file) selectFile(hit.file, span);
+			if (hit.node) selectDirectory(hit.node);
+			else if (hit.file) selectFile(hit.file);
 		}
 	}
 
@@ -1007,26 +1079,8 @@
 </script>
 
 <div class="flex w-full flex-col {className}">
-	<!-- Top bar: persistent root-folder label (the corner the chart unfolds from) + color mode toggle -->
-	<div class="flex items-center justify-between gap-2 px-2 pb-1">
-		{#if rootName}
-			<button
-				type="button"
-				onclick={() => onRootClick?.()}
-				class="flex min-w-0 items-center gap-1.5 rounded-md border px-2 py-0.5 text-sm font-medium text-foreground transition-colors"
-				style="border-color: color-mix(in srgb, var(--color-type-folder) {rootIsActive
-					? '55%'
-					: '30%'}, transparent); background: color-mix(in srgb, var(--color-type-folder) {rootIsActive
-					? '22%'
-					: '10%'}, transparent);"
-				title="Root folder — {rootName}"
-			>
-				<FolderOpenIcon class="h-4 w-4 shrink-0" style="color: var(--color-type-folder);" />
-				<span class="truncate">{rootName}</span>
-			</button>
-		{:else}
-			<span></span>
-		{/if}
+	<!-- Top bar: color mode toggle -->
+	<div class="flex items-center justify-end gap-2 px-2 pb-1">
 		<div class="flex items-center gap-0.5 rounded-lg bg-muted p-[3px]">
 			<button
 				class="cursor-pointer rounded-md border-none px-2.5 py-[5px] text-xs font-medium transition-all {colorMode === 'type' ? 'bg-background text-foreground shadow-sm' : 'bg-transparent text-muted-foreground'}"
@@ -1041,31 +1095,6 @@
 
 	<!-- Chart container: fills the pane; the canvas below is a fixed viewport -->
 	<div bind:this={container} class="relative flex min-h-0 w-full flex-1 flex-col">
-		<!-- Ambient "black hole" conduit: the icicle unfolds from the corner label.
-		     Faint by design so it frames rather than competes with the selection conduit. -->
-		<svg
-			bind:clientWidth={chartWidth}
-			class="pointer-events-none block w-full shrink-0 overflow-visible"
-			style="height: {CORNER_CONDUIT_HEIGHT}px; color: var(--color-type-folder);"
-			aria-hidden="true"
-		>
-			<defs>
-				<!-- Energy concentrated at the top-left corner (the singularity), spilling
-				     out and fading across the chart — gravitational, not a flat band. -->
-				<radialGradient
-					id="corner-conduit"
-					gradientUnits="userSpaceOnUse"
-					cx="0"
-					cy="0"
-					r={Math.max(chartWidth * 0.85, 1)}
-				>
-					<stop offset="0%" stop-color="currentColor" stop-opacity="0.42" />
-					<stop offset="45%" stop-color="currentColor" stop-opacity="0.10" />
-					<stop offset="100%" stop-color="currentColor" stop-opacity="0" />
-				</radialGradient>
-			</defs>
-			<path d={cornerConduitPath} fill="url(#corner-conduit)" />
-		</svg>
 		<div bind:this={canvasWrapper} class="relative min-h-0 w-full flex-1 overflow-hidden">
 			<canvas
 				bind:this={canvas}
