@@ -6,6 +6,9 @@
 		buildTreeHierarchy,
 		getChildren,
 		queryFiles,
+		setDeleteTag,
+		removeDeleteTag,
+		getElementEnrichment,
 		type DirectoryNode,
 		type TreeData,
 		type FileNode
@@ -16,10 +19,13 @@
 		hoverDirectory,
 		hoverFile,
 		clearHoveredItem,
+		invalidateEnrichment,
 		enrichmentInvalidation,
 		selectedItem
 	} from '$lib/stores';
 	import { getFileType } from '$lib/file-types';
+	import { Menu, MenuItem, PredefinedMenuItem } from '@tauri-apps/api/menu';
+	import { LogicalPosition } from '@tauri-apps/api/dpi';
 
 	// ================================
 	// Types
@@ -100,6 +106,10 @@
 	let panY = $state(0);
 	const MIN_ZOOM = 1;
 	const MAX_ZOOM = 40;
+	// Panning is possible only when zoomed in or the tree overflows the viewport
+	// vertically; otherwise the whole tree fits and there's nothing to drag, so
+	// the grab cursor would be lying.
+	let canPan = $derived(zoom > MIN_ZOOM + 1e-3 || contentHeight > viewportHeight);
 	// Pointer state: pan on drag, select on a click that didn't drag.
 	let pointerDown = $state(false);
 	let dragged = false;
@@ -1015,6 +1025,7 @@
 
 	function handlePointerDown(e: PointerEvent) {
 		if (!canvas) return;
+		if (e.button !== 0) return; // primary button only; right-click opens the menu
 		cancelAnim(); // grabbing interrupts a snap in progress
 		if (snapTimer) {
 			clearTimeout(snapTimer);
@@ -1061,7 +1072,9 @@
 	}
 
 	function handlePointerUp(e: PointerEvent) {
-		if (!canvas) return;
+		// Ignore stray ups (e.g. the right-click that opened the native menu, whose
+		// up the menu swallowed) — only finish a gesture we actually started.
+		if (!canvas || !pointerDown) return;
 		canvas.releasePointerCapture(e.pointerId);
 		const wasDrag = dragged;
 		pointerDown = false;
@@ -1084,6 +1097,105 @@
 		hoveredRect = null;
 		clearHoveredItem();
 		render();
+	}
+
+	// ── Double-click: drill into the block under the cursor (fill it to the
+	// viewport width), or zoom back out to the whole tree on empty space. Reuses
+	// the snap/focus target and the eased animation.
+	function zoomToRect(rect: LayoutRect) {
+		const vw = viewportCss().w;
+		if (vw <= 0) return;
+		const fz = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, vw / rect.width));
+		animateTo({ zoom: fz, panX: -rect.x * fz, panY: -rect.y });
+	}
+
+	// Zoom out to the parent directory of a path; top-level items (no parent in
+	// the tree) fall back to the whole-tree home view.
+	function zoomToParent(path: string) {
+		const lastSlash = path.lastIndexOf('/');
+		if (lastSlash < 0) {
+			snapToRoot();
+			return;
+		}
+		const parentPath = path.slice(0, lastSlash);
+		const parent = layoutRects.find((r) => r.node?.path === parentPath);
+		if (parent) zoomToRect(parent);
+		else snapToRoot();
+	}
+
+	// True when the view is already the whole-tree home (nothing to reset to).
+	function isHomeView(): boolean {
+		return zoom <= MIN_ZOOM + 1e-3 && Math.abs(panX) < 0.5 && Math.abs(panY) < 0.5;
+	}
+
+	function handleDoubleClick(e: MouseEvent) {
+		if (snapTimer) {
+			clearTimeout(snapTimer);
+			snapTimer = null;
+		}
+		const { x, y } = toContent(e);
+		const hit = findRectAt(x, y);
+		if (hit) zoomToRect(hit);
+		else snapToRoot();
+	}
+
+	// ── Right-click menu: a native OS menu (Tauri v2) shown at the cursor, acting
+	// on the block under the pointer. The native popup handles its own
+	// positioning, keyboard navigation and dismissal; we only suppress the
+	// default webview menu and build the items for the target block.
+	async function handleContextMenu(e: MouseEvent) {
+		e.preventDefault();
+		const { x, y } = toContent(e);
+		const hit = findRectAt(x, y);
+		if (!hit) return;
+		const path = hit.node?.path ?? hit.file?.path ?? '';
+		// Right-click also selects, so the details panel mirrors the target.
+		if (hit.node) selectDirectory(hit.node);
+		else if (hit.file) selectFile(hit.file);
+
+		const isDeleted = (await getElementEnrichment(path))?.directlyTaggedForDeletion ?? false;
+		const lastSlash = path.lastIndexOf('/');
+		const parentInTree =
+			lastSlash >= 0 && layoutRects.some((r) => r.node?.path === path.slice(0, lastSlash));
+		// Zoom-to-parent is meaningful when there's a parent folder to zoom into,
+		// or — for a top-level item, whose parent is the root — when we're zoomed
+		// in and can fall back to the whole-tree home view.
+		const canZoomToParent = parentInTree || !isHomeView();
+
+		const items = await Promise.all([
+			MenuItem.new({ text: 'Zoom in', action: () => zoomToRect(hit) }),
+			MenuItem.new({
+				text: 'Zoom to parent',
+				enabled: canZoomToParent,
+				action: () => zoomToParent(path)
+			}),
+			MenuItem.new({ text: 'Reset zoom', enabled: !isHomeView(), action: () => snapToRoot() }),
+			PredefinedMenuItem.new({ item: 'Separator' }),
+			MenuItem.new({
+				text: isDeleted ? 'Remove deletion mark' : 'Mark for deletion',
+				action: async () => {
+					const ok = isDeleted ? await removeDeleteTag(path) : await setDeleteTag(path);
+					if (ok) invalidateEnrichment(path, true); // cascade: a dir marks its subtree
+				}
+			}),
+			PredefinedMenuItem.new({ item: 'Separator' }),
+			MenuItem.new({
+				text: 'Copy path',
+				action: async () => {
+					try {
+						await navigator.clipboard.writeText(path);
+					} catch (err) {
+						console.error('Failed to copy path', err);
+					}
+				}
+			})
+		]);
+
+		const menu = await Menu.new({ items });
+		// Position at the click. popup() with no args is meant to use the cursor,
+		// but on Linux/GTK that falls back to window-centre, so pass it explicitly
+		// (client coords are relative to the webview = the window with decorations off).
+		await menu.popup(new LogicalPosition(e.clientX, e.clientY));
 	}
 </script>
 
@@ -1112,7 +1224,13 @@
 				onpointermove={handlePointerMove}
 				onpointerup={handlePointerUp}
 				onpointerleave={handlePointerLeave}
-				class="absolute inset-0 block h-full w-full {pointerDown ? 'cursor-grabbing' : 'cursor-grab'}"
+				ondblclick={handleDoubleClick}
+				oncontextmenu={handleContextMenu}
+				class="absolute inset-0 block h-full w-full {canPan
+					? pointerDown
+						? 'cursor-grabbing'
+						: 'cursor-grab'
+					: 'cursor-default'}"
 			></canvas>
 		</div>
 	</div>
