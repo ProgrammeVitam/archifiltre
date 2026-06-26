@@ -110,6 +110,11 @@
 	// vertically; otherwise the whole tree fits and there's nothing to drag, so
 	// the grab cursor would be lying.
 	let canPan = $derived(zoom > MIN_ZOOM + 1e-3 || contentHeight > viewportHeight);
+	// When zoomed into a folder we frame it with a uniform side margin so its
+	// neighbours peek in at the edges — the zoom reads as a focused view.
+	const FOCUS_INSET_FRAC = 0.08; // share of viewport width left as margin per side
+	const FOCUS_TOP_PX = 48; // px the focused folder sits below the top, clearing the vignette
+	let isZoomed = $derived(zoom > MIN_ZOOM + 1e-3);
 	// Pointer state: pan on drag, select on a click that didn't drag.
 	let pointerDown = $state(false);
 	let dragged = false;
@@ -497,7 +502,18 @@
 		const scaledW = vw * zoom; // content width == viewport width at zoom 1
 		const scaledH = contentHeight; // rows are fixed-height; Y is not zoomed
 		panX = scaledW <= vw ? (vw - scaledW) / 2 : Math.min(0, Math.max(vw - scaledW, panX));
-		panY = scaledH <= vh ? 0 : Math.min(0, Math.max(vh - scaledH, panY));
+		if (isZoomed) {
+			// Centre the focused content when it fits, so the folder sits clear of all
+			// edges and the empty space is split evenly above/below (rather than a void
+			// at the bottom). When it overflows, top-align with a margin and allow a
+			// drag to reveal ancestors above / descendants below.
+			panY =
+				scaledH <= vh
+					? Math.round((vh - scaledH) / 2)
+					: Math.min(FOCUS_TOP_PX, Math.max(vh - scaledH - FOCUS_TOP_PX, panY));
+		} else {
+			panY = scaledH <= vh ? 0 : Math.min(0, Math.max(vh - scaledH, panY));
+		}
 	}
 
 	// The selection conduit is the elastic joint: as the view zooms/pans, re-read
@@ -523,11 +539,11 @@
 		for (const rect of layoutRects) {
 			if (!rect.node) continue; // directories are the frames
 			if (centerXContent < rect.x || centerXContent > rect.x + rect.width) continue;
-			const fz = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, vw / rect.width));
-			const dist = Math.abs(Math.log(fz) - logZoom);
+			const t = frameTarget(rect);
+			const dist = Math.abs(Math.log(t.zoom) - logZoom);
 			if (dist < bestDist) {
 				bestDist = dist;
-				best = { zoom: fz, panX: -rect.x * fz, panY: -rect.y };
+				best = t;
 			}
 		}
 		return best;
@@ -1102,11 +1118,18 @@
 	// ── Double-click: drill into the block under the cursor (fill it to the
 	// viewport width), or zoom back out to the whole tree on empty space. Reuses
 	// the snap/focus target and the eased animation.
-	function zoomToRect(rect: LayoutRect) {
+	// The framing target for a block: fill the viewport minus a uniform side
+	// margin (so neighbours peek), with the block's row at the top of the frame.
+	function frameTarget(rect: LayoutRect): { zoom: number; panX: number; panY: number } {
 		const vw = viewportCss().w;
-		if (vw <= 0) return;
-		const fz = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, vw / rect.width));
-		animateTo({ zoom: fz, panX: -rect.x * fz, panY: -rect.y });
+		const inset = vw * FOCUS_INSET_FRAC;
+		const fz = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, (vw - 2 * inset) / rect.width));
+		return { zoom: fz, panX: inset - rect.x * fz, panY: FOCUS_TOP_PX - rect.y };
+	}
+
+	function zoomToRect(rect: LayoutRect) {
+		if (viewportCss().w <= 0) return;
+		animateTo(frameTarget(rect));
 	}
 
 	// Zoom out to the parent directory of a path; top-level items (no parent in
@@ -1232,6 +1255,14 @@
 						: 'cursor-grab'
 					: 'cursor-default'}"
 			></canvas>
+
+			<!-- Focus vignette: when zoomed in, fade all four edges to the background
+			     so the peeking neighbours dissolve evenly and the view reads as a
+			     focused frame. Non-interactive so the peeks stay clickable. -->
+			<div
+				class="pointer-events-none absolute inset-0 z-10 transition-opacity duration-300"
+				style="box-shadow: inset 0 0 52px 6px var(--background); opacity: {isZoomed ? 0.9 : 0};"
+			></div>
 		</div>
 	</div>
 </div>
