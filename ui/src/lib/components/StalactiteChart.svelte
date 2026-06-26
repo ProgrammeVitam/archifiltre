@@ -90,7 +90,9 @@
 	// Fixed-viewport zoom/pan. The canvas is a window onto content-space; the
 	// wheel zooms toward the cursor and dragging pans. zoom = 1 fits the current
 	// root to the viewport width (the floor — you can't dezoom past "see the whole
-	// root"). screen = content * zoom + pan.
+	// root"). Zoom applies to the BREADTH axis only: screenX = contentX * zoom +
+	// panX, while rows keep a constant height (screenY = contentY + panY) so the
+	// depth levels stay legible at any zoom; vertical pan scrolls through levels.
 	let canvasWrapper: HTMLDivElement | undefined = $state();
 	let viewportHeight = $state(0);
 	let zoom = $state(1);
@@ -483,7 +485,7 @@
 		zoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom));
 		const { w: vw, h: vh } = viewportCss();
 		const scaledW = vw * zoom; // content width == viewport width at zoom 1
-		const scaledH = contentHeight * zoom;
+		const scaledH = contentHeight; // rows are fixed-height; Y is not zoomed
 		panX = scaledW <= vw ? (vw - scaledW) / 2 : Math.min(0, Math.max(vw - scaledW, panX));
 		panY = scaledH <= vh ? 0 : Math.min(0, Math.max(vh - scaledH, panY));
 	}
@@ -515,7 +517,7 @@
 			const dist = Math.abs(Math.log(fz) - logZoom);
 			if (dist < bestDist) {
 				bestDist = dist;
-				best = { zoom: fz, panX: -rect.x * fz, panY: -rect.y * fz };
+				best = { zoom: fz, panX: -rect.x * fz, panY: -rect.y };
 			}
 		}
 		return best;
@@ -572,13 +574,12 @@
 		cancelAnim(); // user took over mid-snap
 		const r = canvas.getBoundingClientRect();
 		const px = e.clientX - r.left;
-		const py = e.clientY - r.top;
 		const factor = Math.exp(-e.deltaY * 0.0015);
 		const newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, zoom * factor));
 		const k = newZoom / zoom;
-		// Keep the point under the cursor fixed while scaling.
+		// Keep the point under the cursor fixed while scaling the breadth axis.
+		// Y isn't zoomed (fixed-height rows), so panY stays put — only panX shifts.
 		panX = px - (px - panX) * k;
-		panY = py - (py - panY) * k;
 		zoom = newZoom;
 		clampView();
 		render();
@@ -795,7 +796,7 @@
 
 		const itemLeft = rect.x * zoom + panX;
 		const itemRight = (rect.x + rect.width) * zoom + panX;
-		const itemBottom = (rect.y + rect.height) * zoom + panY;
+		const itemBottom = rect.y + rect.height + panY; // rows are fixed-height (no zoom on Y)
 
 		// The column extends only while there's a subtree to thread behind.
 		let subBottom = itemBottom;
@@ -803,7 +804,7 @@
 			for (const r of layoutRects) {
 				const p = r.node?.path ?? r.file?.path ?? '';
 				if (p === path || p.startsWith(path + '/')) {
-					subBottom = Math.max(subBottom, (r.y + r.height) * zoom + panY);
+					subBottom = Math.max(subBottom, r.y + r.height + panY);
 				}
 			}
 		}
@@ -840,7 +841,9 @@
 		// transform so all content-space drawing below lands in the right place.
 		ctx.setTransform(1, 0, 0, 1, 0, 0);
 		ctx.clearRect(0, 0, canvasWidth, canvasHeight);
-		ctx.setTransform(dpr * zoom, 0, 0, dpr * zoom, dpr * panX, dpr * panY);
+		// Blocks are drawn in screen space (CSS px) under a uniform device transform;
+		// zoom is baked into X coordinates per block, Y stays fixed-height.
+		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
 		if (layoutRects.length === 0) {
 			// Show empty state (in untransformed viewport space, centred)
@@ -867,7 +870,7 @@
 
 		// Connector first, so the blocks paint over it (it stays in the background).
 		drawConnector(dpr, viewWidth, viewHeight);
-		ctx.setTransform(dpr * zoom, 0, 0, dpr * zoom, dpr * panX, dpr * panY);
+		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
 		// Draw rectangles
 		ctx.save();
@@ -875,8 +878,18 @@
 		// Enrichment band colors (resolved once per render).
 		const bandPalette = resolveColors();
 
-		// Draw each rectangle
+		// Draw each rectangle. Coordinates are computed in screen space (CSS px):
+		// X carries the zoom (breadth), Y is a fixed-height row (depth), so strokes
+		// and labels stay crisp at any zoom.
 		for (const rect of layoutRects) {
+			const sx = rect.x * zoom + panX;
+			const sw = rect.width * zoom;
+			const sy = rect.y + panY; // rows keep a constant height regardless of zoom
+			const sh = rect.height;
+
+			// Cull blocks entirely off the left/right of the viewport.
+			if (sx + sw < 0 || sx > viewWidth) continue;
+
 			const rectPath = rect.node?.path ?? rect.file?.path ?? '';
 			const isHovered =
 				hoveredRect && (hoveredRect.node?.path ?? hoveredRect.file?.path) === rectPath;
@@ -891,25 +904,25 @@
 
 			// Draw background
 			ctx.fillStyle = isHovered ? lightenColor(rect.color, 0.15) : rect.color;
-			ctx.fillRect(rect.x, rect.y, rect.width, rect.height);
+			ctx.fillRect(sx, sy, sw, sh);
 
-			// Draw border (keep ~1px on screen regardless of zoom)
+			// Draw border (uniform 1px — the view transform no longer scales it)
 			ctx.strokeStyle = 'rgba(0, 0, 0, 0.3)';
-			ctx.lineWidth = 1 / zoom;
-			ctx.strokeRect(rect.x, rect.y, rect.width, rect.height);
+			ctx.lineWidth = 1;
+			ctx.strokeRect(sx, sy, sw, sh);
 
 			// Draw enrichment bands (v4 layout): stacked strips from the top edge,
 			// each occupying dy/heightDivider so they never cover more than half the
 			// block and the underlying type/date fill stays visible.
-			if (rect.width > 4 && rect.height > 6) {
+			if (sw > 4 && sh > 6) {
 				const bands = getNodeBands(rect, bandPalette);
 				if (bands.length > 0) {
 					const heightDivider = Math.max(bands.length * 2, 3);
-					const bandHeight = rect.height / heightDivider;
-					const bandWidth = rect.width - 2;
+					const bandHeight = sh / heightDivider;
+					const bandWidth = sw - 2;
 					for (let i = 0; i < bands.length; i++) {
 						ctx.fillStyle = bands[i];
-						ctx.fillRect(rect.x + 1, rect.y + 1 + i * bandHeight, bandWidth, bandHeight);
+						ctx.fillRect(sx + 1, sy + 1 + i * bandHeight, bandWidth, bandHeight);
 					}
 					// Contrast-aware hairlines between bands and below the band stack, so each
 					// band reads as a distinct strip even when its hue matches the fill (the red
@@ -917,12 +930,12 @@
 					ctx.strokeStyle = bandSeparatorColor(
 						isHovered ? lightenColor(rect.color, 0.15) : rect.color
 					);
-					ctx.lineWidth = 1 / zoom;
+					ctx.lineWidth = 1;
 					ctx.beginPath();
 					for (let i = 1; i <= bands.length; i++) {
-						const y = Math.round(rect.y + 1 + i * bandHeight) + 0.5;
-						ctx.moveTo(rect.x + 1, y);
-						ctx.lineTo(rect.x + 1 + bandWidth, y);
+						const y = Math.round(sy + 1 + i * bandHeight) + 0.5;
+						ctx.moveTo(sx + 1, y);
+						ctx.lineTo(sx + 1 + bandWidth, y);
 					}
 					ctx.stroke();
 				}
@@ -931,12 +944,9 @@
 			// Draw text if there's enough space ON SCREEN — labels reveal as you
 			// zoom in (progressive disclosure), so a block too narrow for its name
 			// at one zoom shows it once magnified.
-			const scaledWidth = rect.width * zoom;
-			const scaledHeight = rect.height * zoom;
-
-			if (scaledWidth > 40 && scaledHeight > 14) {
+			if (sw > 40 && sh > 14) {
 				ctx.fillStyle = '#ffffff';
-				const fontSize = Math.min(12, rect.height - 4);
+				const fontSize = Math.min(12, sh - 4);
 				ctx.font = `${fontSize}px system-ui, sans-serif`;
 				ctx.textAlign = 'left';
 				ctx.textBaseline = 'middle';
@@ -945,7 +955,7 @@
 				// display without changing the real file name).
 				const enr = rect.node ?? rect.file;
 				const text = enr?.alias ?? enr?.name ?? '';
-				const maxWidth = rect.width - 8;
+				const maxWidth = sw - 8;
 				const textWidth = ctx.measureText(text).width;
 
 				let displayText = text;
@@ -959,7 +969,7 @@
 				}
 
 				if (displayText.length > 1) {
-					ctx.fillText(displayText, rect.x + 4, rect.y + rect.height / 2);
+					ctx.fillText(displayText, sx + 4, sy + sh / 2);
 				}
 			}
 		}
@@ -993,7 +1003,7 @@
 		const r = canvas!.getBoundingClientRect();
 		return {
 			x: (e.clientX - r.left - panX) / zoom,
-			y: (e.clientY - r.top - panY) / zoom
+			y: e.clientY - r.top - panY // Y isn't zoomed (fixed-height rows)
 		};
 	}
 
