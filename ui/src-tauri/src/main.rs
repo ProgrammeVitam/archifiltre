@@ -266,15 +266,13 @@ async fn send_control_signal(
 
 #[tauri::command]
 async fn health_check(app: tauri::AppHandle) -> Result<CommandResult, String> {
-    use tauri_plugin_shell::ShellExt;
+    // Resolve the sidecar via find_sidecar_path (handles AppImage/portable
+    // layouts where the binary lives next to the executable, not in the
+    // Tauri resource dir) rather than the shell sidecar API.
+    let binary_path = find_sidecar_path(&app)?;
 
-    let sidecar = app
-        .shell()
-        .sidecar("archifiltre")
-        .map_err(|e| format!("Failed to create sidecar: {}", e))?
-        .args(["health", "--verbose"]);
-
-    let output = sidecar
+    let output = tokio::process::Command::new(&binary_path)
+        .args(["health", "--verbose"])
         .output()
         .await
         .map_err(|e| format!("Failed to execute health check: {}", e))?;
@@ -291,15 +289,10 @@ async fn health_check(app: tauri::AppHandle) -> Result<CommandResult, String> {
 
 #[tauri::command]
 async fn get_version(app: tauri::AppHandle) -> Result<CommandResult, String> {
-    use tauri_plugin_shell::ShellExt;
+    let binary_path = find_sidecar_path(&app)?;
 
-    let sidecar = app
-        .shell()
-        .sidecar("archifiltre")
-        .map_err(|e| format!("Failed to create sidecar: {}", e))?
-        .args(["version"]);
-
-    let output = sidecar
+    let output = tokio::process::Command::new(&binary_path)
+        .args(["version"])
         .output()
         .await
         .map_err(|e| format!("Failed to get version: {}", e))?;
