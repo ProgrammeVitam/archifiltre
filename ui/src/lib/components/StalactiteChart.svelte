@@ -19,6 +19,7 @@
 		hoverDirectory,
 		hoverFile,
 		clearHoveredItem,
+		clearSelectedItem,
 		invalidateEnrichment,
 		enrichmentInvalidation,
 		selectedItem
@@ -73,9 +74,19 @@
 		/** Provisional (live-scan) mode: render the streamed directory tree only;
 		 *  do NOT query files (the DB is being written and can't be read). */
 		provisional?: boolean;
+		/** Select the scanned root (the whole-scan overview) — the home state, same
+		 *  as the panel's × . Falls back to clearing the selection if not provided. */
+		onGoHome?: () => void;
 	}
 
-	let { data, class: className = '', provisional = false }: Props = $props();
+	let { data, class: className = '', provisional = false, onGoHome }: Props = $props();
+
+	// Return to the home/overview state: the scanned root selected (panel stays
+	// open on the whole-scan summary), rather than an empty selection.
+	function goHome() {
+		if (onGoHome) onGoHome();
+		else clearSelectedItem();
+	}
 
 	// ================================
 	// State
@@ -115,13 +126,25 @@
 	const FOCUS_INSET_FRAC = 0.08; // share of viewport width left as margin per side
 	const FOCUS_TOP_PX = 48; // px the focused folder sits below the top, clearing the vignette
 	let isZoomed = $derived(zoom > MIN_ZOOM + 1e-3);
-	// Pointer state: pan on drag, select on a click that didn't drag.
+	// Pointer state: pan on drag; single-click backs out, double-click drills in.
 	let pointerDown = $state(false);
 	let dragged = false;
 	let pointerStartX = 0;
 	let pointerStartY = 0;
 	let panStartX = 0;
 	let panStartY = 0;
+	// A single click is deferred briefly so a following double-click can cancel it.
+	let clickTimer: ReturnType<typeof setTimeout> | null = null;
+	const DOUBLE_CLICK_MS = 250;
+	// Last cursor position over the canvas, so after a zoom settles we can promote
+	// whatever the cursor now hovers to the selection.
+	let lastPointerX = 0;
+	let lastPointerY = 0;
+	let pointerInside = false;
+	// The folder the view is currently zoomed-focused on ('' = root). The item
+	// focus (selection) orbits it: navigating syncs it to this folder, and an
+	// empty-click resets the selection back to it (or clears it at the root).
+	let focusPath = '';
 
 	// Color mode
 	let colorMode: 'type' | 'date' = $state('type');
@@ -367,6 +390,7 @@
 			zoom = 1;
 			panX = 0;
 			panY = 0;
+			focusPath = '';
 		} else {
 			childrenMap = childrenMapDerived;
 		}
@@ -501,18 +525,28 @@
 		const { w: vw, h: vh } = viewportCss();
 		const scaledW = vw * zoom; // content width == viewport width at zoom 1
 		const scaledH = contentHeight; // rows are fixed-height; Y is not zoomed
-		panX = scaledW <= vw ? (vw - scaledW) / 2 : Math.min(0, Math.max(vw - scaledW, panX));
-		if (isZoomed) {
-			// Centre the focused content when it fits, so the folder sits clear of all
-			// edges and the empty space is split evenly above/below (rather than a void
-			// at the bottom). When it overflows, top-align with a margin and allow a
-			// drag to reveal ancestors above / descendants below.
-			panY =
-				scaledH <= vh
-					? Math.round((vh - scaledH) / 2)
-					: Math.min(FOCUS_TOP_PX, Math.max(vh - scaledH - FOCUS_TOP_PX, panY));
+		if (scaledW <= vw) {
+			// Fits (the root) → centred, content fills the width, no side margin.
+			panX = (vw - scaledW) / 2;
+		} else if (isZoomed) {
+			// Allow a side margin even at the tree's outer edges, so the leftmost /
+			// rightmost folder still lifts clear of the vignette (the horizontal twin
+			// of the FOCUS_TOP_PX margin). Only when zoomed.
+			const insetX = vw * FOCUS_INSET_FRAC;
+			panX = Math.min(insetX, Math.max(vw - scaledW - insetX, panX));
 		} else {
-			panY = scaledH <= vh ? 0 : Math.min(0, Math.max(vh - scaledH, panY));
+			panX = Math.min(0, Math.max(vw - scaledW, panX));
+		}
+		if (scaledH <= vh) {
+			// Centre the content vertically whenever it fits — at the root AND when
+			// zoomed — so the focused folder sits clear of all edges and, crucially,
+			// the root↔zoom transition interpolates smoothly (no vertical hop).
+			panY = Math.round((vh - scaledH) / 2);
+		} else if (isZoomed) {
+			// Overflowing + zoomed: top-align with a margin, drag to reveal more.
+			panY = Math.min(FOCUS_TOP_PX, Math.max(vh - scaledH - FOCUS_TOP_PX, panY));
+		} else {
+			panY = Math.min(0, Math.max(vh - scaledH, panY));
 		}
 	}
 
@@ -528,13 +562,14 @@
 	let snapTimer: ReturnType<typeof setTimeout> | null = null;
 	let animFrame: number | null = null;
 
-	function computeSnapTarget(): { zoom: number; panX: number; panY: number } {
+	function computeSnapTarget(): { zoom: number; panX: number; panY: number; path: string } {
 		const vw = viewportCss().w;
-		if (vw <= 0 || layoutRects.length === 0) return { zoom: MIN_ZOOM, panX: 0, panY: 0 };
+		if (vw <= 0 || layoutRects.length === 0)
+			return { zoom: MIN_ZOOM, panX: 0, panY: 0, path: '' };
 		const centerXContent = (vw / 2 - panX) / zoom;
 		const logZoom = Math.log(zoom);
 		// Root frame (whole tree) is always in the running.
-		let best = { zoom: MIN_ZOOM, panX: 0, panY: 0 };
+		let best = { zoom: MIN_ZOOM, panX: 0, panY: 0, path: '' };
 		let bestDist = Math.abs(Math.log(MIN_ZOOM) - logZoom);
 		for (const rect of layoutRects) {
 			if (!rect.node) continue; // directories are the frames
@@ -543,7 +578,7 @@
 			const dist = Math.abs(Math.log(t.zoom) - logZoom);
 			if (dist < bestDist) {
 				bestDist = dist;
-				best = t;
+				best = { ...t, path: rect.node.path };
 			}
 		}
 		return best;
@@ -556,7 +591,10 @@
 		}
 	}
 
-	function animateTo(target: { zoom: number; panX: number; panY: number }) {
+	function animateTo(
+		target: { zoom: number; panX: number; panY: number },
+		activateAfter = false
+	) {
 		cancelAnim();
 		const start = { zoom, panX, panY };
 		const t0 = performance.now();
@@ -573,6 +611,7 @@
 			clampView();
 			render();
 			animFrame = t < 1 ? requestAnimationFrame(step) : null;
+			if (t >= 1 && activateAfter) activateHoveredAfterZoom();
 		};
 		animFrame = requestAnimationFrame(step);
 	}
@@ -581,7 +620,12 @@
 		if (snapTimer) clearTimeout(snapTimer);
 		snapTimer = setTimeout(() => {
 			snapTimer = null;
-			animateTo(computeSnapTarget());
+			const target = computeSnapTarget();
+			// Rule 1: the snapped folder becomes the focus + selection (root → clear).
+			focusPath = target.path;
+			if (target.path) selectFolderByPath(target.path);
+			else goHome();
+			animateTo(target);
 		}, SNAP_DELAY);
 	}
 
@@ -591,6 +635,7 @@
 			clearTimeout(snapTimer);
 			snapTimer = null;
 		}
+		focusPath = '';
 		animateTo({ zoom: MIN_ZOOM, panX: 0, panY: 0 });
 	}
 
@@ -1058,6 +1103,9 @@
 
 	function handlePointerMove(e: PointerEvent) {
 		if (!canvas) return;
+		lastPointerX = e.clientX;
+		lastPointerY = e.clientY;
+		pointerInside = true;
 
 		if (pointerDown) {
 			const dx = e.clientX - pointerStartX;
@@ -1100,19 +1148,63 @@
 			return; // a pan, not a selection
 		}
 
-		// Click → select the block under the pointer.
+		if (clickTimer) {
+			clearTimeout(clickTimer);
+			clickTimer = null;
+		}
 		const { x, y } = toContent(e);
 		const hit = findRectAt(x, y);
-		if (hit) {
-			if (hit.node) selectDirectory(hit.node);
-			else if (hit.file) selectFile(hit.file);
+		if (!hit) {
+			// Empty-click resets the item focus back to the zoomed folder — or, at
+			// the root, clears it entirely. Deferred so a double-click can go home.
+			clickTimer = setTimeout(() => {
+				clickTimer = null;
+				if (focusPath) selectFolderByPath(focusPath);
+				else goHome();
+			}, DOUBLE_CLICK_MS);
+			return;
+		}
+
+		// Click selects. If the clicked item is OUTSIDE the current view (the zoomed
+		// folder's subtree), also zoom out to the folder that holds both — so you see
+		// where it sits. Selection is immediate; the zoom-out is deferred so a
+		// double-click (navigate) can cancel it.
+		const hitPath = hit.node?.path ?? hit.file?.path ?? '';
+		if (hit.node) selectDirectory(hit.node);
+		else if (hit.file) selectFile(hit.file);
+
+		const insideView = !focusPath || hitPath === focusPath || hitPath.startsWith(focusPath + '/');
+		if (isZoomed && !insideView) {
+			clickTimer = setTimeout(() => {
+				clickTimer = null;
+				zoomToCommonAncestor(focusPath, hitPath);
+			}, DOUBLE_CLICK_MS);
 		}
 	}
 
 	function handlePointerLeave() {
+		pointerInside = false;
 		hoveredRect = null;
 		clearHoveredItem();
 		render();
+	}
+
+	// After a zoom settles, promote the item now under the cursor to the
+	// selection, so the panel follows where the mouse actually ended up.
+	function activateHoveredAfterZoom() {
+		if (!pointerInside || !canvas) return;
+		const { x, y } = toContent({ clientX: lastPointerX, clientY: lastPointerY });
+		const hit = findRectAt(x, y);
+		if (!hit) return;
+		// Only promote the hovered item if it's inside the folder we just drilled
+		// into; if the cursor ended up over a peek outside it (e.g. an edge sibling),
+		// keep the drilled-into folder selected.
+		const hitPath = hit.node?.path ?? hit.file?.path ?? '';
+		const focus = focusPath;
+		if (focus && hitPath !== focus && !hitPath.startsWith(focus + '/')) return;
+		hoveredRect = hit;
+		if (hit.node) selectDirectory(hit.node);
+		else if (hit.file) selectFile(hit.file);
 	}
 
 	// ── Double-click: drill into the block under the cursor (fill it to the
@@ -1127,23 +1219,83 @@
 		return { zoom: fz, panX: inset - rect.x * fz, panY: FOCUS_TOP_PX - rect.y };
 	}
 
-	function zoomToRect(rect: LayoutRect) {
-		if (viewportCss().w <= 0) return;
-		animateTo(frameTarget(rect));
+	// Select the directory at a path (or clear the selection if it isn't a folder
+	// in the current layout). Keeps the item focus in sync with the zoom focus.
+	function selectFolderByPath(path: string) {
+		const rect = layoutRects.find((r) => r.node?.path === path);
+		if (rect?.node) selectDirectory(rect.node);
+		else goHome();
 	}
 
-	// Zoom out to the parent directory of a path; top-level items (no parent in
-	// the tree) fall back to the whole-tree home view.
-	function zoomToParent(path: string) {
-		const lastSlash = path.lastIndexOf('/');
-		if (lastSlash < 0) {
+	function zoomToRect(rect: LayoutRect, activateAfter = false) {
+		if (viewportCss().w <= 0) return;
+		if (rect.node) focusPath = rect.node.path; // this folder is now the zoom focus
+		animateTo(frameTarget(rect), activateAfter);
+	}
+
+	// Immediate parent path of a node path ('' = the scanned root).
+	function parentPathOf(p: string): string {
+		const i = p.lastIndexOf('/');
+		return i < 0 ? '' : p.slice(0, i);
+	}
+
+	// Direct children (files + folders) a directory has in the current layout.
+	function childCountOf(p: string): number {
+		let n = 0;
+		for (const r of layoutRects) {
+			const rp = r.node?.path ?? r.file?.path;
+			if (rp && parentPathOf(rp) === p) n++;
+		}
+		return n;
+	}
+
+	// Climb to the nearest ancestor that actually branches — skip linear chains
+	// where the path is its parent's sole child (path compression). '' = root.
+	function nearestBranchingParent(path: string): string {
+		let p = parentPathOf(path);
+		while (p !== '' && childCountOf(p) <= 1) {
+			p = parentPathOf(p);
+		}
+		return p;
+	}
+
+	// Longest shared folder prefix of two paths ('' = the scanned root).
+	function commonAncestorPath(a: string, b: string): string {
+		const A = a ? a.split('/') : [];
+		const B = b ? b.split('/') : [];
+		const out: string[] = [];
+		for (let i = 0; i < Math.min(A.length, B.length); i++) {
+			if (A[i] === B[i]) out.push(A[i]);
+			else break;
+		}
+		return out.join('/');
+	}
+
+	// Frame the folder that contains both paths, so they're both on screen.
+	function zoomToCommonAncestor(a: string, b: string) {
+		const common = commonAncestorPath(a, b);
+		if (common === '') {
 			snapToRoot();
 			return;
 		}
-		const parentPath = path.slice(0, lastSlash);
-		const parent = layoutRects.find((r) => r.node?.path === parentPath);
-		if (parent) zoomToRect(parent);
+		const rect = layoutRects.find((r) => r.node?.path === common);
+		if (rect) zoomToRect(rect);
 		else snapToRoot();
+	}
+
+	// Zoom out from a path to its nearest branching ancestor, falling back to the
+	// whole-tree home view at the root.
+	function zoomToParent(path: string) {
+		const target = nearestBranchingParent(path);
+		if (target === '') {
+			snapToRoot();
+			return;
+		}
+		const rect = layoutRects.find((r) => r.node?.path === target);
+		if (rect && rect.node) {
+			selectDirectory(rect.node);
+			zoomToRect(rect);
+		} else snapToRoot();
 	}
 
 	// True when the view is already the whole-tree home (nothing to reset to).
@@ -1151,15 +1303,35 @@
 		return zoom <= MIN_ZOOM + 1e-3 && Math.abs(panX) < 0.5 && Math.abs(panY) < 0.5;
 	}
 
+	// Double-click any element → navigate to it: select it and frame it (a folder
+	// fills the view; a file frames its parent so you see it among siblings).
+	// Empty space → home.
 	function handleDoubleClick(e: MouseEvent) {
+		if (clickTimer) {
+			clearTimeout(clickTimer);
+			clickTimer = null;
+		}
 		if (snapTimer) {
 			clearTimeout(snapTimer);
 			snapTimer = null;
 		}
 		const { x, y } = toContent(e);
 		const hit = findRectAt(x, y);
-		if (hit) zoomToRect(hit);
-		else snapToRoot();
+		if (!hit) {
+			goHome();
+			snapToRoot();
+			return;
+		}
+		if (hit.node) {
+			selectDirectory(hit.node);
+			zoomToRect(hit, true);
+		} else if (hit.file) {
+			selectFile(hit.file);
+			const pp = parentPathOf(hit.file.path);
+			const prect = pp ? layoutRects.find((r) => r.node?.path === pp) : null;
+			if (prect) zoomToRect(prect, true);
+			else snapToRoot();
+		}
 	}
 
 	// ── Right-click menu: a native OS menu (Tauri v2) shown at the cursor, acting

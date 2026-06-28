@@ -436,7 +436,7 @@
 					style:flex={$selectedItem || $hoveredItem ? '0 0 38.2%' : '1 1 0%'}
 				>
 					{#if $viewMode === 'stalactite'}
-						<StalactiteChart data={treeData} class="h-full w-full" />
+						<StalactiteChart data={treeData} onGoHome={selectRoot} class="h-full w-full" />
 					{:else if $viewMode === 'tree'}
 						<TreeView data={treeData} class="h-full w-full" />
 					{:else}
