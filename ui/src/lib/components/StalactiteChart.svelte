@@ -47,6 +47,9 @@
 		// individually at the current zoom. Has no node/file; double-click to reveal.
 		isAggregate?: boolean;
 		aggChildCount?: number;
+		// Deepest subtree (in levels) hidden beneath this aggregate — drives the
+		// "goes deep" signal so folded structure is legible without zooming in.
+		aggMaxDepth?: number;
 	}
 
 	interface ColorPalette {
@@ -765,6 +768,7 @@
 			let aggStart = 0;
 			let aggWidth = 0;
 			let aggCount = 0;
+			let aggMaxDepth = 0;
 			const flushAgg = () => {
 				if (aggCount === 0) return;
 				rects.push({
@@ -772,6 +776,7 @@
 					file: null,
 					isAggregate: true,
 					aggChildCount: aggCount,
+					aggMaxDepth,
 					x: aggStart,
 					y,
 					width: Math.max(1, aggWidth - PADDING),
@@ -782,11 +787,15 @@
 				});
 				aggCount = 0;
 				aggWidth = 0;
+				aggMaxDepth = 0;
 			};
-			const fold = (w: number) => {
+			// hiddenDepth = levels of subtree this folded item hides below the row
+			// (a directory's max_depth; files hide nothing).
+			const fold = (w: number, hiddenDepth = 0) => {
 				if (aggCount === 0) aggStart = currentX;
 				aggWidth += w;
 				aggCount++;
+				if (hiddenDepth > aggMaxDepth) aggMaxDepth = hiddenDepth;
 			};
 
 			// Directories first (positional order), then files.
@@ -816,7 +825,7 @@
 						layoutChildrenAndFiles(subChildren, subFiles, currentX, nodeWidth, depth + 1);
 					}
 				} else {
-					fold(nodeWidth);
+					fold(nodeWidth, dir.max_depth ?? 0);
 				}
 				currentX += nodeWidth;
 			}
@@ -1122,6 +1131,27 @@
 				if (displayText.length > 1) {
 					ctx.fillText(displayText, sx + 4, sy + sh / 2);
 				}
+			}
+
+			// "Goes deep" signal. A folded aggregate hides whole subtrees; mark how
+			// deep with a small "layers" glyph in its bottom-left corner — a stack of
+			// ticks, one per hidden level (capped). Kept to a fixed small width and
+			// contained inside the block, so a wide aggregate never paints full-width
+			// bands (which read as banding, not a cue). Inherits the rect's globalAlpha
+			// so it dims with the spotlight.
+			if (rect.isAggregate && (rect.aggMaxDepth ?? 0) > 0 && sw > 8 && sh > 10) {
+				const ticks = Math.min(rect.aggMaxDepth ?? 0, 5);
+				const glyphW = Math.min(sw - 6, 14);
+				ctx.strokeStyle = 'rgba(30, 41, 59, 0.55)';
+				ctx.lineWidth = 1;
+				ctx.beginPath();
+				for (let i = 0; i < ticks; i++) {
+					const ly = Math.round(sy + sh - 3 - i * 2.5) + 0.5;
+					if (ly < sy + 4) break;
+					ctx.moveTo(sx + 3, ly);
+					ctx.lineTo(sx + 3 + glyphW, ly);
+				}
+				ctx.stroke();
 			}
 		}
 

@@ -224,15 +224,20 @@ async function initializeSchema(db: ReturnType<typeof drizzle>): Promise<void> {
  * Materialize per-directory aggregates into dir_stats for one run: size + file/
  * dir counts, plus the depth metric the icicle leans on — max_depth (how many
  * levels the deepest descendant sits below this directory) and deepest_path (the
- * descendant achieving it). The heavy O(dirs×files) descendant join runs HERE,
- * once, instead of on every get_tree.
+ * descendant achieving it). Runs once; get_tree then just reads it.
  *
- * Idempotent (ON CONFLICT DO NOTHING), so calling it again — or lazily on the
- * first tree read of a scan made before dir_stats existed — is a safe no-op.
+ * Crucially this does NOT join directories to descendants by prefix LIKE: a
+ * `f.path LIKE d.path || '/%'` join uses a *column-derived* pattern, which the
+ * planner cannot turn into an index range-scan, so it degenerates to a nested
+ * loop — O(dirs × files), ~633M row-touches on a 10k-dir / 58k-file scan (minutes,
+ * 1 GB+ RAM). Instead we ATTRIBUTE each item to each of its ancestor directories
+ * via generate_series over its path segments, then GROUP BY the ancestor. That is
+ * O(Σ depth) — a few hundred K attribution rows — and finishes in seconds.
  *
- * Depth is the count of '/' in a path; deepest_path is found with an argmax
- * trick: MAX of (zero-padded depth || path) orders by depth first, then the
- * 6-char prefix is stripped in SQL so the stored value is the clean path.
+ * Idempotent (ON CONFLICT DO NOTHING), so a re-call — or a lazy first-read of a
+ * scan made before dir_stats existed — is a safe no-op. deepest_path uses an
+ * argmax trick: MAX of (zero-padded depth || path) orders by depth first, then
+ * the 6-char prefix is stripped so the stored value is the clean path.
  */
 export async function populateDirStats(
   connection: DatabaseConnection,
@@ -242,22 +247,44 @@ export async function populateDirStats(
     INSERT INTO dir_stats (run_id, path, total_size, file_count, dir_count, max_depth, deepest_path)
     SELECT
       ${runId} AS run_id,
-      d.path AS path,
-      COALESCE(SUM(CASE WHEN NOT f.is_directory THEN f.physical_size ELSE 0 END), 0) AS total_size,
-      COUNT(CASE WHEN NOT f.is_directory THEN 1 END) AS file_count,
-      COUNT(CASE WHEN f.is_directory AND f.path <> d.path THEN 1 END) AS dir_count,
-      COALESCE(MAX(
-        (length(f.path) - length(replace(f.path, '/', '')))
-        - (length(d.path) - length(replace(d.path, '/', '')))
-      ), 0) AS max_depth,
-      substring(
-        MAX(lpad((length(f.path) - length(replace(f.path, '/', '')))::text, 6, '0') || f.path)
-        FROM 7
-      ) AS deepest_path
-    FROM files d
-    LEFT JOIN files f ON f.run_id = ${runId} AND f.path LIKE d.path || '/%'
-    WHERE d.run_id = ${runId} AND d.is_directory = true
-    GROUP BY d.path
+      anc.anc_path AS path,
+      COALESCE(SUM(CASE WHEN anc.kind = 'file' THEN anc.sz ELSE 0 END), 0) AS total_size,
+      COALESCE(SUM(CASE WHEN anc.kind = 'file' THEN 1 ELSE 0 END), 0) AS file_count,
+      COALESCE(SUM(CASE WHEN anc.kind = 'dir' THEN 1 ELSE 0 END), 0) AS dir_count,
+      COALESCE(MAX(anc.rel_depth), 0) AS max_depth,
+      substring(MAX(anc.depth_key) FROM 7) AS deepest_path
+    FROM (
+      -- Attribute every item to each ancestor directory (a strict path prefix).
+      SELECT
+        array_to_string((string_to_array(f.path, '/'))[1:i.i], '/') AS anc_path,
+        (f.segs - i.i) AS rel_depth,
+        (CASE WHEN f.is_directory THEN 'dir' ELSE 'file' END)::text AS kind,
+        f.physical_size AS sz,
+        (lpad(f.segs::text, 6, '0') || f.path)::text AS depth_key
+      FROM (
+        SELECT
+          path,
+          physical_size,
+          is_directory,
+          (length(path) - length(replace(path, '/', '')) + 1) AS segs
+        FROM files
+        WHERE run_id = ${runId}
+      ) f
+      CROSS JOIN LATERAL generate_series(1, f.segs - 1) AS i(i)
+
+      UNION ALL
+
+      -- Ensure every directory has a row even if it has no descendants (empty dir).
+      SELECT
+        d.path AS anc_path,
+        NULL::int AS rel_depth,
+        NULL::text AS kind,
+        0 AS sz,
+        NULL::text AS depth_key
+      FROM files d
+      WHERE d.run_id = ${runId} AND d.is_directory = true
+    ) anc
+    GROUP BY anc.anc_path
     ON CONFLICT (run_id, path) DO NOTHING
   `);
 }
