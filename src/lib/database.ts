@@ -69,6 +69,9 @@ export const files = pgTable(
   table => ({
     pk: primaryKey({ columns: [table.run_id, table.path] }),
     runIdIdx: index('idx_files_run_id').on(table.run_id),
+    // Prefix-LIKE on path ('folder/%') drives the LOD/aggregate queries; the
+    // runtime CREATE INDEX below uses text_pattern_ops (authoritative).
+    pathPatternIdx: index('idx_files_path_pattern').on(table.run_id, table.path),
     physicalSizeIdx: index('idx_files_physical_size').on(table.physical_size),
     contentSizeIdx: index('idx_files_content_size').on(table.content_size),
     hashIdx: index('idx_files_hash').on(table.hash),
@@ -154,6 +157,11 @@ async function initializeSchema(db: ReturnType<typeof drizzle>): Promise<void> {
 
     // Create indexes for performance
     await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_files_run_id ON files (run_id)`);
+    // Prefix-LIKE on path ('folder/%') drives the LOD/aggregate descendant joins;
+    // without text_pattern_ops those scans are O(n²) on large scans.
+    await db.execute(
+      sql`CREATE INDEX IF NOT EXISTS idx_files_path_pattern ON files (run_id, path text_pattern_ops)`
+    );
     await db.execute(
       sql`CREATE INDEX IF NOT EXISTS idx_files_physical_size ON files (physical_size)`
     );
