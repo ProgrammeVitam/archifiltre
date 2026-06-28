@@ -24,6 +24,7 @@ import {
   closeScanDatabase,
   getLatestRunId,
   getScanStats,
+  populateDirStats,
   files,
   scanMetadata,
   type DatabaseConnection,
@@ -80,6 +81,10 @@ interface DirectoryNode extends NodeEnrichment {
   total_size: number;
   file_count: number;
   dir_count: number;
+  /** Levels the deepest descendant sits below this directory (0 = leaf folder). */
+  max_depth: number;
+  /** Path of that deepest descendant, or null if the folder is empty. */
+  deepest_path: string | null;
 }
 
 interface FileNode extends NodeEnrichment {
@@ -117,46 +122,39 @@ async function handleGetTree(
 
   const rootPath = metadataResult[0]?.root_path || null;
 
-  // Get all directories with aggregated stats using a CTE
-  // This computes total_size, file_count, and dir_count for each directory
+  // Ensure the per-directory aggregates are materialized for this run. They never
+  // go stale (a new scan = a new run_id), so this runs the heavy descendant join
+  // only once — on the first tree read — and auto-migrates scans made before the
+  // dir_stats table existed. Subsequent reads (incl. every enrichment re-query)
+  // just join the cached aggregates with the enrichment tables.
+  const populated = await db.db.execute(
+    sql`SELECT 1 FROM dir_stats WHERE run_id = ${runId} LIMIT 1`
+  );
+  if (populated.rows.length === 0) {
+    await populateDirStats(db, runId);
+  }
+
+  // Read the materialized aggregates and join the (cheap) enrichment flags.
   const directoriesQuery = await db.db.execute(sql`
-    WITH RECURSIVE dir_tree AS (
-      -- Base: all directories
-      SELECT
-        path,
-        physical_size,
-        is_directory
-      FROM files
-      WHERE run_id = ${runId}
-    ),
-    dir_stats AS (
-      -- For each directory, compute stats from all descendants
-      SELECT
-        d.path as dir_path,
-        COALESCE(SUM(CASE WHEN NOT f.is_directory THEN f.physical_size ELSE 0 END), 0) as total_size,
-        COUNT(CASE WHEN NOT f.is_directory THEN 1 END) as file_count,
-        COUNT(CASE WHEN f.is_directory AND f.path != d.path THEN 1 END) as dir_count
-      FROM files d
-      LEFT JOIN files f ON f.path LIKE d.path || '/%' AND f.run_id = ${runId}
-      WHERE d.run_id = ${runId} AND d.is_directory = true
-      GROUP BY d.path
-    )
     SELECT
-      ds.dir_path as path,
+      ds.path as path,
       ds.total_size,
       ds.file_count,
       ds.dir_count,
+      ds.max_depth,
+      ds.deepest_path,
       al.alias as alias,
-      EXISTS (SELECT 1 FROM comments cm WHERE cm.run_id = ${runId} AND cm.path = ds.dir_path) as has_comment,
-      EXISTS (SELECT 1 FROM tag_assignments tg WHERE tg.run_id = ${runId} AND tg.path = ds.dir_path) as has_tag,
+      EXISTS (SELECT 1 FROM comments cm WHERE cm.run_id = ${runId} AND cm.path = ds.path) as has_comment,
+      EXISTS (SELECT 1 FROM tag_assignments tg WHERE tg.run_id = ${runId} AND tg.path = ds.path) as has_tag,
       EXISTS (
         SELECT 1 FROM delete_tags dt
         WHERE dt.run_id = ${runId}
-          AND (dt.path = ds.dir_path OR starts_with(ds.dir_path, dt.path || '/'))
+          AND (dt.path = ds.path OR starts_with(ds.path, dt.path || '/'))
       ) as tagged_for_deletion
     FROM dir_stats ds
-    LEFT JOIN aliases al ON al.run_id = ${runId} AND al.path = ds.dir_path
-    ORDER BY ds.dir_path
+    LEFT JOIN aliases al ON al.run_id = ${runId} AND al.path = ds.path
+    WHERE ds.run_id = ${runId}
+    ORDER BY ds.path
   `);
 
   const directories: DirectoryNode[] = (
@@ -165,6 +163,8 @@ async function handleGetTree(
       total_size: string | number;
       file_count: string | number;
       dir_count: string | number;
+      max_depth: string | number;
+      deepest_path: string | null;
       alias: string | null;
       has_comment: boolean;
       has_tag: boolean;
@@ -186,6 +186,8 @@ async function handleGetTree(
       total_size: Number(row.total_size) || 0,
       file_count: Number(row.file_count) || 0,
       dir_count: Number(row.dir_count) || 0,
+      max_depth: Number(row.max_depth) || 0,
+      deepest_path: row.deepest_path ?? null,
       alias: row.alias ?? null,
       has_comment: Boolean(row.has_comment),
       has_tag: Boolean(row.has_tag),

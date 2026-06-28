@@ -254,6 +254,11 @@ export interface DirectoryNode extends NodeEnrichment {
 	total_size: number;
 	file_count: number;
 	dir_count: number;
+	/** Levels the deepest descendant sits below this directory (0 = leaf folder).
+	 *  Optional: provisional (mid-scan) directories don't carry it yet. */
+	max_depth?: number;
+	/** Path of that deepest descendant, or null when the folder is empty. */
+	deepest_path?: string | null;
 }
 
 /** Tree data from get_tree query */

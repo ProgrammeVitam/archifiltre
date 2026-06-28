@@ -194,6 +194,23 @@ async function initializeSchema(db: ReturnType<typeof drizzle>): Promise<void> {
       )
     `);
 
+    // Materialized per-directory aggregates (size/counts + max subtree depth).
+    // Computed once per run (see populateDirStats) so get_tree is O(dirs) instead
+    // of re-running the O(dirs×files) descendant join on every query. total_size
+    // is BIGINT — a directory subtree easily exceeds the 2 GB INTEGER ceiling.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS dir_stats (
+        run_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        total_size BIGINT NOT NULL DEFAULT 0,
+        file_count BIGINT NOT NULL DEFAULT 0,
+        dir_count BIGINT NOT NULL DEFAULT 0,
+        max_depth INTEGER NOT NULL DEFAULT 0,
+        deepest_path TEXT,
+        CONSTRAINT dir_stats_pkey PRIMARY KEY (run_id, path)
+      )
+    `);
+
     logger.debug(
       'Database schema initialized with physical_size, content_size, archive preprocessing fields, and scan_metadata'
     );
@@ -201,6 +218,48 @@ async function initializeSchema(db: ReturnType<typeof drizzle>): Promise<void> {
     logger.error('Failed to initialize database schema', error as Error);
     throw error;
   }
+}
+
+/**
+ * Materialize per-directory aggregates into dir_stats for one run: size + file/
+ * dir counts, plus the depth metric the icicle leans on — max_depth (how many
+ * levels the deepest descendant sits below this directory) and deepest_path (the
+ * descendant achieving it). The heavy O(dirs×files) descendant join runs HERE,
+ * once, instead of on every get_tree.
+ *
+ * Idempotent (ON CONFLICT DO NOTHING), so calling it again — or lazily on the
+ * first tree read of a scan made before dir_stats existed — is a safe no-op.
+ *
+ * Depth is the count of '/' in a path; deepest_path is found with an argmax
+ * trick: MAX of (zero-padded depth || path) orders by depth first, then the
+ * 6-char prefix is stripped in SQL so the stored value is the clean path.
+ */
+export async function populateDirStats(
+  connection: DatabaseConnection,
+  runId: string
+): Promise<void> {
+  await connection.db.execute(sql`
+    INSERT INTO dir_stats (run_id, path, total_size, file_count, dir_count, max_depth, deepest_path)
+    SELECT
+      ${runId} AS run_id,
+      d.path AS path,
+      COALESCE(SUM(CASE WHEN NOT f.is_directory THEN f.physical_size ELSE 0 END), 0) AS total_size,
+      COUNT(CASE WHEN NOT f.is_directory THEN 1 END) AS file_count,
+      COUNT(CASE WHEN f.is_directory AND f.path <> d.path THEN 1 END) AS dir_count,
+      COALESCE(MAX(
+        (length(f.path) - length(replace(f.path, '/', '')))
+        - (length(d.path) - length(replace(d.path, '/', '')))
+      ), 0) AS max_depth,
+      substring(
+        MAX(lpad((length(f.path) - length(replace(f.path, '/', '')))::text, 6, '0') || f.path)
+        FROM 7
+      ) AS deepest_path
+    FROM files d
+    LEFT JOIN files f ON f.run_id = ${runId} AND f.path LIKE d.path || '/%'
+    WHERE d.run_id = ${runId} AND d.is_directory = true
+    GROUP BY d.path
+    ON CONFLICT (run_id, path) DO NOTHING
+  `);
 }
 
 /**

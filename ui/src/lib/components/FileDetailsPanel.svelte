@@ -58,7 +58,8 @@
 		TagIcon,
 		MessageSquareTextIcon,
 		PencilIcon,
-		PlusIcon
+		PlusIcon,
+		LayersIcon
 	} from '@lucide/svelte';
 	import FilePreview from './FilePreview.svelte';
 
@@ -704,6 +705,25 @@
 							<span class="font-medium text-foreground">
 								{displayItem.dirCount?.toLocaleString() ?? 0}
 							</span>
+
+							<!-- Deepest descendant: how far the structure nests below this
+							     folder, and where. Surfaces the "this corner goes deep" signal
+							     the icicle can only hint at when zoomed out. -->
+							{#if (displayItem.maxDepth ?? 0) > 0}
+								<div class="flex items-center gap-2 text-muted-foreground">
+									<LayersIcon class="h-3.5 w-3.5" />
+									<span>Deepest</span>
+								</div>
+								<span class="font-medium text-foreground" title={displayItem.deepestPath ?? undefined}>
+									{displayItem.maxDepth}
+									{displayItem.maxDepth === 1 ? 'level' : 'levels'}
+									{#if displayItem.deepestPath}
+										<span class="font-normal text-muted-foreground"
+											>· {displayItem.deepestPath.split('/').pop()}</span
+										>
+									{/if}
+								</span>
+							{/if}
 
 							<!-- Date stats -->
 							{#if isLoadingDateStats}

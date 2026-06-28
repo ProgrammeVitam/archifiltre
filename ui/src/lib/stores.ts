@@ -426,6 +426,10 @@ export interface SelectedItem {
 	fileCount?: number;
 	dirCount?: number;
 	totalSize?: number;
+	/** Levels the deepest descendant sits below this directory. */
+	maxDepth?: number;
+	/** Path of that deepest descendant. */
+	deepestPath?: string | null;
 	// File-specific fields
 	contentSize?: number | null;
 	mtime?: number;
@@ -484,6 +488,8 @@ export function hoverDirectory(
 		total_size: number;
 		file_count: number;
 		dir_count: number;
+		max_depth?: number;
+		deepest_path?: string | null;
 	},
 	span?: ItemSpan
 ): void {
@@ -494,7 +500,9 @@ export function hoverDirectory(
 		size: node.total_size,
 		totalSize: node.total_size,
 		fileCount: node.file_count,
-		dirCount: node.dir_count
+		dirCount: node.dir_count,
+		maxDepth: node.max_depth,
+		deepestPath: node.deepest_path ?? null
 	});
 	if (span) {
 		hoveredItemSpan.set(span);
@@ -541,6 +549,8 @@ export function selectDirectory(
 		total_size: number;
 		file_count: number;
 		dir_count: number;
+		max_depth?: number;
+		deepest_path?: string | null;
 	},
 	span?: ItemSpan
 ): void {
@@ -551,7 +561,9 @@ export function selectDirectory(
 		size: node.total_size,
 		totalSize: node.total_size,
 		fileCount: node.file_count,
-		dirCount: node.dir_count
+		dirCount: node.dir_count,
+		maxDepth: node.max_depth,
+		deepestPath: node.deepest_path ?? null
 	});
 	if (span) {
 		selectedItemSpan.set(span);
