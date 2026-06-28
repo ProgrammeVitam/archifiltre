@@ -22,7 +22,8 @@
 		clearSelectedItem,
 		invalidateEnrichment,
 		enrichmentInvalidation,
-		selectedItem
+		selectedItem,
+		colorMode
 	} from '$lib/stores';
 	import { getFileType } from '$lib/file-types';
 	import { Menu, MenuItem, PredefinedMenuItem } from '@tauri-apps/api/menu';
@@ -146,8 +147,18 @@
 	// empty-click resets the selection back to it (or clears it at the root).
 	let focusPath = '';
 
-	// Color mode
-	let colorMode: 'type' | 'date' = $state('type');
+	// Colour mode lives in a shared store (the header drives the toggle); re-colour
+	// the chart whenever it flips.
+	$effect(() => {
+		$colorMode;
+		untrack(() => {
+			if (!ctx || canvasWidth === 0 || !data) return;
+			computeLayout();
+			updateCanvasHeight();
+			clampView();
+			render();
+		});
+	});
 
 	// Path of the current selection. Non-empty → spotlight that subtree (the node
 	// and its descendants stay vivid, the rest of the chart dims into context).
@@ -343,7 +354,7 @@
 	): string {
 		if (dir !== null) return palette.folder;
 		if (file === null) return palette.other;
-		if (colorMode === 'date') return getDateColor(file.mtime, minMtime, maxMtime, palette);
+		if ($colorMode === 'date') return getDateColor(file.mtime, minMtime, maxMtime, palette);
 		return getTypeColorFor(file.name, palette);
 	}
 
@@ -839,14 +850,6 @@
 		}
 
 		layoutRects = rects;
-	}
-
-	function setColorMode(mode: 'type' | 'date') {
-		colorMode = mode;
-		computeLayout();
-		updateCanvasHeight();
-		clampView();
-		render();
 	}
 
 	// ================================
@@ -1395,20 +1398,6 @@
 </script>
 
 <div class="flex w-full flex-col {className}">
-	<!-- Top bar: color mode toggle -->
-	<div class="flex items-center justify-end gap-2 px-2 pb-1">
-		<div class="flex items-center gap-0.5 rounded-lg bg-muted p-[3px]">
-			<button
-				class="cursor-pointer rounded-md border-none px-2.5 py-[5px] text-xs font-medium transition-all {colorMode === 'type' ? 'bg-background text-foreground shadow-sm' : 'bg-transparent text-muted-foreground'}"
-				onclick={() => setColorMode('type')}
-			>Type</button>
-			<button
-				class="cursor-pointer rounded-md border-none px-2.5 py-[5px] text-xs font-medium transition-all {colorMode === 'date' ? 'bg-background text-foreground shadow-sm' : 'bg-transparent text-muted-foreground'}"
-				onclick={() => setColorMode('date')}
-			>Date</button>
-		</div>
-	</div>
-
 	<!-- Chart container: fills the pane; the canvas below is a fixed viewport -->
 	<div bind:this={container} class="relative flex min-h-0 w-full flex-1 flex-col">
 		<div bind:this={canvasWrapper} class="relative min-h-0 w-full flex-1 overflow-hidden">

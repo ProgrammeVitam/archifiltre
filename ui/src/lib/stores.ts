@@ -412,6 +412,10 @@ export const cliVersion = writable<string | null>(null);
 export type ViewMode = 'stalactite' | 'tree' | 'flat';
 export const viewMode = writable<ViewMode>('stalactite');
 
+/** Icicle colour mode — by file type or by date. Shared so the header can drive
+ *  the toggle while the chart renders from it. */
+export const colorMode = writable<'type' | 'date'>('type');
+
 // Selected item store for details panel (shared across all views)
 export interface SelectedItem {
 	type: 'file' | 'directory';

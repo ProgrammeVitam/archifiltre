@@ -7,6 +7,7 @@
 		activeScan,
 		hasActiveScans,
 		viewMode,
+		colorMode,
 		type Platform,
 		type ViewMode
 	} from '$lib/stores';
@@ -331,6 +332,26 @@
 
 					<!-- Spacer to push export and controls to the right -->
 					<div class="titlebar-spacer"></div>
+
+					<!-- Icicle colour mode (Visual view only) -->
+					{#if showViewControls && $viewMode === 'stalactite'}
+						<div class="flex items-center gap-0.5 rounded-lg bg-muted p-[3px]" data-no-drag>
+							<button
+								class="cursor-pointer rounded-md border-none px-2.5 py-[5px] text-xs font-medium transition-all {$colorMode ===
+								'type'
+									? 'bg-background text-foreground shadow-sm'
+									: 'bg-transparent text-muted-foreground'}"
+								onclick={() => colorMode.set('type')}>Type</button
+							>
+							<button
+								class="cursor-pointer rounded-md border-none px-2.5 py-[5px] text-xs font-medium transition-all {$colorMode ===
+								'date'
+									? 'bg-background text-foreground shadow-sm'
+									: 'bg-transparent text-muted-foreground'}"
+								onclick={() => colorMode.set('date')}>Date</button
+							>
+						</div>
+					{/if}
 
 					<!-- Export dropdown - only shown when scan complete -->
 					{#if showViewControls}

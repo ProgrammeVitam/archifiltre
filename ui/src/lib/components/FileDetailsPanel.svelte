@@ -103,9 +103,10 @@
 	// rootName: the scanned folder's display name, always the first breadcrumb.
 	let { onGoHome, rootName = '' }: { onGoHome?: () => void; rootName?: string } = $props();
 
-	// Determine which item to display: selected takes priority, then hovered
-	let displayItem = $derived($selectedItem ?? $hoveredItem);
-	let isPreview = $derived(!$selectedItem && !!$hoveredItem);
+	// Hover-to-preview: the hovered item takes priority so moving the mouse over a
+	// block previews it; releasing the hover reverts to the committed selection.
+	let displayItem = $derived($hoveredItem ?? $selectedItem);
+	let isPreview = $derived(!!$hoveredItem && $hoveredItem.path !== ($selectedItem?.path ?? null));
 	// The root / home state (the whole scan) is not a folder: no enrichment, no
 	// close button — it IS the close target. (The connector itself is drawn by the
 	// chart, behind the blocks; the panel no longer renders it.)
@@ -342,9 +343,9 @@
 		}
 	});
 
-	// Fetch date stats when a directory is selected
+	// Fetch date stats for the displayed directory (hover preview included).
 	$effect(() => {
-		const item = $selectedItem;
+		const item = displayItem;
 		if (item && item.type === 'directory' && item.path !== lastDateStatsPath) {
 			lastDateStatsPath = item.path;
 			isLoadingDateStats = true;
@@ -362,9 +363,9 @@
 		}
 	});
 
-	// Fetch composition when a directory (incl. the whole-scan root) is selected
+	// Fetch composition for the displayed directory (hover preview included).
 	$effect(() => {
-		const item = $selectedItem;
+		const item = displayItem;
 		if (item && item.type === 'directory' && item.path !== lastCompositionPath) {
 			lastCompositionPath = item.path;
 			composition = null;
@@ -598,7 +599,13 @@
 							<span>Summary</span>
 						</div>
 
-						{#if isLoadingDescription}
+						{#if lastDescribedPath !== displayItem.path}
+							<!-- Hover preview: the AI summary stays load-on-select (no LLM call
+							     per hover), so show a hint rather than another item's summary. -->
+							<p class="flex-1 text-sm text-muted-foreground/40 italic">
+								Select this folder to load its summary.
+							</p>
+						{:else if isLoadingDescription}
 							<div class="flex flex-1 items-center gap-2 text-sm text-muted-foreground">
 								<LoaderCircleIcon class="h-4 w-4 animate-spin" />
 								<span>Analyzing directory contents…</span>
@@ -779,8 +786,9 @@
 							{/if}
 						{/if}
 
-						<!-- Enrichment (editable for a selected element — never the whole scan) -->
-						{#if $selectedItem && !isRootSelected}
+						<!-- Enrichment (editable for a selected element — never the whole scan
+						     nor a transient hover preview, which has no committed selection) -->
+						{#if $selectedItem && !isRootSelected && !isPreview}
 							<div class="col-span-2 mt-3 flex flex-col gap-4 border-t border-border pt-4">
 								<!-- Alias -->
 								<label class="flex flex-col gap-1.5">
