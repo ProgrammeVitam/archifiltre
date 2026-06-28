@@ -43,6 +43,10 @@
 		color: string;
 		opacity: number;
 		depth: number;
+		// Aggregate ("rest") block: stands in for a run of siblings too small to draw
+		// individually at the current zoom. Has no node/file; double-click to reveal.
+		isAggregate?: boolean;
+		aggChildCount?: number;
 	}
 
 	interface ColorPalette {
@@ -160,6 +164,21 @@
 		});
 	});
 
+	// Re-layout when the zoom BAND changes: visibility is on-screen-width based, so
+	// zooming in reveals smaller blocks and re-folds the aggregates. Quantised
+	// (~3 bands/octave) so it recomputes per band, not on every wheel tick.
+	let zoomBand = $derived(Math.round(Math.log2(zoom) * 3));
+	$effect(() => {
+		zoomBand;
+		untrack(() => {
+			if (!ctx || canvasWidth === 0 || !data) return;
+			computeLayout();
+			updateCanvasHeight();
+			clampView();
+			render();
+		});
+	});
+
 	// Path of the current selection. Non-empty → spotlight that subtree (the node
 	// and its descendants stay vivid, the rest of the chart dims into context).
 	// '' (root) or null (nothing selected) → no dimming, the whole chart is lit.
@@ -190,8 +209,11 @@
 
 	// Constants
 	const ROW_HEIGHT = 28;
-	const MIN_VISIBLE_WIDTH = 2;
 	const PADDING = 1;
+	// A block is drawn individually once its ON-SCREEN width (content width × zoom)
+	// clears this floor; smaller siblings fold into one aggregate "rest" block that
+	// fills their slice exactly (so gaps never form, and zooming reveals more).
+	const MIN_REVEAL_PX = 3;
 
 	// ================================
 	// Lifecycle
@@ -211,11 +233,12 @@
 			canvas.width = canvasWidth;
 			canvas.height = canvasHeight;
 			setupResizeObserver();
-			// Initial render
+			// Initial render. Route through updateForNewData (not a bare computeLayout)
+			// so it records lastDataId here — otherwise the $effect.pre rAF below would
+			// treat this same data as new, reset the file-load guard sets, and re-fetch
+			// every visible directory's files a second time.
 			if (data) {
-				childrenMap = buildTreeHierarchy(data.directories);
-				computeLayout();
-				render();
+				updateForNewData();
 			}
 		}
 	});
@@ -411,8 +434,7 @@
 			updateCanvasHeight();
 			clampView();
 			render();
-			// Load files for all directories
-			loadFilesForAllDirectories();
+			// Files load lazily from inside computeLayout (only on-screen folders).
 		}
 	}
 
@@ -452,18 +474,6 @@
 			filesCache.set(dirPath, []);
 		} finally {
 			loadingFiles.delete(dirPath);
-		}
-	}
-
-	function loadFilesForAllDirectories() {
-		if (!data || provisional) return; // provisional: dirs-only, the DB isn't readable mid-scan
-
-		// Load root files
-		loadFilesForDirectory('');
-
-		// Load files for ALL directories to show complete structure
-		for (const dir of data.directories) {
-			loadFilesForDirectory(dir.path);
 		}
 	}
 
@@ -680,6 +690,7 @@
 
 		// If no directories, layout root files instead
 		if (data.directories.length === 0) {
+			if (!filesCache.has('') && !provisional) loadFilesForDirectory('');
 			const rootFilesList = filesCache.get('') || [];
 			if (rootFilesList.length > 0) {
 				computeFilesOnlyLayout(rootFilesList, palette, minMtime, maxMtime);
@@ -701,6 +712,11 @@
 		let currentMaxDepth = 0;
 
 		const rects: LayoutRect[] = [];
+		// LOD lazy-load queue: directories this layout actually draws but whose files
+		// aren't materialized yet. Filled during layout, drained after — so only the
+		// folders on-screen at the current zoom fetch their files from PGlite, never
+		// the whole tree up front (the v4 all-in-memory trap).
+		const dirsToLoad: string[] = [];
 
 		// Start from the TRUE top-level directories (those whose parent is the
 		// scanned root) using the path-based hierarchy. The backend's `depth` field
@@ -718,11 +734,14 @@
 
 		// Initial layout of root level directories and files
 		function layoutRootLevel(dirs: DirectoryNode[], x: number, width: number, depth: number) {
+			if (!filesCache.has('') && !provisional) dirsToLoad.push('');
 			const rootFiles = filesCache.get('') || [];
 			layoutChildrenAndFiles(dirs, rootFiles, x, width, depth);
 		}
 
-		// Layout both subdirectories and files together at the same level
+		// Layout subdirectories and files at one level, folding runs of siblings too
+		// small to draw individually (at the current zoom) into one aggregate block
+		// that fills their slice — so no gaps, and zooming in reveals more.
 		function layoutChildrenAndFiles(
 			dirs: DirectoryNode[],
 			files: FileNode[],
@@ -732,26 +751,49 @@
 		) {
 			const levelIndex = depth - startDepth;
 			const y = levelIndex * ROW_HEIGHT;
+			if (levelIndex > currentMaxDepth) currentMaxDepth = levelIndex;
 
-			// Track max depth
-			if (levelIndex > currentMaxDepth) {
-				currentMaxDepth = levelIndex;
-			}
-
-			// Calculate total size including both dirs and files
 			const dirsSize = dirs.reduce((sum, d) => sum + d.total_size, 0);
 			const filesSize = files.reduce((sum, f) => sum + f.size, 0);
 			const totalSize = dirsSize + filesSize;
-
 			if (totalSize === 0) return;
 
-			let currentX = x;
+			// Visible iff on-screen width (content width × zoom) clears the floor.
+			const minContentWidth = MIN_REVEAL_PX / zoom;
 
-			// Layout directories first
+			let currentX = x;
+			let aggStart = 0;
+			let aggWidth = 0;
+			let aggCount = 0;
+			const flushAgg = () => {
+				if (aggCount === 0) return;
+				rects.push({
+					node: null,
+					file: null,
+					isAggregate: true,
+					aggChildCount: aggCount,
+					x: aggStart,
+					y,
+					width: Math.max(1, aggWidth - PADDING),
+					height: ROW_HEIGHT - PADDING,
+					color: palette.other,
+					opacity: 1,
+					depth: levelIndex
+				});
+				aggCount = 0;
+				aggWidth = 0;
+			};
+			const fold = (w: number) => {
+				if (aggCount === 0) aggStart = currentX;
+				aggWidth += w;
+				aggCount++;
+			};
+
+			// Directories first (positional order), then files.
 			for (const dir of dirs) {
 				const nodeWidth = (dir.total_size / totalSize) * width;
-
-				if (nodeWidth >= MIN_VISIBLE_WIDTH) {
+				if (nodeWidth >= minContentWidth) {
+					flushAgg();
 					rects.push({
 						node: dir,
 						file: null,
@@ -763,26 +805,28 @@
 						opacity: 1,
 						depth: levelIndex
 					});
-
-					// Recursively layout this directory's children
 					const subChildren = getChildren(dir.path, childrenMap);
-					const subFiles = filesCache.get(dir.path) || [];
+					// Wide enough to draw, so this folder's file children may be visible
+					// too — request them lazily if they aren't loaded yet (undefined =
+					// never loaded; [] = loaded-but-empty, so don't re-fetch).
+					const cachedFiles = filesCache.get(dir.path);
+					if (cachedFiles === undefined && !provisional) dirsToLoad.push(dir.path);
+					const subFiles = cachedFiles || [];
 					if (subChildren.length > 0 || subFiles.length > 0) {
 						layoutChildrenAndFiles(subChildren, subFiles, currentX, nodeWidth, depth + 1);
 					}
+				} else {
+					fold(nodeWidth);
 				}
-
 				currentX += nodeWidth;
 			}
-
-			// Then layout files
 			for (const file of files) {
 				const fileWidth = (file.size / totalSize) * width;
-
-				if (fileWidth >= MIN_VISIBLE_WIDTH) {
+				if (fileWidth >= minContentWidth) {
+					flushAgg();
 					rects.push({
 						node: null,
-						file: file,
+						file,
 						x: currentX,
 						y,
 						width: fileWidth - PADDING,
@@ -791,15 +835,22 @@
 						opacity: 1,
 						depth: levelIndex
 					});
+				} else {
+					fold(fileWidth);
 				}
-
 				currentX += fileWidth;
 			}
+			flushAgg();
 		}
 
 		layoutRootLevel(startDirs, 0, viewWidth, startDepth);
 		layoutRects = rects;
 		maxDepth = currentMaxDepth;
+
+		// Drain the lazy-load queue: fetch files only for the folders this layout
+		// actually drew. loadFilesForDirectory is guarded (cache + in-flight set), so
+		// re-running layout on every pan/zoom frame never double-fetches.
+		for (const path of dirsToLoad) loadFilesForDirectory(path);
 	}
 
 	function computeFilesOnlyLayout(
@@ -828,14 +879,36 @@
 
 		maxDepth = 0; // Files only = single row
 
+		const minContentWidth = MIN_REVEAL_PX / zoom;
 		let currentX = 0;
+		let aggStart = 0;
+		let aggWidth = 0;
+		let aggCount = 0;
+		const flushAgg = () => {
+			if (aggCount === 0) return;
+			rects.push({
+				node: null,
+				file: null,
+				isAggregate: true,
+				aggChildCount: aggCount,
+				x: aggStart,
+				y: 0,
+				width: Math.max(1, aggWidth - PADDING),
+				height: ROW_HEIGHT - PADDING,
+				color: palette.other,
+				opacity: 1,
+				depth: 0
+			});
+			aggCount = 0;
+			aggWidth = 0;
+		};
 		for (const file of files) {
 			const fileWidth = (file.size / totalSize) * viewWidth;
-
-			if (fileWidth >= MIN_VISIBLE_WIDTH) {
+			if (fileWidth >= minContentWidth) {
+				flushAgg();
 				rects.push({
 					node: null,
-					file: file,
+					file,
 					x: currentX,
 					y: 0,
 					width: fileWidth - PADDING,
@@ -844,10 +917,14 @@
 					opacity: 1,
 					depth: 0
 				});
+			} else {
+				if (aggCount === 0) aggStart = currentX;
+				aggWidth += fileWidth;
+				aggCount++;
 			}
-
 			currentX += fileWidth;
 		}
+		flushAgg();
 
 		layoutRects = rects;
 	}
@@ -1168,6 +1245,8 @@
 			return;
 		}
 
+		if (hit.isAggregate) return; // a folded "rest" block — not selectable
+
 		// Click selects. If the clicked item is OUTSIDE the current view (the zoomed
 		// folder's subtree), also zoom out to the folder that holds both — so you see
 		// where it sits. Selection is immediate; the zoom-out is deferred so a
@@ -1325,6 +1404,10 @@
 			snapToRoot();
 			return;
 		}
+		if (hit.isAggregate) {
+			zoomToRect(hit); // zoom into the aggregate's span to reveal its contents
+			return;
+		}
 		if (hit.node) {
 			selectDirectory(hit.node);
 			zoomToRect(hit, true);
@@ -1345,7 +1428,7 @@
 		e.preventDefault();
 		const { x, y } = toContent(e);
 		const hit = findRectAt(x, y);
-		if (!hit) return;
+		if (!hit || hit.isAggregate) return;
 		const path = hit.node?.path ?? hit.file?.path ?? '';
 		// Right-click also selects, so the details panel mirrors the target.
 		if (hit.node) selectDirectory(hit.node);
