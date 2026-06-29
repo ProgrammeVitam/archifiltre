@@ -20,7 +20,6 @@ import {
   last,
   catchError,
   mergeMap,
-  delay,
 } from 'rxjs/operators';
 import {
   eq as _eq,
@@ -434,17 +433,19 @@ export interface ScanConfig {
   archiveConcurrency?: number;
   enableArchiveNesting?: boolean;
   /**
-   * Yield to the macrotask queue between ingestion batches (single concurrency +
-   * a macrotask tick per batch). Set ONLY when the same process must also answer
-   * reads during the scan (the single-owner session) — PGlite blocks the JS thread,
-   * so without this a tight write loop starves concurrent reads entirely. Costs
-   * ~throughput; off by default so the standalone scan stays fast.
+   * Read-priority hook called between write batches (ingestion + hashing). Set ONLY
+   * by the single-owner session, which provides a function that yields to any
+   * in-flight reads before the next batch — so concurrent reads aren't starved
+   * (PGlite blocks the JS thread and its queue is FIFO, so without this a dense
+   * write loop monopolises the connection). Its presence also drops ingestion to
+   * concurrency 1 (sequential batches, clean yield points). Absent → standalone
+   * scan runs at full write throughput.
    */
-  cooperativeYield?: boolean;
+  betweenBatches?: () => Promise<void>;
   /**
    * The connection is owned by a long-lived session (shared with live readers), so
    * the scan must clear data in place rather than close + delete + recreate the
-   * datadir. Set together with cooperativeYield for the single-owner session.
+   * datadir. Set together with betweenBatches for the single-owner session.
    */
   preserveConnection?: boolean;
 }
@@ -631,9 +632,9 @@ export function scanDirectory(
         bufferCount(config.batchSize || 1000),
 
         // Insert batches with limited concurrency (PGlite handles concurrent writes).
-        // In cooperativeYield mode we drop to concurrency 1 and add a macrotask tick
-        // (delay(0)) after each batch, so a concurrent reader in the same process
-        // gets a turn between batches instead of being starved for the whole ingest.
+        // With betweenBatches set (single-owner session) we drop to concurrency 1 and
+        // run the read-priority hook after each batch, so a concurrent reader in the
+        // same process is served between batches instead of being starved.
         mergeMap(
           batch =>
             insertFileBatch(connection, batch).pipe(
@@ -659,9 +660,11 @@ export function scanDirectory(
                 });
                 return from([0]); // Continue processing
               }),
-              config.cooperativeYield ? delay(0) : tap()
+              config.betweenBatches
+                ? mergeMap((n: number) => from(config.betweenBatches!()).pipe(map(() => n)))
+                : tap()
             ),
-          config.cooperativeYield ? 1 : 2
+          config.betweenBatches ? 1 : 2
         ),
 
         // Final ingestion update
@@ -693,7 +696,7 @@ export function scanDirectory(
 
     // Phase 5: Hash calculation for files with duplicate content_size
     switchMap(() =>
-      performHashing({ database: connection, runId: config.runId, rootPath: config.rootPath }, (processed, total, errors) => {
+      performHashing({ database: connection, runId: config.runId, rootPath: config.rootPath, betweenBatches: config.betweenBatches }, (processed, total, errors) => {
         if (processed % 100 === 0 || processed === total) {
           const percentage = total > 0 ? ((processed / total) * 100).toFixed(1) : '0.0';
           const status = `hashed ${processed.toLocaleString()}/${total.toLocaleString()} files (${percentage}%)`;

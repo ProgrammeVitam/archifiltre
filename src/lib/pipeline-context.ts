@@ -11,4 +11,12 @@ export interface PipelineContext {
   onTree?: (directories: ProvisionalDir[]) => void;
   pauseSignal?: Subject<void>;
   resumeSignal?: Subject<void>;
+  /**
+   * Read-priority hook: called by write pipelines (ingestion, hashing) BETWEEN
+   * batches. The single-owner session provides one that yields the event loop and
+   * then waits until any in-flight reads have drained — so a read arriving mid-scan
+   * is served before the next write batch (the UI stays responsive). No-op cost when
+   * nothing is waiting. Absent for the standalone scan (full write throughput).
+   */
+  betweenBatches?: () => Promise<void>;
 }

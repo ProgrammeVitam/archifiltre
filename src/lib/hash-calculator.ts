@@ -46,6 +46,8 @@ export interface HashConfig {
   onProgress?: (processed: number, total: number, errors: number) => void;
   pauseSignal?: import('rxjs').Subject<void>;
   resumeSignal?: import('rxjs').Subject<void>;
+  /** Read-priority hook called between hash batches (see PipelineContext). */
+  betweenBatches?: () => Promise<void>;
 }
 
 // Hash calculation statistics
@@ -73,7 +75,9 @@ export interface FileHashEntry {
 /**
  * Default hashing configuration
  */
-export const DEFAULT_HASH_CONFIG: Required<Omit<HashConfig, 'onProgress' | 'pauseSignal' | 'resumeSignal'>> = {
+export const DEFAULT_HASH_CONFIG: Required<
+  Omit<HashConfig, 'onProgress' | 'pauseSignal' | 'resumeSignal' | 'betweenBatches'>
+> = {
   concurrency: Math.max(2, (os.cpus()?.length ?? 4) - 1),
   batchSize: 100, // Small batches to keep memory bounded
 };
@@ -423,7 +427,12 @@ export function calculateHashes(
                       }
                     })
                   );
-                })
+                }),
+                // Read-priority: yield to any in-flight reads before the next hash
+                // batch, so the UI stays responsive through the long hashing phase.
+                finalConfig.betweenBatches
+                  ? switchMap((n: number) => from(finalConfig.betweenBatches!()).pipe(map(() => n)))
+                  : tap()
               );
             }),
             finalize(() => {
@@ -461,7 +470,7 @@ export function performHashing(
   context: PipelineContext,
   progressCallback?: (processed: number, total: number, errors: number) => void
 ): Observable<void> {
-  const { database: connection, runId, rootPath, onProgress, pauseSignal, resumeSignal } = context;
+  const { database: connection, runId, rootPath, onProgress, pauseSignal, resumeSignal, betweenBatches } = context;
   const combined =
     progressCallback || onProgress
       ? (processed: number, total: number, errors: number) => {
@@ -473,6 +482,7 @@ export function performHashing(
     onProgress: combined,
     pauseSignal,
     resumeSignal,
+    betweenBatches,
   });
 }
 
