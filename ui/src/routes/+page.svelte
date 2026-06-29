@@ -65,6 +65,13 @@
 	let rootDisplayName = $derived(
 		treeData?.root ? (treeData.root.split(/[/\\]/).filter(Boolean).pop() ?? treeData.root) : ''
 	);
+	// During a scan there's no queried tree yet, so the root name comes from the
+	// path being scanned.
+	let scanRootName = $derived(
+		$activeScan?.path
+			? ($activeScan.path.split(/[/\\]/).filter(Boolean).pop() ?? $activeScan.path)
+			: ''
+	);
 	let isLoadingVisualization = $state(false);
 	let visualizationError = $state<string | null>(null);
 
@@ -260,6 +267,30 @@
 		});
 	}
 
+	// Select the scan root during a live scan: the whole-scan home, with counts
+	// pulled from the live scan progress (the DB isn't readable yet). The panel
+	// keeps these live and skeletons everything that needs a query.
+	function selectScanningRoot() {
+		const sr = $activeScan?.scanResult;
+		selectDirectory({
+			path: '',
+			name: scanRootName,
+			total_size: sr?.totalSize ?? 0,
+			file_count: sr?.filesDiscovered ?? 0,
+			dir_count: sr?.folders ?? 0
+		});
+	}
+
+	// Keep a panel open throughout a scan so there's never an empty void: as soon
+	// as the provisional tree exists and nothing is selected, open the root panel.
+	// Once the user picks a folder this stands down; clearing the selection re-opens
+	// root. (On completion the complete-state branch re-selects the real root.)
+	$effect(() => {
+		if ($activeScan?.state === 'scanning' && $activeProvisionalTree && !$selectedItem) {
+			selectScanningRoot();
+		}
+	});
+
 	// Re-query the tree when enrichment changes so directory bands and the
 	// deletion cascade update live. The flat tree is one cheap query; the chart
 	// refreshes its own (lazily loaded) file rows. Depends only on the signal.
@@ -288,6 +319,7 @@
 		treeData = null;
 		statsData = null;
 		visualizationError = null;
+		clearSelectedItem(); // drop a stale selection so the scan auto-opens root
 		clearProvisionalTree(scan.id); // drop any stale live-scan tree
 
 		// Generate job ID used for both event routing and job protocol
@@ -380,11 +412,29 @@
 			<DropZone onStartAnalysis={handleStartAnalysis} disabled={false} class="max-w-3xl" />
 		</div>
 	{:else if $activeScan?.state === 'scanning'}
-		<!-- Scanning: the icicle grows live from streamed directory aggregates; until the
-		     first snapshot arrives, a chart-area skeleton stands in (no blocking splash).
-		     Live phase/progress is reported in the status bar. -->
+		<!-- Scanning: the icicle grows live from streamed directory aggregates and is
+		     navigable as it builds; an always-present details panel (auto-opened on the
+		     scan root) fills the bottom so there's never an empty void. The panel shows
+		     the stream-known fields (size/counts, live) and skeletons everything that
+		     needs the DB until completion. Until the first snapshot arrives, a chart-area
+		     skeleton stands in (no blocking splash). Progress is in the status bar. -->
 		{#if $activeProvisionalTree}
-			<StalactiteChart data={$activeProvisionalTree} provisional class="h-full w-full" />
+			<div class="flex h-full flex-col">
+				<div
+					class="flex min-h-0 flex-col overflow-hidden p-4 pb-0"
+					style:flex={$selectedItem || $hoveredItem ? '0 0 38.2%' : '1 1 0%'}
+				>
+					<StalactiteChart
+						data={$activeProvisionalTree}
+						provisional
+						onGoHome={selectScanningRoot}
+						class="h-full w-full"
+					/>
+				</div>
+				{#if $selectedItem || $hoveredItem}
+					<FileDetailsPanel loading onGoHome={selectScanningRoot} rootName={scanRootName} />
+				{/if}
+			</div>
 		{:else}
 			<SkeletonIcicle class="h-full" />
 		{/if}

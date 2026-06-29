@@ -5,8 +5,10 @@
 		tagDictionary,
 		addTagToDictionary,
 		invalidateEnrichment,
-		reportSaveStatus
+		reportSaveStatus,
+		scanResult
 	} from '$lib/stores';
+	import { Skeleton } from '$lib/components/ui/skeleton';
 	import {
 		formatBytes,
 		queryDirectoryDescription,
@@ -102,7 +104,14 @@
 
 	// onGoHome (× / root crumb): return to the whole-scan home state.
 	// rootName: the scanned folder's display name, always the first breadcrumb.
-	let { onGoHome, rootName = '' }: { onGoHome?: () => void; rootName?: string } = $props();
+	// loading: a scan is in progress, so the database is being written and cannot be
+	// read — show the stream-known fields (size/counts) and skeleton everything that
+	// needs a query (depth, dates, composition, summary, enrichment) until completion.
+	let {
+		onGoHome,
+		rootName = '',
+		loading = false
+	}: { onGoHome?: () => void; rootName?: string; loading?: boolean } = $props();
 
 	// Hover-to-preview: the hovered item takes priority so moving the mouse over a
 	// block previews it; releasing the hover reverts to the committed selection.
@@ -112,6 +121,18 @@
 	// close button — it IS the close target. (The connector itself is drawn by the
 	// chart, behind the blocks; the panel no longer renders it.)
 	let isRootSelected = $derived(($selectedItem?.path ?? '') === '');
+
+	// Size / file / folder counts are available without the DB. During a scan the
+	// whole-scan figures come live from the scan progress; a selected sub-folder
+	// uses its own streamed provisional aggregates. Outside a scan they're just the
+	// selected item's values.
+	let shownSize = $derived(loading && isRootSelected ? $scanResult.totalSize : (displayItem?.size ?? 0));
+	let shownFiles = $derived(
+		loading && isRootSelected ? $scanResult.filesDiscovered : displayItem?.fileCount
+	);
+	let shownFolders = $derived(
+		loading && isRootSelected ? $scanResult.folders : displayItem?.dirCount
+	);
 
 	// Per-element enrichment, read on selection (query-on-select). PGlite is the
 	// source of truth; this is not a long-lived cache — it is re-read whenever the
@@ -161,6 +182,11 @@
 	// Fetch enrichment when the selected element changes.
 	$effect(() => {
 		const item = $selectedItem;
+		if (loading) {
+			enrichmentPath = null;
+			elementEnrichment = null;
+			return;
+		}
 		if (item && item.path !== enrichmentPath) {
 			enrichmentPath = item.path;
 			elementEnrichment = null;
@@ -327,6 +353,14 @@
 	// Fetch AI description when a directory is selected
 	$effect(() => {
 		const item = $selectedItem;
+		if (loading) {
+			// DB is being written by the scanner — don't query; the skeleton stands in.
+			// Reset so the real fetch fires once the scan completes (loading → false).
+			lastDescribedPath = null;
+			aiDescription = null;
+			isLoadingDescription = false;
+			return;
+		}
 		if (item && item.type === 'directory' && item.path !== lastDescribedPath) {
 			lastDescribedPath = item.path;
 			isLoadingDescription = true;
@@ -347,6 +381,12 @@
 	// Fetch date stats for the displayed directory (hover preview included).
 	$effect(() => {
 		const item = displayItem;
+		if (loading) {
+			lastDateStatsPath = null;
+			dirDateStats = null;
+			isLoadingDateStats = false;
+			return;
+		}
 		if (item && item.type === 'directory' && item.path !== lastDateStatsPath) {
 			lastDateStatsPath = item.path;
 			isLoadingDateStats = true;
@@ -367,6 +407,11 @@
 	// Fetch composition for the displayed directory (hover preview included).
 	$effect(() => {
 		const item = displayItem;
+		if (loading) {
+			lastCompositionPath = null;
+			composition = null;
+			return;
+		}
 		if (item && item.type === 'directory' && item.path !== lastCompositionPath) {
 			lastCompositionPath = item.path;
 			composition = null;
@@ -600,7 +645,16 @@
 							<span>Summary</span>
 						</div>
 
-						{#if lastDescribedPath !== displayItem.path}
+						{#if loading}
+							<!-- The AI summary needs the DB (and the LLM), neither reachable
+							     mid-scan — shimmer until completion. -->
+							<div class="flex flex-1 flex-col gap-2">
+								<Skeleton class="h-4 w-full" />
+								<Skeleton class="h-4 w-[92%]" />
+								<Skeleton class="h-4 w-[96%]" />
+								<Skeleton class="h-4 w-3/4" />
+							</div>
+						{:else if lastDescribedPath !== displayItem.path}
 							<!-- Hover preview: the AI summary stays load-on-select (no LLM call
 							     per hover), so show a hint rather than another item's summary. -->
 							<p class="flex-1 text-sm text-muted-foreground/40 italic">
@@ -629,8 +683,22 @@
 						{/if}
 
 						<!-- Composition: file-type breakdown of this subtree (same colours as
-						     the chart). Shown at every level — the whole scan and any folder. -->
-						{#if typeBreakdown.segments.length > 0}
+						     the chart). Shown at every level — the whole scan and any folder.
+						     DB-derived → shimmer a placeholder bar during a scan. -->
+						{#if loading}
+							<div class="mt-5 flex shrink-0 flex-col gap-2 border-t border-border pt-4">
+								<div class="flex items-center gap-2 text-sm font-medium text-muted-foreground">
+									<FilesIcon class="h-4 w-4" />
+									<span>Composition</span>
+								</div>
+								<Skeleton class="h-3 w-full rounded-full" />
+								<div class="flex flex-wrap gap-x-3 gap-y-1">
+									<Skeleton class="h-3 w-16" />
+									<Skeleton class="h-3 w-20" />
+									<Skeleton class="h-3 w-14" />
+								</div>
+							</div>
+						{:else if typeBreakdown.segments.length > 0}
 							<div class="mt-5 flex shrink-0 flex-col gap-2 border-t border-border pt-4">
 								<div class="flex items-center gap-2 text-sm font-medium text-muted-foreground">
 									<FilesIcon class="h-4 w-4" />
@@ -672,7 +740,7 @@
 							<span>Size</span>
 						</div>
 						<span class="font-medium text-foreground">
-							{formatBytes(displayItem.size)}
+							{formatBytes(shownSize)}
 							{#if displayItem.type === 'file' && displayItem.contentSize != null && displayItem.contentSize !== displayItem.size}
 								<span class="ml-1 font-normal text-muted-foreground">
 									({formatBytes(displayItem.contentSize)} on disk)
@@ -685,7 +753,7 @@
 							<LeafIcon class="h-3.5 w-3.5" />
 							<span>CO₂</span>
 						</div>
-						<span class="font-medium text-foreground">{formatCO2(displayItem.size)}</span>
+						<span class="font-medium text-foreground">{formatCO2(shownSize)}</span>
 
 						{#if displayItem.type === 'directory'}
 							<!-- File count -->
@@ -694,7 +762,7 @@
 								<span>Files</span>
 							</div>
 							<span class="font-medium text-foreground">
-								{displayItem.fileCount?.toLocaleString() ?? 0}
+								{shownFiles?.toLocaleString() ?? 0}
 							</span>
 
 							<!-- Folder count -->
@@ -703,13 +771,20 @@
 								<span>Folders</span>
 							</div>
 							<span class="font-medium text-foreground">
-								{displayItem.dirCount?.toLocaleString() ?? 0}
+								{shownFolders?.toLocaleString() ?? 0}
 							</span>
 
 							<!-- Deepest descendant: how far the structure nests below this
 							     folder, and where. Surfaces the "this corner goes deep" signal
-							     the icicle can only hint at when zoomed out. -->
-							{#if (displayItem.maxDepth ?? 0) > 0}
+							     the icicle can only hint at when zoomed out. Needs the DB, so it
+							     shimmers until the scan completes. -->
+							{#if loading}
+								<div class="flex items-center gap-2 text-muted-foreground">
+									<LayersIcon class="h-3.5 w-3.5" />
+									<span>Deepest</span>
+								</div>
+								<Skeleton class="h-4 w-28" />
+							{:else if (displayItem.maxDepth ?? 0) > 0}
 								<div class="flex items-center gap-2 text-muted-foreground">
 									<LayersIcon class="h-3.5 w-3.5" />
 									<span>Deepest</span>
@@ -725,8 +800,16 @@
 								</span>
 							{/if}
 
-							<!-- Date stats -->
-							{#if isLoadingDateStats}
+							<!-- Date stats. DB-derived → shimmer the three rows during a scan. -->
+							{#if loading}
+								{#each ['Oldest file', 'Newest file', 'Median date'] as label (label)}
+									<div class="flex items-center gap-2 text-muted-foreground">
+										<CalendarIcon class="h-3.5 w-3.5" />
+										<span>{label}</span>
+									</div>
+									<Skeleton class="h-4 w-36" />
+								{/each}
+							{:else if isLoadingDateStats}
 								<div class="col-span-2 flex items-center gap-2 text-sm text-muted-foreground">
 									<LoaderCircleIcon class="h-3.5 w-3.5 animate-spin" />
 									<span>Computing date statistics…</span>
@@ -807,8 +890,9 @@
 						{/if}
 
 						<!-- Enrichment (editable for a selected element — never the whole scan
-						     nor a transient hover preview, which has no committed selection) -->
-						{#if $selectedItem && !isRootSelected && !isPreview}
+						     nor a transient hover preview, which has no committed selection).
+						     Hidden during a scan: writes go to the DB the scanner owns. -->
+						{#if $selectedItem && !isRootSelected && !isPreview && !loading}
 							<div class="col-span-2 mt-3 flex flex-col gap-4 border-t border-border pt-4">
 								<!-- Alias -->
 								<label class="flex flex-col gap-1.5">
