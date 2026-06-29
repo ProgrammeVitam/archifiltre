@@ -345,8 +345,25 @@ export async function closeDatabase(connection: DatabaseConnection): Promise<voi
  * Clean database by recreating it with fresh schema
  * This ensures schema compatibility and removes all old data
  */
-export function cleanDatabase(connection: DatabaseConnection, runId: string): Observable<void> {
+export function cleanDatabase(
+  connection: DatabaseConnection,
+  runId: string,
+  preserveConnection = false
+): Observable<void> {
   return defer(async () => {
+    // Single-owner session: the connection is shared with live readers, so it must
+    // NOT be closed and its datadir must NOT be deleted (that would pull the
+    // connection out from under in-flight reads AND drop the enrichment tables the
+    // queries join). Clear the scan-data tables in place instead; the schema +
+    // enrichment tables created at startup stay intact.
+    if (preserveConnection) {
+      logger.debug('Clearing scan data in place (preserveConnection)', { runId, dbName: connection.name });
+      await connection.db.execute(sql`DELETE FROM dir_stats`);
+      await connection.db.execute(sql`DELETE FROM scan_metadata`);
+      await connection.db.execute(sql`DELETE FROM files`);
+      return void 0;
+    }
+
     logger.debug('Recreating database for fresh schema', { runId, dbName: connection.name });
 
     try {

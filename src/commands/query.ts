@@ -51,7 +51,7 @@ import {
 
 // === Types ===
 
-interface QueryRequest {
+export interface QueryRequest {
   id: string;
   action: string;
   [key: string]: unknown;
@@ -512,6 +512,119 @@ async function handleGetComposition(
 
 // === Main Command ===
 
+/**
+ * Route a query request to its handler against a given connection + run. Pure
+ * dispatch (no I/O): returns the data or throws. Shared by the `query` command and
+ * the single-owner `session` sidecar so both expose exactly the same read/enrich
+ * surface over one connection.
+ */
+export async function dispatchQuery(
+  database: DatabaseConnection,
+  runId: string,
+  request: QueryRequest
+): Promise<unknown> {
+  switch (request.action) {
+    case 'get_tree':
+      return await handleGetTree(database, runId);
+    case 'get_files':
+      return await handleGetFiles(
+        database,
+        runId,
+        request.path as string,
+        (request.limit as number) || 1000,
+        request.cursor as string | undefined
+      );
+    case 'get_duplicates':
+      return await handleGetDuplicates(
+        database,
+        runId,
+        (request.min_size as number) || 0,
+        (request.limit as number) || 100
+      );
+    case 'search':
+      return await handleSearch(
+        database,
+        runId,
+        request.pattern as string,
+        (request.limit as number) || 500,
+        request.cursor as string | undefined
+      );
+    case 'get_stats':
+      return await handleGetStats(database, runId);
+    case 'get_dir_date_stats':
+      return await handleGetDirDateStats(database, runId, (request.path as string) ?? '');
+    case 'get_composition':
+      return await handleGetComposition(database, runId, (request.path as string) ?? '');
+    case 'ping':
+      return { pong: true, timestamp: Date.now() };
+    case 'describe_directory':
+      return await handleDescribeDirectory(database, runId, (request.path as string) ?? '');
+    case 'get_thumbnail':
+      return await handleGetThumbnail(database, runId, (request.path as string) ?? '');
+    case 'store_thumbnail':
+      return await handleStoreThumbnail(
+        database,
+        runId,
+        (request.path as string) ?? '',
+        request.thumbnail as string,
+        (request.width as number) ?? 0,
+        (request.height as number) ?? 0,
+        (request.format as string) ?? 'image/png'
+      );
+    case 'set_delete_tag':
+      return await handleSetDeleteTag(database, runId, (request.path as string) ?? '');
+    case 'remove_delete_tag':
+      return await handleRemoveDeleteTag(database, runId, (request.path as string) ?? '');
+    case 'get_delete_tags':
+      return await handleGetDeleteTags(database, runId);
+    case 'set_alias':
+      return await handleSetAlias(
+        database,
+        runId,
+        (request.path as string) ?? '',
+        (request.alias as string) ?? ''
+      );
+    case 'set_comment':
+      return await handleSetComment(
+        database,
+        runId,
+        (request.path as string) ?? '',
+        (request.comment as string) ?? ''
+      );
+    case 'create_tag':
+      return await handleCreateTag(database, runId, (request.name as string) ?? '');
+    case 'rename_tag':
+      return await handleRenameTag(
+        database,
+        runId,
+        (request.tag_id as string) ?? '',
+        (request.name as string) ?? ''
+      );
+    case 'delete_tag':
+      return await handleDeleteTag(database, runId, (request.tag_id as string) ?? '');
+    case 'assign_tag':
+      return await handleAssignTag(
+        database,
+        runId,
+        (request.tag_id as string) ?? '',
+        (request.path as string) ?? ''
+      );
+    case 'unassign_tag':
+      return await handleUnassignTag(
+        database,
+        runId,
+        (request.tag_id as string) ?? '',
+        (request.path as string) ?? ''
+      );
+    case 'get_enrichment':
+      return await handleGetEnrichment(database, runId);
+    case 'get_element_enrichment':
+      return await handleGetElementEnrichment(database, runId, (request.path as string) ?? '');
+    default:
+      throw new Error(`Unknown action: ${request.action}`);
+  }
+}
+
 export default class Query extends Command {
   static override description = 'Interactive JSON query interface for the database';
 
@@ -544,218 +657,18 @@ export default class Query extends Command {
 
   private async processQuery(request: QueryRequest): Promise<void> {
     if (!this.database || !this.runId) {
-      this.sendResponse({
-        id: request.id,
-        ok: false,
-        error: 'Database not initialized',
-      });
+      this.sendResponse({ id: request.id, ok: false, error: 'Database not initialized' });
       return;
     }
 
     try {
-      let data: unknown;
-
-      switch (request.action) {
-        case 'get_tree':
-          data = await handleGetTree(this.database, this.runId);
-          break;
-
-        case 'get_files':
-          data = await handleGetFiles(
-            this.database,
-            this.runId,
-            request.path as string,
-            (request.limit as number) || 1000,
-            request.cursor as string | undefined
-          );
-          break;
-
-        case 'get_duplicates':
-          data = await handleGetDuplicates(
-            this.database,
-            this.runId,
-            (request.min_size as number) || 0,
-            (request.limit as number) || 100
-          );
-          break;
-
-        case 'search':
-          data = await handleSearch(
-            this.database,
-            this.runId,
-            request.pattern as string,
-            (request.limit as number) || 500,
-            request.cursor as string | undefined
-          );
-          break;
-
-        case 'get_stats':
-          data = await handleGetStats(this.database, this.runId);
-          break;
-
-        case 'get_dir_date_stats':
-          data = await handleGetDirDateStats(
-            this.database,
-            this.runId,
-            (request.path as string) ?? ''
-          );
-          break;
-
-        case 'get_composition':
-          data = await handleGetComposition(
-            this.database,
-            this.runId,
-            (request.path as string) ?? ''
-          );
-          break;
-
-        case 'ping':
-          data = { pong: true, timestamp: Date.now() };
-          break;
-
-        case 'describe_directory':
-          data = await handleDescribeDirectory(
-            this.database,
-            this.runId,
-            (request.path as string) ?? ''
-          );
-          break;
-
-        case 'get_thumbnail':
-          data = await handleGetThumbnail(
-            this.database,
-            this.runId,
-            (request.path as string) ?? ''
-          );
-          break;
-
-        case 'store_thumbnail':
-          data = await handleStoreThumbnail(
-            this.database,
-            this.runId,
-            (request.path as string) ?? '',
-            request.thumbnail as string,
-            (request.width as number) ?? 0,
-            (request.height as number) ?? 0,
-            (request.format as string) ?? 'image/png'
-          );
-          break;
-
-        case 'set_delete_tag':
-          data = await handleSetDeleteTag(
-            this.database!,
-            this.runId!,
-            (request.path as string) ?? ''
-          );
-          break;
-
-        case 'remove_delete_tag':
-          data = await handleRemoveDeleteTag(
-            this.database!,
-            this.runId!,
-            (request.path as string) ?? ''
-          );
-          break;
-
-        case 'get_delete_tags':
-          data = await handleGetDeleteTags(this.database!, this.runId!);
-          break;
-
-        case 'set_alias':
-          data = await handleSetAlias(
-            this.database!,
-            this.runId!,
-            (request.path as string) ?? '',
-            (request.alias as string) ?? ''
-          );
-          break;
-
-        case 'set_comment':
-          data = await handleSetComment(
-            this.database!,
-            this.runId!,
-            (request.path as string) ?? '',
-            (request.comment as string) ?? ''
-          );
-          break;
-
-        case 'create_tag':
-          data = await handleCreateTag(
-            this.database!,
-            this.runId!,
-            (request.name as string) ?? ''
-          );
-          break;
-
-        case 'rename_tag':
-          data = await handleRenameTag(
-            this.database!,
-            this.runId!,
-            (request.tag_id as string) ?? '',
-            (request.name as string) ?? ''
-          );
-          break;
-
-        case 'delete_tag':
-          data = await handleDeleteTag(
-            this.database!,
-            this.runId!,
-            (request.tag_id as string) ?? ''
-          );
-          break;
-
-        case 'assign_tag':
-          data = await handleAssignTag(
-            this.database!,
-            this.runId!,
-            (request.tag_id as string) ?? '',
-            (request.path as string) ?? ''
-          );
-          break;
-
-        case 'unassign_tag':
-          data = await handleUnassignTag(
-            this.database!,
-            this.runId!,
-            (request.tag_id as string) ?? '',
-            (request.path as string) ?? ''
-          );
-          break;
-
-        case 'get_enrichment':
-          data = await handleGetEnrichment(this.database!, this.runId!);
-          break;
-
-        case 'get_element_enrichment':
-          data = await handleGetElementEnrichment(
-            this.database!,
-            this.runId!,
-            (request.path as string) ?? ''
-          );
-          break;
-
-        default:
-          this.sendResponse({
-            id: request.id,
-            ok: false,
-            error: `Unknown action: ${request.action}`,
-          });
-          return;
-      }
-
-      this.sendResponse({
-        id: request.id,
-        ok: true,
-        data,
-      });
+      const data = await dispatchQuery(this.database, this.runId, request);
+      this.sendResponse({ id: request.id, ok: true, data });
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      // Logging disabled to preserve JSON protocol
-
       this.sendResponse({
         id: request.id,
         ok: false,
-        error: errorMessage,
+        error: error instanceof Error ? error.message : String(error),
       });
     }
   }

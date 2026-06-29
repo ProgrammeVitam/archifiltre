@@ -20,6 +20,7 @@ import {
   last,
   catchError,
   mergeMap,
+  delay,
 } from 'rxjs/operators';
 import {
   eq as _eq,
@@ -432,6 +433,20 @@ export interface ScanConfig {
   archiveTimeoutMs?: number;
   archiveConcurrency?: number;
   enableArchiveNesting?: boolean;
+  /**
+   * Yield to the macrotask queue between ingestion batches (single concurrency +
+   * a macrotask tick per batch). Set ONLY when the same process must also answer
+   * reads during the scan (the single-owner session) — PGlite blocks the JS thread,
+   * so without this a tight write loop starves concurrent reads entirely. Costs
+   * ~throughput; off by default so the standalone scan stays fast.
+   */
+  cooperativeYield?: boolean;
+  /**
+   * The connection is owned by a long-lived session (shared with live readers), so
+   * the scan must clear data in place rather than close + delete + recreate the
+   * datadir. Set together with cooperativeYield for the single-owner session.
+   */
+  preserveConnection?: boolean;
 }
 
 export interface ScanResult {
@@ -550,7 +565,7 @@ export function scanDirectory(
   };
 
   // Phase 1: Clean database first (hot observable, no defer)
-  return cleanDatabase(connection, config.runId).pipe(
+  return cleanDatabase(connection, config.runId, config.preserveConnection).pipe(
     tap(() => logger.debug('Database cleaned', { runId: config.runId })),
 
     // Phase 2-3: Streaming discovery + immediate ingestion (hot observable)
@@ -615,7 +630,10 @@ export function scanDirectory(
         // Batch for efficient database writes
         bufferCount(config.batchSize || 1000),
 
-        // Insert batches with limited concurrency (PGlite handles concurrent writes)
+        // Insert batches with limited concurrency (PGlite handles concurrent writes).
+        // In cooperativeYield mode we drop to concurrency 1 and add a macrotask tick
+        // (delay(0)) after each batch, so a concurrent reader in the same process
+        // gets a turn between batches instead of being starved for the whole ingest.
         mergeMap(
           batch =>
             insertFileBatch(connection, batch).pipe(
@@ -640,9 +658,10 @@ export function scanDirectory(
                   batchSize: batch.length,
                 });
                 return from([0]); // Continue processing
-              })
+              }),
+              config.cooperativeYield ? delay(0) : tap()
             ),
-          2 // 2 concurrent batch inserts
+          config.cooperativeYield ? 1 : 2
         ),
 
         // Final ingestion update
