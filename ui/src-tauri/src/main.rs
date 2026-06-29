@@ -12,6 +12,9 @@ use tauri::Emitter;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+mod owner;
+use owner::{EventSink, Owner};
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -164,6 +167,9 @@ pub struct AppState {
     pub query_session: Mutex<Option<QuerySession>>,
     /// stdin handles for running pipeline jobs, keyed by job_id
     pub running_jobs: Mutex<HashMap<String, tokio::process::ChildStdin>>,
+    /// Single-owner DB session (read-while-scanning). Arc so a command can clone it
+    /// out and release the AppState lock before awaiting a request (concurrency).
+    pub owner: Mutex<Option<Arc<Owner>>>,
 }
 
 impl Default for AppState {
@@ -171,6 +177,7 @@ impl Default for AppState {
         Self {
             query_session: Mutex::new(None),
             running_jobs: Mutex::new(HashMap::new()),
+            owner: Mutex::new(None),
         }
     }
 }
@@ -699,6 +706,89 @@ async fn get_query_run_id(state: tauri::State<'_, Arc<AppState>>) -> Result<Stri
 }
 
 // ============================================================================
+// Commands - Single-Owner DB Session (read-while-scanning; UI gates on the
+// ARCHIFILTRE_OWNER_DB flag). One owner process serves scan writes + live reads.
+// ============================================================================
+
+#[tauri::command]
+async fn start_session(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+    db_name: Option<String>,
+) -> Result<String, String> {
+    let binary_path = find_sidecar_path(&app)?;
+    let db = db_name.unwrap_or_else(|| "main".to_string());
+
+    let mut guard = state.owner.lock().await;
+    // Confirm any existing owner is fully dead before spawning a new one — there
+    // must never be two openers of the datadir.
+    if let Some(old) = guard.take() {
+        old.kill().await;
+    }
+
+    // Event sink: tag the session's event lines with the current scan's job id and
+    // emit them on the job-update stream the UI already listens to.
+    let current_job_id = Arc::new(std::sync::Mutex::new(String::new()));
+    let sink: EventSink = {
+        let app = app.clone();
+        let jid = current_job_id.clone();
+        Arc::new(move |line: String| {
+            let job_id = jid.lock().unwrap().clone();
+            let _ = app.emit("job-update", JobUpdateEvent { job_id, line });
+        })
+    };
+
+    let args = vec!["session".to_string(), "--db".to_string(), db];
+    let owner = Owner::spawn(
+        binary_path.to_string_lossy().as_ref(),
+        &args,
+        None,
+        sink,
+        current_job_id,
+    )
+    .await?;
+    let run_id = owner.run_id.lock().unwrap().clone();
+    *guard = Some(Arc::new(owner));
+    Ok(run_id)
+}
+
+#[tauri::command]
+async fn session_request(
+    state: tauri::State<'_, Arc<AppState>>,
+    request: QueryRequest,
+    timeout_ms: Option<u64>,
+) -> Result<QueryResponse, String> {
+    // Clone the Arc and release the AppState lock so independent requests run
+    // concurrently (the owner multiplexes them onto the one connection).
+    let owner = {
+        let guard = state.owner.lock().await;
+        guard.as_ref().ok_or("No active session")?.clone()
+    };
+    // Tag scan events with the job id the UI passed on start_scan.
+    if request.action == "start_scan" {
+        if let Some(jid) = request.params.get("jobId").and_then(|v| v.as_str()) {
+            *owner.current_job_id.lock().unwrap() = jid.to_string();
+        }
+    }
+    owner.send_request(&request, timeout_ms.unwrap_or(15000)).await
+}
+
+#[tauri::command]
+async fn stop_session(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
+    let mut guard = state.owner.lock().await;
+    if let Some(owner) = guard.take() {
+        owner.kill().await;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn is_session_active(state: tauri::State<'_, Arc<AppState>>) -> Result<bool, String> {
+    let guard = state.owner.lock().await;
+    Ok(guard.as_ref().map(|o| o.is_alive()).unwrap_or(false))
+}
+
+// ============================================================================
 // Commands - Path Validation
 // ============================================================================
 
@@ -809,6 +899,11 @@ fn main() {
             send_query,
             is_query_session_active,
             get_query_run_id,
+            // Single-Owner DB Session
+            start_session,
+            session_request,
+            stop_session,
+            is_session_active,
             // Path Validation
             validate_path,
             // Window Management
