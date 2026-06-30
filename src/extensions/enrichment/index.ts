@@ -22,6 +22,8 @@ import {
   tagAssignments,
   deleteTags,
 } from '@extensions/enrichment/schema.ts';
+import { recordOp, isNoOp, captureRow, type Change } from '@extensions/enrichment/undo.ts';
+export { handleUndo, handleRedo, handleUndoState } from '@extensions/enrichment/undo.ts';
 
 // Re-export schema types for consumers
 export type {
@@ -190,6 +192,26 @@ export async function ensureEnrichmentTables(connection: DatabaseConnection): Pr
       PRIMARY KEY (run_id, path)
     );
     CREATE INDEX IF NOT EXISTS idx_delete_tags_run_id ON delete_tags (run_id);
+
+    -- Undo/redo: an append-only log of reversible enrichment operations + a cursor.
+    -- See undo.ts. seq is monotonic per run; changes is a JSON row-diff array.
+    CREATE TABLE IF NOT EXISTS operations (
+      run_id TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      ts INTEGER NOT NULL,
+      session_id TEXT,
+      op_kind TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      changes TEXT NOT NULL,
+      PRIMARY KEY (run_id, seq)
+    );
+    CREATE INDEX IF NOT EXISTS idx_operations_run_id ON operations (run_id);
+
+    CREATE TABLE IF NOT EXISTS undo_meta (
+      run_id TEXT NOT NULL,
+      cursor INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (run_id)
+    );
   `);
 }
 
@@ -209,18 +231,34 @@ export async function handleSetAlias(
   await ensureEnrichmentTables(db);
 
   const trimmed = (alias ?? '').trim();
-  if (trimmed === '' || trimmed === originalName(path)) {
-    await db.pg.query(`DELETE FROM aliases WHERE run_id = $1 AND path = $2`, [runId, path]);
-    return { alias: null };
-  }
+  const clear = trimmed === '' || trimmed === originalName(path);
 
-  await db.pg.query(
-    `INSERT INTO aliases (run_id, path, alias, created_at)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (run_id, path) DO UPDATE SET alias = EXCLUDED.alias`,
-    [runId, path, trimmed, nowSeconds()]
-  );
-  return { alias: trimmed };
+  // Capture before → write → re-read after, all in one transaction, and record the
+  // reversible row-diff alongside the mutation so undo/redo can replay it exactly.
+  await db.pg.transaction(async tx => {
+    const before = ((
+      await tx.query(`SELECT run_id, path, alias, created_at FROM aliases WHERE run_id = $1 AND path = $2`, [runId, path])
+    ).rows[0] ?? null) as Record<string, unknown> | null;
+    if (clear) {
+      await tx.query(`DELETE FROM aliases WHERE run_id = $1 AND path = $2`, [runId, path]);
+    } else {
+      await tx.query(
+        `INSERT INTO aliases (run_id, path, alias, created_at) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (run_id, path) DO UPDATE SET alias = EXCLUDED.alias`,
+        [runId, path, trimmed, nowSeconds()]
+      );
+    }
+    const after = ((
+      await tx.query(`SELECT run_id, path, alias, created_at FROM aliases WHERE run_id = $1 AND path = $2`, [runId, path])
+    ).rows[0] ?? null) as Record<string, unknown> | null;
+    const change: Change = { table: 'aliases', key: { run_id: runId, path }, before, after };
+    if (!isNoOp([change])) {
+      const summary = after ? `Aliased ${originalName(path)} → “${trimmed}”` : `Cleared alias on ${originalName(path)}`;
+      await recordOp(tx, runId, 'alias', summary, [change]);
+    }
+  });
+
+  return { alias: clear ? null : trimmed };
 }
 
 // === Comment Operations ===
@@ -238,18 +276,29 @@ export async function handleSetComment(
 
   // Preserve internal whitespace; only treat an all-whitespace comment as empty.
   const value = comment ?? '';
-  if (value.trim() === '') {
-    await db.pg.query(`DELETE FROM comments WHERE run_id = $1 AND path = $2`, [runId, path]);
-    return { comment: null };
-  }
+  const clear = value.trim() === '';
 
-  await db.pg.query(
-    `INSERT INTO comments (run_id, path, comment, created_at)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (run_id, path) DO UPDATE SET comment = EXCLUDED.comment`,
-    [runId, path, value, nowSeconds()]
-  );
-  return { comment: value };
+  await db.pg.transaction(async tx => {
+    const key = { run_id: runId, path };
+    const before = await captureRow(tx, 'comments', key);
+    if (clear) {
+      await tx.query(`DELETE FROM comments WHERE run_id = $1 AND path = $2`, [runId, path]);
+    } else {
+      await tx.query(
+        `INSERT INTO comments (run_id, path, comment, created_at) VALUES ($1, $2, $3, $4)
+         ON CONFLICT (run_id, path) DO UPDATE SET comment = EXCLUDED.comment`,
+        [runId, path, value, nowSeconds()]
+      );
+    }
+    const after = await captureRow(tx, 'comments', key);
+    const change: Change = { table: 'comments', key, before, after };
+    if (!isNoOp([change])) {
+      const summary = after ? `Commented ${originalName(path)}` : `Cleared comment on ${originalName(path)}`;
+      await recordOp(tx, runId, 'comment', summary, [change]);
+    }
+  });
+
+  return { comment: clear ? null : value };
 }
 
 // === Tag Dictionary Operations ===
@@ -266,10 +315,18 @@ export async function handleCreateTag(
 
   const tagId = crypto.randomUUID();
   const trimmed = (name ?? '').trim();
-  await db.pg.query(
-    `INSERT INTO tags (run_id, tag_id, name, created_at) VALUES ($1, $2, $3, $4)`,
-    [runId, tagId, trimmed, nowSeconds()]
-  );
+  await db.pg.transaction(async tx => {
+    await tx.query(`INSERT INTO tags (run_id, tag_id, name, created_at) VALUES ($1, $2, $3, $4)`, [
+      runId,
+      tagId,
+      trimmed,
+      nowSeconds(),
+    ]);
+    const after = await captureRow(tx, 'tags', { run_id: runId, tag_id: tagId });
+    await recordOp(tx, runId, 'tag_create', `Created tag “${trimmed}”`, [
+      { table: 'tags', key: { run_id: runId, tag_id: tagId }, before: null, after },
+    ]);
+  });
   return { tag_id: tagId, name: trimmed };
 }
 
@@ -284,11 +341,23 @@ export async function handleRenameTag(
 ): Promise<RenameTagResult> {
   await ensureEnrichmentTables(db);
 
-  const result = await db.pg.query(
-    `UPDATE tags SET name = $3 WHERE run_id = $1 AND tag_id = $2`,
-    [runId, tagId, (name ?? '').trim()]
-  );
-  return { renamed: (result.affectedRows ?? 0) > 0 };
+  let renamed = false;
+  await db.pg.transaction(async tx => {
+    const key = { run_id: runId, tag_id: tagId };
+    const before = await captureRow(tx, 'tags', key);
+    const result = await tx.query(`UPDATE tags SET name = $3 WHERE run_id = $1 AND tag_id = $2`, [
+      runId,
+      tagId,
+      (name ?? '').trim(),
+    ]);
+    renamed = (result.affectedRows ?? 0) > 0;
+    const after = await captureRow(tx, 'tags', key);
+    const change: Change = { table: 'tags', key, before, after };
+    if (!isNoOp([change])) {
+      await recordOp(tx, runId, 'tag_rename', `Renamed tag → “${(name ?? '').trim()}”`, [change]);
+    }
+  });
+  return { renamed };
 }
 
 /**
@@ -301,15 +370,33 @@ export async function handleDeleteTag(
 ): Promise<DeleteTagDictResult> {
   await ensureEnrichmentTables(db);
 
-  await db.pg.query(`DELETE FROM tag_assignments WHERE run_id = $1 AND tag_id = $2`, [
-    runId,
-    tagId,
-  ]);
-  const result = await db.pg.query(`DELETE FROM tags WHERE run_id = $1 AND tag_id = $2`, [
-    runId,
-    tagId,
-  ]);
-  return { deleted: (result.affectedRows ?? 0) > 0 };
+  let deleted = false;
+  await db.pg.transaction(async tx => {
+    // Capture the tag row AND every assignment it cascade-removes, so undo restores all.
+    const tagBefore = await captureRow(tx, 'tags', { run_id: runId, tag_id: tagId });
+    const assignBefore = (
+      await tx.query(`SELECT * FROM tag_assignments WHERE run_id = $1 AND tag_id = $2`, [runId, tagId])
+    ).rows as Array<Record<string, unknown>>;
+
+    await tx.query(`DELETE FROM tag_assignments WHERE run_id = $1 AND tag_id = $2`, [runId, tagId]);
+    const result = await tx.query(`DELETE FROM tags WHERE run_id = $1 AND tag_id = $2`, [runId, tagId]);
+    deleted = (result.affectedRows ?? 0) > 0;
+
+    const changes: Change[] = [];
+    if (tagBefore) changes.push({ table: 'tags', key: { run_id: runId, tag_id: tagId }, before: tagBefore, after: null });
+    for (const a of assignBefore) {
+      changes.push({
+        table: 'tag_assignments',
+        key: { run_id: runId, tag_id: a.tag_id as string, path: a.path as string },
+        before: a,
+        after: null,
+      });
+    }
+    if (changes.length) {
+      await recordOp(tx, runId, 'tag_delete', `Deleted tag “${(tagBefore?.name as string) ?? ''}”`, changes);
+    }
+  });
+  return { deleted };
 }
 
 // === Tag Assignment Operations ===
@@ -325,12 +412,18 @@ export async function handleAssignTag(
 ): Promise<AssignTagResult> {
   await ensureEnrichmentTables(db);
 
-  await db.pg.query(
-    `INSERT INTO tag_assignments (run_id, tag_id, path)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (run_id, tag_id, path) DO NOTHING`,
-    [runId, tagId, path]
-  );
+  await db.pg.transaction(async tx => {
+    const key = { run_id: runId, tag_id: tagId, path };
+    const before = await captureRow(tx, 'tag_assignments', key);
+    await tx.query(
+      `INSERT INTO tag_assignments (run_id, tag_id, path) VALUES ($1, $2, $3)
+       ON CONFLICT (run_id, tag_id, path) DO NOTHING`,
+      [runId, tagId, path]
+    );
+    const after = await captureRow(tx, 'tag_assignments', key);
+    const change: Change = { table: 'tag_assignments', key, before, after };
+    if (!isNoOp([change])) await recordOp(tx, runId, 'tag_assign', `Tagged ${originalName(path)}`, [change]);
+  });
   return { assigned: true };
 }
 
@@ -345,11 +438,20 @@ export async function handleUnassignTag(
 ): Promise<UnassignTagResult> {
   await ensureEnrichmentTables(db);
 
-  const result = await db.pg.query(
-    `DELETE FROM tag_assignments WHERE run_id = $1 AND tag_id = $2 AND path = $3`,
-    [runId, tagId, path]
-  );
-  return { unassigned: (result.affectedRows ?? 0) > 0 };
+  let unassigned = false;
+  await db.pg.transaction(async tx => {
+    const key = { run_id: runId, tag_id: tagId, path };
+    const before = await captureRow(tx, 'tag_assignments', key);
+    const result = await tx.query(
+      `DELETE FROM tag_assignments WHERE run_id = $1 AND tag_id = $2 AND path = $3`,
+      [runId, tagId, path]
+    );
+    unassigned = (result.affectedRows ?? 0) > 0;
+    const after = await captureRow(tx, 'tag_assignments', key);
+    const change: Change = { table: 'tag_assignments', key, before, after };
+    if (!isNoOp([change])) await recordOp(tx, runId, 'tag_unassign', `Untagged ${originalName(path)}`, [change]);
+  });
+  return { unassigned };
 }
 
 // === Delete-Tag Operations (relocated from the former delete-tags extension) ===
@@ -364,12 +466,20 @@ export async function handleSetDeleteTag(
 ): Promise<SetDeleteTagResult> {
   await ensureEnrichmentTables(db);
 
-  await db.pg.query(
-    `INSERT INTO delete_tags (run_id, path, created_at)
-     VALUES ($1, $2, $3)
-     ON CONFLICT (run_id, path) DO UPDATE SET created_at = EXCLUDED.created_at`,
-    [runId, path, nowSeconds()]
-  );
+  await db.pg.transaction(async tx => {
+    const key = { run_id: runId, path };
+    const before = await captureRow(tx, 'delete_tags', key);
+    // DO NOTHING (not UPDATE created_at): re-marking an already-marked node is a true
+    // no-op, so it doesn't churn the timestamp or create an empty undo step.
+    await tx.query(
+      `INSERT INTO delete_tags (run_id, path, created_at) VALUES ($1, $2, $3)
+       ON CONFLICT (run_id, path) DO NOTHING`,
+      [runId, path, nowSeconds()]
+    );
+    const after = await captureRow(tx, 'delete_tags', key);
+    const change: Change = { table: 'delete_tags', key, before, after };
+    if (!isNoOp([change])) await recordOp(tx, runId, 'mark_delete', `Marked ${originalName(path)} for deletion`, [change]);
+  });
   return { tagged: true };
 }
 
@@ -383,11 +493,17 @@ export async function handleRemoveDeleteTag(
 ): Promise<RemoveDeleteTagResult> {
   await ensureEnrichmentTables(db);
 
-  const result = await db.pg.query(`DELETE FROM delete_tags WHERE run_id = $1 AND path = $2`, [
-    runId,
-    path,
-  ]);
-  return { removed: (result.affectedRows ?? 0) > 0 };
+  let removed = false;
+  await db.pg.transaction(async tx => {
+    const key = { run_id: runId, path };
+    const before = await captureRow(tx, 'delete_tags', key);
+    const result = await tx.query(`DELETE FROM delete_tags WHERE run_id = $1 AND path = $2`, [runId, path]);
+    removed = (result.affectedRows ?? 0) > 0;
+    const after = await captureRow(tx, 'delete_tags', key);
+    const change: Change = { table: 'delete_tags', key, before, after };
+    if (!isNoOp([change])) await recordOp(tx, runId, 'unmark_delete', `Unmarked ${originalName(path)}`, [change]);
+  });
+  return { removed };
 }
 
 /**
