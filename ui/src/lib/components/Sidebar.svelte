@@ -6,7 +6,7 @@
 		resumeScanningScan,
 		type Scan
 	} from '$lib/stores';
-	import { resumeScan, cancelScan } from '$lib/tauri';
+	import { resumeScan, deleteDatabase } from '$lib/tauri';
 	import {
 		Plus as PlusIcon,
 		FolderInput as FolderInputIcon,
@@ -45,18 +45,18 @@
 		e.stopPropagation();
 
 		if (scan.state === 'scanning' || scan.state === 'paused') {
-			if (!confirm('A scan is in progress. Closing it will stop the scan. Continue?')) {
+			if (!confirm('A scan is in progress. Closing it stops the scan and deletes it. Continue?')) {
 				return;
 			}
-			// Close = cancel: stop the owner's scan so it doesn't keep running in the
-			// background (data is kept by the frontier, but this tab is being discarded).
-			if (scan.dbName) void cancelScan(scan.dbName);
 		} else if (scan.state === 'complete') {
 			if (!confirm(`Delete "${scan.name}"? This will also delete the scan database.`)) {
 				return;
 			}
 		}
 
+		// Close = discard: stop the owner's scan AND delete its datadir so closed scans
+		// don't orphan databases on disk. Fire-and-forget; the tab is removed immediately.
+		if (scan.path && scan.dbName) void deleteDatabase(scan.dbName);
 		scansStore.closeScan(scan.id);
 	}
 

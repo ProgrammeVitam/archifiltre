@@ -438,11 +438,28 @@ export async function resumeScan(dbName: string): Promise<void> {
 	await sendQuery({ id: `resume_${Date.now()}`, action: 'resume_scan' }, dbName);
 }
 
-/** Stop the scan on this db's owner, persisted as cancelled — used when closing a tab.
- *  Same mechanism as pause (data kept, resumable); only the persisted status differs. */
+/** Stop the scan on this db's owner, persisted as cancelled — same mechanism as pause
+ *  (data kept, resumable); only the persisted status differs. */
 export async function cancelScan(dbName: string): Promise<void> {
 	if (!useOwnerDb()) return;
 	await sendQuery({ id: `cancel_${Date.now()}`, action: 'cancel_scan' }, dbName);
+}
+
+/** Discard a scan entirely — used when CLOSING a tab. The owner stops its scan, deletes
+ *  its datadir, and exits; then it's dropped from the supervisor. Errors are swallowed:
+ *  the owner acks then exits, so a late "session closed" is expected and harmless. */
+export async function deleteDatabase(dbName: string): Promise<void> {
+	if (!useOwnerDb()) return;
+	try {
+		await sendQuery({ id: `delete_${Date.now()}`, action: 'delete_db' }, dbName);
+	} catch {
+		/* owner exiting after its ack */
+	}
+	try {
+		await invoke('stop_session', { dbName });
+	} catch {
+		/* already reaped */
+	}
 }
 
 /**

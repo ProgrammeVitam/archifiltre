@@ -18,6 +18,7 @@
 import { Command, Flags } from '@oclif/core';
 import * as readline from 'node:readline';
 import * as os from 'node:os';
+import { rm } from 'node:fs/promises';
 import { firstValueFrom, type Subscription } from 'rxjs';
 import { initializeLogging, logger } from '@lib/logging.ts';
 import {
@@ -39,6 +40,7 @@ import {
   type ScanResult,
 } from '@lib/scanner.ts';
 import { ensureEnrichmentTables } from '@extensions/enrichment/index.ts';
+import { getDatabasePath } from '@lib/platform-paths.ts';
 import { dispatchQuery, type QueryRequest } from './query.ts';
 
 export default class Session extends Command {
@@ -227,6 +229,13 @@ export default class Session extends Command {
       }
       if (action === 'resume_scan') {
         await this.handleResumeScan(req);
+        return;
+      }
+
+      // Close = delete: stop the scan, close the connection (frees the datadir's file
+      // handles), remove the datadir, ack, then exit so the supervisor reaps this owner.
+      if (action === 'delete_db') {
+        await this.handleDeleteDb(id);
         return;
       }
 
@@ -474,6 +483,29 @@ export default class Session extends Command {
       }
     }
     this.send({ event: 'job:paused', jobId: this.currentJobId });
+  }
+
+  /**
+   * Delete this owner's database and exit — the "close the tab = discard the scan" path.
+   * Stop any scan, close the connection so PGlite releases the datadir, remove the datadir,
+   * ack (so the caller knows it's gone), then exit so the Rust supervisor reaps the owner.
+   */
+  private async handleDeleteDb(id: string): Promise<void> {
+    const db = this.database?.name;
+    try {
+      this.scanPaused = true;
+      this.scanSubscription?.unsubscribe();
+      this.scanSubscription = undefined;
+      this.scanning = false;
+      if (this.database) await this.database.pg.close();
+      if (db) await rm(getDatabasePath(db), { recursive: true, force: true });
+      this.send({ id, ok: true });
+    } catch (e) {
+      this.send({ id, ok: false, error: e instanceof Error ? e.message : String(e) });
+    }
+    // Give the ack a moment to flush down the pipe, then exit (datadir is gone; nothing
+    // left to serve). The supervisor's stdout-closed handler removes the dead owner.
+    setTimeout(() => process.exit(0), 50);
   }
 
   /**
