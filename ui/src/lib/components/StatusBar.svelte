@@ -2,9 +2,9 @@
 	// Persistent bottom status bar: one glanceable line for what the system is
 	// doing — scan phase/progress, scan failure, or the post-scan stats — with a
 	// transient enrichment save status overlaid on top. Driven by real state/acks.
-	import { activeScan, enrichmentSaveStatus } from '$lib/stores';
+	import { activeScan, enrichmentSaveStatus, resourceStats } from '$lib/stores';
 	import { formatBytes } from '$lib/tauri';
-	import { CheckIcon, LoaderCircleIcon, CircleAlertIcon } from '@lucide/svelte';
+	import { CheckIcon, LoaderCircleIcon, CircleAlertIcon, CpuIcon } from '@lucide/svelte';
 
 	// Completed-scan stats are computed in +page.svelte (it has the query stats),
 	// so they're passed in; everything else comes from the stores.
@@ -87,5 +87,22 @@
 		<span class="whitespace-nowrap">{duplicateCount.toLocaleString()} duplicates</span>
 		<span class="text-[8px] opacity-40">{sep}</span>
 		<span class="whitespace-nowrap">{formatBytes(totalSize)}</span>
+	{/if}
+
+	<!-- Live resource telemetry from the single-owner session (owner mode), right-
+	     aligned. Shows the scan's CPU/mem and whether the governor is throttling. -->
+	{#if $resourceStats && $resourceStats.scanning}
+		<span class="ml-auto flex items-center gap-1.5 whitespace-nowrap tabular-nums">
+			<CpuIcon class="h-3 w-3" />
+			<span>{$resourceStats.cpuPct}%</span>
+			<span class="text-[8px] opacity-40">{sep}</span>
+			<span>{$resourceStats.rssMB} MB</span>
+			{#if $resourceStats.budget < 1}
+				<span class="text-[8px] opacity-40">{sep}</span>
+				<span class="text-[var(--color-warning,#d97706)]"
+					>throttled {Math.round($resourceStats.budget * 100)}%</span
+				>
+			{/if}
+		</span>
 	{/if}
 </div>

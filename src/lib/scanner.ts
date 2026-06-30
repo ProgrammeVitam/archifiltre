@@ -33,6 +33,7 @@ import type { ProvisionalDir } from '@lib/job-context.ts';
 import {
   cleanDatabase,
   insertFileBatch,
+  rollupDirStatsBatch,
   findDuplicateSizes,
   countRealDuplicateGroups,
   type DatabaseConnection,
@@ -481,6 +482,18 @@ export interface ScanProgressEvent {
   status: string;
 }
 
+// Scanner progress → canonical job:progress {processed, total}. Phase-aware:
+// hashing counts checksums, every other phase counts discovered files.
+export function scanProgressMetrics(e: ScanProgressEvent): {
+  processed: number;
+  total: number | null;
+} {
+  if (e.phase === 'hashing') {
+    return { processed: e.filesHashed ?? 0, total: e.filesToHash ?? null };
+  }
+  return { processed: e.filesDiscovered, total: null };
+}
+
 /**
  * Main scanning function
  */
@@ -653,6 +666,25 @@ export function scanDirectory(
                   emitProgress('ingestion', `ingested ${filesIngested.toLocaleString()} files`);
                 }
               }),
+              // Incremental, DB-central dir_stats maintenance (owner mode only): fold
+              // this batch into the per-directory aggregates so the icicle can read the
+              // tree LIVE from the DB and dir_stats is fully materialized by completion
+              // (no one-shot populateDirStats spike). Own catchError so a rollup hiccup
+              // never fails the batch. O(batch) — independent of table size.
+              config.betweenBatches
+                ? mergeMap((inserted: number) =>
+                    from(rollupDirStatsBatch(connection, config.runId, batch)).pipe(
+                      map(() => inserted),
+                      catchError(err => {
+                        logger.warn('dir_stats rollup failed for batch', {
+                          runId: config.runId,
+                          error: (err as Error).message,
+                        });
+                        return of(inserted);
+                      })
+                    )
+                  )
+                : tap(),
               catchError(error => {
                 logger.error('Failed to insert batch', error as Error, {
                   runId: config.runId,

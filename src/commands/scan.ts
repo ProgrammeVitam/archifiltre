@@ -24,6 +24,7 @@ import {
   scanDirectory,
   validateScanPath,
   generateRunId,
+  scanProgressMetrics,
   type ScanConfig,
   type ScanResult,
   type ScanProgressEvent,
@@ -178,7 +179,8 @@ export default class Scan extends BaseCommand {
         context.database,
         scanConfig,
         (event: ScanProgressEvent) => {
-          context.onProgress?.(event.phase, event.filesDiscovered, null, event.status);
+          const { processed, total } = scanProgressMetrics(event);
+          context.onProgress?.(event.phase, processed, total, event.status);
           if (isTTY) {
             ux.action.status = event.status;
           } else if (!context.onProgress) {

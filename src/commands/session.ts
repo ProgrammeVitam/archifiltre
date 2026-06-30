@@ -11,9 +11,9 @@
  * are safe by construction (no second process, no corruption).
  *
  * Wire format (one JSON object per line):
- *   in : {id, action, …}            (query)  | {id, action:'start_scan', path, runId?, …}
+ *   in : {id, action, …}            (query)  | {id, action:'start_scan', path, jobId?, …}
  *   out: {id, ok, data|error}       (response, correlated by id)
- *        {event:'ready'|'progress'|'scan:tree'|'complete'|'scan_error', …}  (async)
+ *        {event:'job:progress'|'job:complete'|'job:error'|'scan:tree'|'ready'|'resource', …}  (async)
  */
 import { Command, Flags } from '@oclif/core';
 import * as readline from 'node:readline';
@@ -25,12 +25,13 @@ import {
   getLatestRunId,
   insertScanMetadata,
   updateScanMetadata,
-  populateDirStats,
+  ensureTemplateInBackground,
   type DatabaseConnection,
 } from '@lib/database.ts';
 import {
   scanDirectory,
   generateRunId,
+  scanProgressMetrics,
   type ScanConfig,
   type ScanProgressEvent,
 } from '@lib/scanner.ts';
@@ -49,6 +50,8 @@ export default class Session extends Command {
   private database: DatabaseConnection | undefined;
   private runId: string | undefined;
   private scanning = false;
+  /** True while switch_db swaps the connection, so a second switch can't race it. */
+  private switching = false;
   /** In-flight read queries. The scan's betweenBatches hook waits on this so reads
    *  are served before the next write batch (read priority → responsive UI). */
   private pendingReads = 0;
@@ -146,6 +149,13 @@ export default class Session extends Command {
     this.send({ event: 'ready', run_id: this.runId ?? null, pid: process.pid });
     this.startMonitor();
 
+    // The pre-warmed spare (db "_warm") will sit IDLE until claimed, so it's the safe
+    // place to build the warm-start template — once it's ready, the first real scan
+    // (claimed spare OR cold spawn) copies the template instead of running initdb.
+    if (flags.db === '_warm') {
+      void ensureTemplateInBackground();
+    }
+
     const rl = readline.createInterface({ input: process.stdin, terminal: false });
     rl.on('line', (line) => {
       const trimmed = line.trim();
@@ -180,24 +190,34 @@ export default class Session extends Command {
         return;
       }
 
+      // Warm reuse: re-target this (already-running, WASM-compiled) process at a
+      // different datadir in-process, instead of cold-spawning a fresh one.
+      if (action === 'switch_db') {
+        await this.handleSwitchDb(req);
+        return;
+      }
+
       if (!this.runId) {
         this.send({ id, ok: false, error: 'No run loaded yet (start a scan first)' });
         return;
       }
 
-      // get_tree / get_stats lazily materialize dir_stats, which must NOT run while
-      // the files table is still growing (a partial dir_stats would be cached stale
-      // for the whole run). The live graph uses get_files during a scan; the tree is
-      // for the settled DB. (Phase 3 will serve a live tree another way.)
-      if (this.scanning && (action === 'get_tree' || action === 'get_stats')) {
+      // get_tree is served LIVE during a scan now: dir_stats is maintained
+      // incrementally as batches ingest (rollupDirStatsBatch), so the icicle reads
+      // the growing tree straight from the DB. get_stats stays settled-only — it's a
+      // whole-table aggregate the live UI doesn't use (it reads $scanResult instead).
+      if (this.scanning && action === 'get_stats') {
         this.send({ id, ok: false, error: 'unavailable_during_scan' });
         return;
       }
 
-      // Count as an in-flight read so the scan yields to it (read priority).
+      // Count as an in-flight read so the scan yields to it (read priority). Pass the
+      // scanning flag so handleGetTree does NOT lazily recompute dir_stats mid-scan
+      // (that would double-count against the incremental rollup); it just reads the
+      // partial aggregates.
       this.pendingReads++;
       try {
-        const data = await dispatchQuery(this.database, this.runId, req);
+        const data = await dispatchQuery(this.database, this.runId, req, this.scanning);
         this.send({ id, ok: true, data });
       } finally {
         this.pendingReads--;
@@ -208,9 +228,66 @@ export default class Session extends Command {
     }
   }
 
-  private async runScan(req: QueryRequest): Promise<void> {
+  /** Re-point this warm process at a different db in-process (no respawn → no WASM
+   *  recompile). Combined with the warm-start template-copy, claiming + switching a
+   *  spare process is ~0.5 s vs a ~4 s cold spawn. Refuses while scanning (closing
+   *  PGlite mid-scan would kill it); a concurrent scan must use a different process. */
+  private async handleSwitchDb(req: QueryRequest): Promise<void> {
+    const { id } = req;
+    const db = req.db as string;
+    if (!db) {
+      this.send({ id, ok: false, error: 'switch_db requires db' });
+      return;
+    }
     if (this.scanning) {
-      this.send({ event: 'scan_error', error: 'already scanning' });
+      this.send({ id, ok: false, error: 'cannot switch_db while scanning' });
+      return;
+    }
+    // Already on this datadir → no-op. (Re-opening it while it's still open would be
+    // two openers of one datadir = corruption.)
+    if (this.database?.name === db) {
+      this.send({ id, ok: true, data: { run_id: this.runId ?? null, db } });
+      return;
+    }
+    if (this.switching) {
+      this.send({ id, ok: false, error: 'switch already in progress' });
+      return;
+    }
+    this.switching = true;
+    try {
+      // Drain in-flight reads on the current connection before swapping it out.
+      await new Promise<void>((r) => setImmediate(r));
+      while (this.pendingReads > 0) await new Promise<void>((r) => setImmediate(r));
+      // Open the NEW connection before closing the old, so this.database is never a
+      // closed handle (a concurrent read keeps using the old, still-open one until the
+      // atomic swap). Different datadir → no two-openers-of-one-datadir.
+      const old = this.database;
+      const next = await createScanDatabase(db);
+      await ensureEnrichmentTables(next);
+      const rid = await new Promise<string | null>((resolve, reject) => {
+        getLatestRunId(next).subscribe({ next: resolve, error: reject });
+      });
+      this.database = next;
+      this.runId = rid ?? undefined;
+      if (old) {
+        try {
+          await old.pg.close();
+        } catch {
+          /* best effort — datadir lock is released for the next opener */
+        }
+      }
+      this.send({ id, ok: true, data: { run_id: this.runId ?? null, db } });
+    } catch (e) {
+      this.send({ id, ok: false, error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      this.switching = false;
+    }
+  }
+
+  private async runScan(req: QueryRequest): Promise<void> {
+    const jobId = (req.jobId as string) || (req.runId as string) || '';
+    if (this.scanning) {
+      this.send({ event: 'job:error', jobId, error: 'already scanning' });
       return;
     }
     const rootPath = req.path as string;
@@ -218,6 +295,7 @@ export default class Session extends Command {
     this.runId = runId; // queries during the scan target this run
     this.scanning = true;
     const startedAt = Math.floor(Date.now() / 1000);
+    const startMs = Date.now();
 
     // Resource governor settings for this scan (default: full speed, no throttle).
     this.cpuBudget = typeof req.cpuBudget === 'number' ? Math.max(0.1, Math.min(1, req.cpuBudget)) : 1;
@@ -235,28 +313,36 @@ export default class Session extends Command {
     };
 
     try {
+      // Write scan_metadata at the START (not completion). It carries the root path, so
+      // get_tree returns a non-null root DURING the scan — giving each in-progress scan's
+      // live tree a distinct identity (the chart keys on it, so concurrent tabs switch
+      // correctly) AND making an interrupted scan recoverable on restart. cleanDatabase
+      // (inside scanDirectory) preserves this row (it clears only other run_ids).
+      await insertScanMetadata(this.database!, runId, rootPath, startedAt).toPromise();
       const result = await lastValueFrom(
         scanDirectory(
           this.database!,
           scanConfig,
-          (event: ScanProgressEvent) => this.send({ event: 'progress', ...event }),
-          (directories) => this.send({ event: 'scan:tree', directories })
+          (event: ScanProgressEvent) => {
+            const { processed, total } = scanProgressMetrics(event);
+            this.send({ event: 'job:progress', jobId, phase: event.phase, processed, total, detail: event.status });
+          }
+          // No tree callback: owner mode doesn't stream a JS-accumulated provisional
+          // tree. dir_stats is maintained in the DB per batch, so the UI reads the
+          // live tree straight from get_tree — the DB is the single source of truth.
         )
       );
-      await insertScanMetadata(this.database!, runId, rootPath, startedAt).toPromise();
       await updateScanMetadata(this.database!, runId, result.filesIngested).toPromise();
-      // Materialize dir_stats now that the table is final → the first get_tree is instant.
-      await populateDirStats(this.database!, runId);
+      // dir_stats is already fully materialized by the incremental rollup that ran on
+      // every ingestion batch (rollupDirStatsBatch) — no one-shot populate spike here.
       this.scanning = false;
-      this.send({
-        event: 'complete',
-        run_id: runId,
-        filesIngested: result.filesIngested,
-        duplicateGroups: result.duplicateGroups,
-      });
+      this.send({ event: 'job:complete', jobId, durationMs: Date.now() - startMs });
+      // Now idle: build the warm-start template (initdb once) so the NEXT new db is a
+      // ~125 ms copy instead of a ~3 s initdb. Fire-and-forget; no-op if already built.
+      void ensureTemplateInBackground();
     } catch (e) {
       this.scanning = false;
-      this.send({ event: 'scan_error', error: e instanceof Error ? e.message : String(e) });
+      this.send({ event: 'job:error', jobId, error: e instanceof Error ? e.message : String(e) });
     } finally {
       // Back to full speed when idle (the governor only governs an active scan).
       this.cpuBudget = 1;

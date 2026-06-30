@@ -10,6 +10,27 @@ import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 
 // ================================
+// Single-owner DB mode (read-while-scanning)
+// ================================
+// When enabled, the data layer routes through the Rust Owner (one process owning
+// the PGlite connection: scan writes + live reads), instead of the legacy two
+// sidecars. Runtime switch via localStorage so it can be flipped without a rebuild.
+// Owner mode is now the DEFAULT (live read-while-scanning, full-depth tree,
+// concurrent scans). The legacy two-sidecar path is on its way out — kept behind
+// an escape hatch (`archifiltre-owner-db = '0'`) only until owner mode is confirmed
+// in the real Tauri app, then both the flag and the legacy path get deleted.
+export function useOwnerDb(): boolean {
+	try {
+		return typeof localStorage === 'undefined' || localStorage.getItem('archifiltre-owner-db') !== '0';
+	} catch {
+		return true;
+	}
+}
+
+let _ownerReqCounter = 0;
+const ownerReqId = (): string => `q${Date.now().toString(36)}_${_ownerReqCounter++}`;
+
+// ================================
 // Basic Types
 // ================================
 
@@ -143,7 +164,50 @@ export async function getVersion(): Promise<CommandResult> {
  * @param options - Scan options including scanId for event routing
  */
 export async function scanDirectory(options: ScanOptions): Promise<CommandResult> {
-	return await invoke<CommandResult>('scan_directory', { options });
+	if (!useOwnerDb()) {
+		return await invoke<CommandResult>('scan_directory', { options });
+	}
+	// Owner mode: one owner PROCESS per db. Ensure THIS db's owner is up (other dbs'
+	// owners keep running → concurrent scans), point queries at it, fire the scan (acks
+	// immediately, streams job:progress/resource events), and resolve on job:complete /
+	// job:error — same canonical vocabulary as the scan command.
+	await invoke('start_session', { dbName: options.dbName });
+	setActiveQueryDb(options.dbName);
+	const jobId = options.jobId || options.scanId;
+	const done = new Promise<CommandResult>((resolve) => {
+		let unlisten: UnlistenFn | null = null;
+		void onJobUpdate((e) => {
+			if (e.jobId !== jobId) return;
+			let m: { event?: string; error?: string };
+			try {
+				m = JSON.parse(e.line);
+			} catch {
+				return;
+			}
+			if (m.event === 'job:complete') {
+				unlisten?.();
+				resolve({ success: true, output: '', error: null });
+			} else if (m.event === 'job:error') {
+				unlisten?.();
+				resolve({ success: false, output: '', error: m.error ?? 'scan failed' });
+			}
+		}).then((u) => {
+			unlisten = u;
+		});
+	});
+	await invoke('session_request', {
+		dbName: options.dbName,
+		request: {
+			id: ownerReqId(),
+			action: 'start_scan',
+			path: options.path,
+			jobId,
+			batchSize: options.batchSize,
+			includeHidden: options.includeHidden,
+			enableArchives: !options.disableArchives,
+		},
+	});
+	return done;
 }
 
 // ================================
@@ -305,12 +369,27 @@ export interface FilesData {
 // Command Functions - Query Session
 // ================================
 
+// Owner mode runs one owner PROCESS per db (concurrent scans/tabs/windows), so every
+// query must say WHICH db/owner it targets. This tracks the db of the scan currently
+// being viewed/scanned; it's set whenever a session is (re)established for a db
+// (startQuerySession / scanDirectory), i.e. on scan start and on switching to a tab.
+let activeQueryDb: string | undefined;
+
+/** Owner mode: point subsequent queries at this db's owner. */
+export function setActiveQueryDb(dbName: string | undefined): void {
+	activeQueryDb = dbName;
+}
+
 /**
  * Start a query session for interactive database access.
  * @param dbName - Optional database name (defaults to 'main')
  * @returns The run_id for the current scan in that database
  */
 export async function startQuerySession(dbName?: string): Promise<string> {
+	if (useOwnerDb()) {
+		activeQueryDb = dbName;
+		return await invoke<string>('start_session', { dbName });
+	}
 	return await invoke<string>('start_query_session', { dbName });
 }
 
@@ -318,13 +397,26 @@ export async function startQuerySession(dbName?: string): Promise<string> {
  * Stop the current query session.
  */
 export async function stopQuerySession(): Promise<void> {
+	if (useOwnerDb()) {
+		await invoke('stop_session', { dbName: activeQueryDb });
+		return;
+	}
 	await invoke('stop_query_session');
 }
 
 /**
- * Send a query to the active session.
+ * Send a query to a session. Owner mode runs one process per db, so pass `dbName`
+ * to target a specific db's owner explicitly — REQUIRED whenever two scans/tabs are
+ * live, because the shared `activeQueryDb` pointer is only correct for the active tab
+ * and a query carrying the wrong db reads the other owner (e.g. unmaterialized data
+ * mid-scan → empty tree). Omitting it falls back to the active tab's pointer.
  */
-export async function sendQuery(request: QueryRequest): Promise<QueryResponse> {
+export async function sendQuery(request: QueryRequest, dbName?: string): Promise<QueryResponse> {
+	if (useOwnerDb())
+		return await invoke<QueryResponse>('session_request', {
+			dbName: dbName ?? activeQueryDb,
+			request
+		});
 	return await invoke<QueryResponse>('send_query', { request });
 }
 
@@ -332,6 +424,7 @@ export async function sendQuery(request: QueryRequest): Promise<QueryResponse> {
  * Check if a query session is currently active.
  */
 export async function isQuerySessionActive(): Promise<boolean> {
+	if (useOwnerDb()) return await invoke<boolean>('is_session_active', { dbName: activeQueryDb });
 	return await invoke<boolean>('is_query_session_active');
 }
 
@@ -351,11 +444,11 @@ export async function getQueryRunId(): Promise<string> {
  * Returns a flat list of directories that can be built into a hierarchy.
  * Requires an active query session.
  */
-export async function queryTree(): Promise<TreeData | null> {
+export async function queryTree(dbName?: string): Promise<TreeData | null> {
 	const response = await sendQuery({
 		id: `get_tree_${Date.now()}`,
 		action: 'get_tree'
-	});
+	}, dbName);
 
 	if (!response.ok) {
 		console.error('Failed to get tree:', response.error);
@@ -369,11 +462,11 @@ export async function queryTree(): Promise<TreeData | null> {
  * Query scan statistics.
  * Requires an active query session.
  */
-export async function queryStats(): Promise<ScanStats | null> {
+export async function queryStats(dbName?: string): Promise<ScanStats | null> {
 	const response = await sendQuery({
 		id: `get_stats_${Date.now()}`,
 		action: 'get_stats'
-	});
+	}, dbName);
 
 	if (!response.ok) {
 		console.error('Failed to get stats:', response.error);
@@ -785,12 +878,12 @@ export async function unassignTag(tagId: string, path: string): Promise<boolean>
 }
 
 /** Fetch the full enrichment snapshot for the current scan (hydration). */
-export async function getEnrichment(): Promise<EnrichmentData | null> {
+export async function getEnrichment(dbName?: string): Promise<EnrichmentData | null> {
 	try {
 		const response = await sendQuery({
 			id: `get_enrichment_${Date.now()}`,
 			action: 'get_enrichment'
-		});
+		}, dbName);
 		if (!response.ok) {
 			console.error('Failed to get enrichment:', response.error);
 			return null;

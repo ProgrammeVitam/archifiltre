@@ -460,21 +460,24 @@
 
 		try {
 			const filesData = await queryFiles(dirPath, 1000);
-			if (filesData && filesData.files.length > 0) {
+			// null = the query FAILED (e.g. timed out under live-scan write contention).
+			// Do NOT cache that as "empty" — leave it uncached so the next layout/poll
+			// retries it once the connection frees up; otherwise a single mid-scan
+			// timeout would hide a folder's files for the rest of the scan.
+			if (filesData) {
 				const files = filesData.files.filter((f) => !f.is_directory);
-				filesCache.set(dirPath, files);
-				computeLayout();
-				// Async file loading can deepen the tree (new rows); refresh the content
-				// metric and re-clamp the pan so deeper rows stay reachable.
-				updateCanvasHeight();
-				clampView();
-				render();
-			} else {
-				filesCache.set(dirPath, []);
+				filesCache.set(dirPath, files); // valid response (possibly genuinely empty)
+				if (files.length > 0) {
+					computeLayout();
+					// Async file loading can deepen the tree (new rows); refresh the content
+					// metric and re-clamp the pan so deeper rows stay reachable.
+					updateCanvasHeight();
+					clampView();
+					render();
+				}
 			}
 		} catch (e) {
-			console.error('Failed to load files for', dirPath, e);
-			filesCache.set(dirPath, []);
+			console.error('Failed to load files for', dirPath, e); // transient — retry next layout
 		} finally {
 			loadingFiles.delete(dirPath);
 		}
@@ -859,7 +862,15 @@
 		// Drain the lazy-load queue: fetch files only for the folders this layout
 		// actually drew. loadFilesForDirectory is guarded (cache + in-flight set), so
 		// re-running layout on every pan/zoom frame never double-fetches.
-		for (const path of dirsToLoad) loadFilesForDirectory(path);
+		// Bound the concurrent in-flight loads: during a LIVE scan the connection is
+		// also serving writes, so firing 20+ get_files at once floods the queue and the
+		// tail times out. Cap it; the rest are re-queued by the next layout/poll (and a
+		// failed load stays uncached, so it retries) → bounded read pressure, no flood.
+		const MAX_INFLIGHT_FILE_LOADS = 6;
+		for (const path of dirsToLoad) {
+			if (loadingFiles.size >= MAX_INFLIGHT_FILE_LOADS) break;
+			loadFilesForDirectory(path);
+		}
 	}
 
 	function computeFilesOnlyLayout(

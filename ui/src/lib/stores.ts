@@ -381,6 +381,19 @@ export const scanOptions = derived(activeScan, ($scan) => ({
 /** Scan result (from active scan) - LEGACY */
 export const scanResult = derived(activeScan, ($scan) => $scan?.scanResult ?? defaultScanResult);
 
+/** Live resource telemetry from the single-owner session (owner mode). The session
+ *  emits a `resource` event every ~500ms; the status bar shows it and the scan can
+ *  be throttled against it. Null when idle / not in owner mode. */
+export interface ResourceStats {
+	cpuPct: number;
+	rssMB: number;
+	load1: number;
+	cores: number;
+	budget: number;
+	scanning: boolean;
+}
+export const resourceStats = writable<ResourceStats | null>(null);
+
 /** Terminal output (from active scan) - LEGACY */
 export const terminalOutput = derived(activeScan, ($scan) => $scan?.terminalOutput ?? []);
 
@@ -652,17 +665,6 @@ export function clearTerminal(): void {
 	}
 }
 
-interface LegacyScanProgressEvent {
-	type: 'scan-progress';
-	phase: ScanPhase;
-	filesDiscovered: number;
-	filesIngested: number;
-	filesHashed?: number;
-	filesToHash?: number;
-	duplicateGroups: number;
-	status: string;
-}
-
 interface JobProgressEvent {
 	event: 'job:progress';
 	jobId: string;
@@ -672,12 +674,9 @@ interface JobProgressEvent {
 	detail: string;
 }
 
-function tryParseJsonProgressEvent(
-	line: string
-): LegacyScanProgressEvent | JobProgressEvent | null {
+function tryParseJsonProgressEvent(line: string): JobProgressEvent | null {
 	try {
 		const parsed = JSON.parse(line);
-		if (parsed?.type === 'scan-progress') return parsed as LegacyScanProgressEvent;
 		if (parsed?.event === 'job:progress') return parsed as JobProgressEvent;
 	} catch {
 		/* not JSON */
@@ -690,43 +689,30 @@ export function parseScanOutputForScan(scanId: string, line: string): void {
 	const scan = scansStore.getScan(scanId);
 	if (!scan) return;
 
-	// Try JSON progress event first (legacy scan-progress or new job:progress)
 	const event = tryParseJsonProgressEvent(line);
 	if (event) {
-		if ('event' in event && event.event === 'job:progress') {
-			const validPhases: ScanPhase[] = [
-				'discovery',
-				'ingestion',
-				'prefilter',
-				'hashing',
-				'duplicate-detection',
-				'complete'
-			];
-			const phase = validPhases.includes(event.phase as ScanPhase)
-				? (event.phase as ScanPhase)
-				: scan.scanPhase;
-			scansStore.updateScan(scanId, {
-				scanPhase: phase,
-				scanProgress: event.detail,
-				scanResult: {
-					...scan.scanResult,
-					filesDiscovered: event.processed
-				}
-			});
-		} else {
-			const legacy = event as LegacyScanProgressEvent;
-			scansStore.updateScan(scanId, {
-				scanPhase: legacy.phase,
-				scanProgress: legacy.status,
-				scanResult: {
-					...scan.scanResult,
-					filesDiscovered: legacy.filesDiscovered,
-					duplicateGroups: legacy.duplicateGroups,
-					...(legacy.filesHashed !== undefined && { filesHashed: legacy.filesHashed }),
-					...(legacy.filesToHash !== undefined && { filesToHash: legacy.filesToHash })
-				}
-			});
-		}
+		const validPhases: ScanPhase[] = [
+			'discovery',
+			'ingestion',
+			'prefilter',
+			'hashing',
+			'duplicate-detection',
+			'complete'
+		];
+		const phase = validPhases.includes(event.phase as ScanPhase)
+			? (event.phase as ScanPhase)
+			: scan.scanPhase;
+		// processed/total are phase-aware (see scanProgressMetrics): hashing counts
+		// checksums, every other phase counts discovered files.
+		const metrics =
+			event.phase === 'hashing'
+				? { filesHashed: event.processed, filesToHash: event.total ?? 0 }
+				: { filesDiscovered: event.processed };
+		scansStore.updateScan(scanId, {
+			scanPhase: phase,
+			scanProgress: event.detail,
+			scanResult: { ...scan.scanResult, ...metrics }
+		});
 		return;
 	}
 

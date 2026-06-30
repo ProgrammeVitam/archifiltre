@@ -167,9 +167,15 @@ pub struct AppState {
     pub query_session: Mutex<Option<QuerySession>>,
     /// stdin handles for running pipeline jobs, keyed by job_id
     pub running_jobs: Mutex<HashMap<String, tokio::process::ChildStdin>>,
-    /// Single-owner DB session (read-while-scanning). Arc so a command can clone it
-    /// out and release the AppState lock before awaiting a request (concurrency).
-    pub owner: Mutex<Option<Arc<Owner>>>,
+    /// DB-session owners (read-while-scanning), keyed by db name — ONE owner process
+    /// per datadir. Multiple entries = multiple concurrent scans/tabs (and windows),
+    /// each its own OS process; one owner per db preserves "never two openers". Arc so
+    /// a command can clone an owner out and release the map lock before awaiting.
+    pub owners: Mutex<HashMap<String, Arc<Owner>>>,
+    /// One pre-warmed spare owner (WASM already compiled, on a scratch db). The next
+    /// NEW scan claims it and re-targets it via switch_db (~0.5 s) instead of paying
+    /// the ~1 s WASM compile of a cold spawn; a replacement is warmed in the background.
+    pub warm_spare: Mutex<Option<Arc<Owner>>>,
 }
 
 impl Default for AppState {
@@ -177,7 +183,8 @@ impl Default for AppState {
         Self {
             query_session: Mutex::new(None),
             running_jobs: Mutex::new(HashMap::new()),
-            owner: Mutex::new(None),
+            owners: Mutex::new(HashMap::new()),
+            warm_spare: Mutex::new(None),
         }
     }
 }
@@ -710,24 +717,12 @@ async fn get_query_run_id(state: tauri::State<'_, Arc<AppState>>) -> Result<Stri
 // ARCHIFILTRE_OWNER_DB flag). One owner process serves scan writes + live reads.
 // ============================================================================
 
-#[tauri::command]
-async fn start_session(
-    app: tauri::AppHandle,
-    state: tauri::State<'_, Arc<AppState>>,
-    db_name: Option<String>,
-) -> Result<String, String> {
-    let binary_path = find_sidecar_path(&app)?;
-    let db = db_name.unwrap_or_else(|| "main".to_string());
-
-    let mut guard = state.owner.lock().await;
-    // Confirm any existing owner is fully dead before spawning a new one — there
-    // must never be two openers of the datadir.
-    if let Some(old) = guard.take() {
-        old.kill().await;
-    }
-
-    // Event sink: tag the session's event lines with the current scan's job id and
-    // emit them on the job-update stream the UI already listens to.
+/// Spawn one owner process on `db`, wired to emit its events on the job-update stream.
+async fn spawn_owner(
+    app: &tauri::AppHandle,
+    binary_path: &std::path::Path,
+    db: &str,
+) -> Result<Arc<Owner>, String> {
     let current_job_id = Arc::new(std::sync::Mutex::new(String::new()));
     let sink: EventSink = {
         let app = app.clone();
@@ -737,8 +732,7 @@ async fn start_session(
             let _ = app.emit("job-update", JobUpdateEvent { job_id, line });
         })
     };
-
-    let args = vec!["session".to_string(), "--db".to_string(), db];
+    let args = vec!["session".to_string(), "--db".to_string(), db.to_string()];
     let owner = Owner::spawn(
         binary_path.to_string_lossy().as_ref(),
         &args,
@@ -747,22 +741,96 @@ async fn start_session(
         current_job_id,
     )
     .await?;
+    Ok(Arc::new(owner))
+}
+
+/// Pre-warm ONE spare owner (WASM compiled, on a scratch "_warm" db) so the next NEW
+/// scan can claim it via switch_db instead of cold-spawning. Background + idempotent —
+/// no-op if a live spare already exists. The scratch datadir is closed by switch_db
+/// when the spare is claimed, so it's free for the next spare.
+fn ensure_warm_spare(app: tauri::AppHandle, state: Arc<AppState>) {
+    // Tauri's runtime so this works from the sync setup hook AND async commands.
+    tauri::async_runtime::spawn(async move {
+        if state.warm_spare.lock().await.as_ref().map(|o| o.is_alive()).unwrap_or(false) {
+            return;
+        }
+        let bin = match find_sidecar_path(&app) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        if let Ok(spare) = spawn_owner(&app, &bin, "_warm").await {
+            let mut g = state.warm_spare.lock().await;
+            if g.as_ref().map(|o| o.is_alive()).unwrap_or(false) {
+                drop(g);
+                spare.kill().await; // lost a race — discard ours
+            } else {
+                *g = Some(spare);
+            }
+        }
+    });
+}
+
+#[tauri::command]
+async fn start_session(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+    db_name: Option<String>,
+) -> Result<String, String> {
+    let binary_path = find_sidecar_path(&app)?;
+    let db = db_name.unwrap_or_else(|| "main".to_string());
+    let state_arc = state.inner().clone();
+
+    // Hold `owners` across the spawn/claim so two concurrent start_sessions for the
+    // SAME db can't both open its datadir (two openers = corruption). The wait is
+    // ≤~0.5 s on the warm path (vs the ~4 s the cold path already held).
+    let mut owners = state.owners.lock().await;
+    // Get-or-spawn the owner for THIS db. A live one is reused (reconnect after a
+    // scan, another tab on the same scan) — no cold start, no killing it. Other dbs'
+    // owners are left untouched, so concurrent scans/tabs/windows each keep running.
+    if let Some(existing) = owners.get(&db) {
+        if existing.is_alive() {
+            return Ok(existing.run_id.lock().unwrap().clone());
+        }
+        // Stale/dead entry for this db — drop it before respawning on the same datadir.
+        if let Some(dead) = owners.remove(&db) {
+            dead.kill().await;
+        }
+    }
+
+    // Warm path: claim the pre-warmed spare (WASM already compiled) and re-target it
+    // at this db in-process (~0.5 s) instead of a cold spawn (~4 s).
+    let spare = { state.warm_spare.lock().await.take() };
+    if let Some(spare) = spare {
+        if spare.is_alive() && spare.switch_db(&db, 20000).await.is_ok() {
+            let run_id = spare.run_id.lock().unwrap().clone();
+            owners.insert(db, spare);
+            ensure_warm_spare(app.clone(), state_arc); // re-warm for next time
+            return Ok(run_id);
+        }
+        spare.kill().await; // unusable spare → discard, fall through to cold spawn
+    }
+
+    // Cold path: no usable spare → spawn fresh.
+    let owner = spawn_owner(&app, &binary_path, &db).await?;
     let run_id = owner.run_id.lock().unwrap().clone();
-    *guard = Some(Arc::new(owner));
+    owners.insert(db, owner);
+    ensure_warm_spare(app.clone(), state_arc); // make sure a spare exists for next time
     Ok(run_id)
 }
 
 #[tauri::command]
 async fn session_request(
     state: tauri::State<'_, Arc<AppState>>,
+    db_name: Option<String>,
     request: QueryRequest,
     timeout_ms: Option<u64>,
 ) -> Result<QueryResponse, String> {
-    // Clone the Arc and release the AppState lock so independent requests run
-    // concurrently (the owner multiplexes them onto the one connection).
+    let db = db_name.unwrap_or_else(|| "main".to_string());
+    // Clone the Arc and release the map lock so independent requests (across dbs or
+    // on the same owner) run concurrently — the owner multiplexes its own.
     let owner = {
-        let guard = state.owner.lock().await;
-        guard.as_ref().ok_or("No active session")?.clone()
+        let owners = state.owners.lock().await;
+        owners.get(&db).ok_or("No active session for this db")?.clone()
     };
     // Tag scan events with the job id the UI passed on start_scan.
     if request.action == "start_scan" {
@@ -774,18 +842,39 @@ async fn session_request(
 }
 
 #[tauri::command]
-async fn stop_session(state: tauri::State<'_, Arc<AppState>>) -> Result<(), String> {
-    let mut guard = state.owner.lock().await;
-    if let Some(owner) = guard.take() {
-        owner.kill().await;
+async fn stop_session(
+    state: tauri::State<'_, Arc<AppState>>,
+    db_name: Option<String>,
+) -> Result<(), String> {
+    let mut owners = state.owners.lock().await;
+    // No db → stop ALL owners (app teardown); else just that db's owner.
+    match db_name {
+        Some(db) => {
+            if let Some(owner) = owners.remove(&db) {
+                owner.kill().await;
+            }
+        }
+        None => {
+            for (_, owner) in owners.drain() {
+                owner.kill().await;
+            }
+            // App teardown: also drop the pre-warmed spare.
+            if let Some(spare) = state.warm_spare.lock().await.take() {
+                spare.kill().await;
+            }
+        }
     }
     Ok(())
 }
 
 #[tauri::command]
-async fn is_session_active(state: tauri::State<'_, Arc<AppState>>) -> Result<bool, String> {
-    let guard = state.owner.lock().await;
-    Ok(guard.as_ref().map(|o| o.is_alive()).unwrap_or(false))
+async fn is_session_active(
+    state: tauri::State<'_, Arc<AppState>>,
+    db_name: Option<String>,
+) -> Result<bool, String> {
+    let db = db_name.unwrap_or_else(|| "main".to_string());
+    let owners = state.owners.lock().await;
+    Ok(owners.get(&db).map(|o| o.is_alive()).unwrap_or(false))
 }
 
 // ============================================================================
@@ -873,12 +962,20 @@ async fn create_window(app: tauri::AppHandle) -> Result<String, String> {
 
 fn main() {
     let app_state = Arc::new(AppState::default());
+    let state_for_setup = app_state.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_os::init())
         .manage(app_state)
+        .setup(move |app| {
+            // Pre-warm a spare owner during launch so its ~1 s WASM compile overlaps
+            // startup and the first scan can claim it (no-op if owner mode is unused —
+            // the spare just sits idle and is reaped on teardown).
+            ensure_warm_spare(app.handle().clone(), state_for_setup);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             // Health & Version
             health_check,

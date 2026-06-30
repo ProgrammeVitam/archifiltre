@@ -29,7 +29,7 @@ pub struct Owner {
     child: Mutex<tokio::process::Child>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<QueryResponse>>>>,
     alive: Arc<AtomicBool>,
-    /// Latest run id (from the session's `ready`/`complete` events).
+    /// Latest run id carried by any session event (currently the `ready` event).
     pub run_id: Arc<std::sync::Mutex<String>>,
     /// Job id to tag scan events with; set by the command layer on `start_scan`.
     pub current_job_id: Arc<std::sync::Mutex<String>>,
@@ -180,6 +180,33 @@ impl Owner {
         let _ = self.child.lock().await.kill().await;
         self.alive.store(false, Ordering::SeqCst);
     }
+
+    /// Re-point this warm process at a different db IN-PROCESS (no respawn → no WASM
+    /// recompile). Updates the tracked run id from the session's response. On error the
+    /// owner stays on its old db (caller should discard it). Refused by the session
+    /// while it is scanning.
+    pub async fn switch_db(&self, db: &str, timeout_ms: u64) -> Result<(), String> {
+        let mut params = serde_json::Map::new();
+        params.insert("db".to_string(), serde_json::json!(db));
+        let req = QueryRequest {
+            id: format!("switchdb-{}", db),
+            action: "switch_db".to_string(),
+            params,
+        };
+        let resp = self.send_request(&req, timeout_ms).await?;
+        if !resp.ok {
+            return Err(resp.error.unwrap_or_else(|| "switch_db failed".to_string()));
+        }
+        if let Some(rid) = resp
+            .data
+            .as_ref()
+            .and_then(|d| d.get("run_id"))
+            .and_then(|r| r.as_str())
+        {
+            *self.run_id.lock().unwrap() = rid.to_string();
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -269,5 +296,235 @@ mod tests {
         owner2.kill().await;
 
         println!("PHASE2 OK: live_ok={} settled_dirs={} after_respawn_dirs={}", live_ok, dirs, dirs2);
+    }
+
+    /// Generalises the single-crash test above: SIGKILL the session at random points
+    /// *during* the scan (mid-ingestion / mid-hashing — when an interrupted write is
+    /// most likely to corrupt the datadir), over many iterations, and assert every
+    /// time that (a) the dead owner fails fast instead of hanging, (b) the datadir
+    /// survives — a respawn opens it and a fresh scan runs to completion, and (c) the
+    /// recovered data is correct (full dir count). This is the "never corrupts, always
+    /// recovers" claim, exercised at scale rather than once.
+    #[test]
+    fn owner_crash_injection_random() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(owner_crash_injection_random_impl());
+    }
+
+    /// Scan to completion on `owner`, returning the settled dir count.
+    async fn scan_to_completion(owner: &Owner, scan_path: &str) -> usize {
+        let mut p = serde_json::Map::new();
+        p.insert("path".into(), json!(scan_path));
+        p.insert("batchSize".into(), json!(100));
+        let ack = owner.send_request(&req("s", "start_scan", p), 5000).await.unwrap();
+        assert!(ack.ok, "start_scan ack");
+        for _ in 0..200 {
+            let pong = owner.send_request(&req("pg", "ping", serde_json::Map::new()), 3000).await.unwrap();
+            let scanning = pong.data.as_ref().and_then(|d| d.get("scanning")).and_then(|s| s.as_bool()).unwrap_or(true);
+            if !scanning { break; }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        let tree = owner.send_request(&req("t", "get_tree", serde_json::Map::new()), 8000).await.unwrap();
+        assert!(tree.ok, "get_tree on settled db ok");
+        tree.data.as_ref().and_then(|d| d.get("directories")).and_then(|x| x.as_array()).map(|a| a.len()).unwrap_or(0)
+    }
+
+    async fn owner_crash_injection_random_impl() {
+        let archi = Path::new("/path/to/archifiltre");
+        let db = "ownercrashtest";
+        let _ = std::fs::remove_dir_all(archi.join(format!("dbdata-{}", db)));
+        let scan_path = "/path/to/sample-folder/node_modules/@types"; // ~1610 files → 160 dirs
+        let sink: EventSink = Arc::new(|_line: String| {});
+        let jid = Arc::new(std::sync::Mutex::new(String::new()));
+
+        // Establish the ground-truth dir count once (clean scan, no crash).
+        let owner0 = Owner::spawn("bun", &dev_args(db), Some(archi), sink.clone(), jid.clone())
+            .await
+            .expect("spawn owner0");
+        let expected_dirs = scan_to_completion(&owner0, scan_path).await;
+        owner0.kill().await;
+        assert!(expected_dirs > 0, "ground-truth dir count must be > 0");
+
+        // Kill delays spread across the scan: discovery → ingestion → hashing. A
+        // time-based jitter (no rand crate offline) varies where exactly each lands.
+        let base_delays = [180u64, 450, 800, 1200, 1700];
+        let mut mid_scan_kills = 0;
+        for (i, base) in base_delays.iter().enumerate() {
+            let jitter = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_millis() % 150) as u64;
+            let delay = base + jitter;
+
+            let owner = Owner::spawn("bun", &dev_args(db), Some(archi), sink.clone(), jid.clone())
+                .await
+                .expect("spawn owner");
+            let mut p = serde_json::Map::new();
+            p.insert("path".into(), json!(scan_path));
+            p.insert("batchSize".into(), json!(100));
+            let ack = owner.send_request(&req("s", "start_scan", p), 5000).await.unwrap();
+            assert!(ack.ok, "iter {}: start_scan ack", i);
+
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            // Was a write in flight when we pulled the trigger?
+            let pong = owner.send_request(&req("pg", "ping", serde_json::Map::new()), 2000).await;
+            let scanning = pong.ok().and_then(|r| r.data).and_then(|d| d.get("scanning").and_then(|s| s.as_bool())).unwrap_or(false);
+            if scanning { mid_scan_kills += 1; }
+
+            // CRASH at this random point.
+            let t_kill = std::time::Instant::now();
+            owner.kill().await;
+            assert!(!owner.is_alive(), "iter {}: owner must be dead after kill", i);
+            // The dead owner must FAIL FAST (not wait out the timeout) so the UI never hangs.
+            let dead = owner.send_request(&req("d", "ping", serde_json::Map::new()), 3000).await;
+            assert!(dead.is_err(), "iter {}: dead-owner request should error", i);
+            assert!(t_kill.elapsed() < Duration::from_millis(1500), "iter {}: kill+fail-fast must be prompt, took {:?}", i, t_kill.elapsed());
+
+            // RECOVER: respawn on the same datadir and scan to completion → correct data.
+            let owner2 = Owner::spawn("bun", &dev_args(db), Some(archi), sink.clone(), jid.clone())
+                .await
+                .unwrap_or_else(|e| panic!("iter {}: respawn after crash failed (datadir corrupt?): {}", i, e));
+            let dirs = scan_to_completion(&owner2, scan_path).await;
+            assert_eq!(dirs, expected_dirs, "iter {}: rescan after mid-scan crash must recover full data ({} dirs)", i, expected_dirs);
+            owner2.kill().await;
+
+            println!("CRASH iter {}: delay={}ms scanning_at_kill={} recovered_dirs={}", i, delay, scanning, dirs);
+        }
+
+        assert!(mid_scan_kills >= 3, "expected most kills mid-scan, only {} of {} were", mid_scan_kills, base_delays.len());
+        println!("CRASH-INJECTION OK: {}/{} kills landed mid-scan, all recovered to {} dirs", mid_scan_kills, base_delays.len(), expected_dirs);
+    }
+
+    /// The multi-owner foundation: TWO owner processes on TWO dbs scanning at the SAME
+    /// time (what the single-owner AppState couldn't do — a 2nd scan killed the 1st).
+    /// Asserts both run concurrently (both scanning at once), serve live reads while
+    /// scanning, complete, and keep their data isolated (each db gets only its tree).
+    #[test]
+    fn two_owners_concurrent_scans() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(two_owners_concurrent_scans_impl());
+    }
+
+    async fn two_owners_concurrent_scans_impl() {
+        let archi = Path::new("/path/to/archifiltre");
+        let sink: EventSink = Arc::new(|_line: String| {});
+        let (db_a, path_a) = ("concurrent-a", "/path/to/sample-folder/node_modules/@types"); // ~160 dirs
+        let (db_b, path_b) = ("concurrent-b", "/path/to/archifiltre/src"); // distinct, smaller
+        for db in [db_a, db_b] {
+            let _ = std::fs::remove_dir_all(archi.join(format!("dbdata-{}", db)));
+        }
+        let owner_a = Owner::spawn("bun", &dev_args(db_a), Some(archi), sink.clone(), Arc::new(std::sync::Mutex::new(String::new()))).await.expect("spawn A");
+        let owner_b = Owner::spawn("bun", &dev_args(db_b), Some(archi), sink.clone(), Arc::new(std::sync::Mutex::new(String::new()))).await.expect("spawn B");
+
+        // Kick off BOTH scans, then confirm both are scanning AT THE SAME TIME.
+        let mut pa = serde_json::Map::new();
+        pa.insert("path".into(), json!(path_a));
+        pa.insert("batchSize".into(), json!(100));
+        let mut pb = serde_json::Map::new();
+        pb.insert("path".into(), json!(path_b));
+        pb.insert("batchSize".into(), json!(100));
+        assert!(owner_a.send_request(&req("sa", "start_scan", pa), 5000).await.unwrap().ok);
+        assert!(owner_b.send_request(&req("sb", "start_scan", pb), 5000).await.unwrap().ok);
+
+        // Both scanning concurrently + both serve a live read mid-scan.
+        let mut both_scanning_seen = false;
+        let mut live_reads_a = 0;
+        let mut live_reads_b = 0;
+        for _ in 0..40 {
+            // Sequential pings ms apart: both reporting `scanning` proves both
+            // processes are mid-scan at the same time (genuine concurrency).
+            let pa = owner_a.send_request(&req("pa", "ping", serde_json::Map::new()), 3000).await;
+            let pb = owner_b.send_request(&req("pb", "ping", serde_json::Map::new()), 3000).await;
+            let sa = pa.ok().and_then(|r| r.data).and_then(|d| d.get("scanning").and_then(|s| s.as_bool())).unwrap_or(false);
+            let sb = pb.ok().and_then(|r| r.data).and_then(|d| d.get("scanning").and_then(|s| s.as_bool())).unwrap_or(false);
+            if sa && sb { both_scanning_seen = true; }
+            // interleave a live read on each
+            if owner_a.send_request(&req("ra", "get_files", serde_json::Map::from_iter([("path".to_string(), json!(""))])), 3000).await.map(|r| r.ok).unwrap_or(false) { live_reads_a += 1; }
+            if owner_b.send_request(&req("rb", "get_files", serde_json::Map::from_iter([("path".to_string(), json!(""))])), 3000).await.map(|r| r.ok).unwrap_or(false) { live_reads_b += 1; }
+            if !sa && !sb { break; }
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+        assert!(both_scanning_seen, "expected BOTH owners scanning at the same time");
+
+        // Let both finish.
+        for owner in [&owner_a, &owner_b] {
+            for _ in 0..150 {
+                let scanning = owner.send_request(&req("pg", "ping", serde_json::Map::new()), 3000).await.unwrap()
+                    .data.and_then(|d| d.get("scanning").and_then(|s| s.as_bool())).unwrap_or(true);
+                if !scanning { break; }
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        }
+        let dirs_a = owner_a.send_request(&req("ta", "get_tree", serde_json::Map::new()), 8000).await.unwrap()
+            .data.and_then(|d| d.get("directories").and_then(|x| x.as_array()).map(|a| a.len())).unwrap_or(0);
+        let dirs_b = owner_b.send_request(&req("tb", "get_tree", serde_json::Map::new()), 8000).await.unwrap()
+            .data.and_then(|d| d.get("directories").and_then(|x| x.as_array()).map(|a| a.len())).unwrap_or(0);
+        owner_a.kill().await;
+        owner_b.kill().await;
+
+        // Isolation: each db has its OWN tree (distinct, non-zero, not cross-contaminated).
+        assert!(dirs_a > 0 && dirs_b > 0, "both trees non-empty (a={}, b={})", dirs_a, dirs_b);
+        assert_ne!(dirs_a, dirs_b, "the two scans should yield different trees (no shared/crossed db)");
+        println!("TWO-OWNERS OK: concurrent scanning seen; live reads a={} b={}; settled dirs a={} b={}", live_reads_a, live_reads_b, dirs_a, dirs_b);
+    }
+
+    /// Warm reuse: one process scans db A, then `switch_db`s to db B and back IN-PROCESS
+    /// (no respawn). Asserts the switch succeeds, the run id tracks across switches, and
+    /// A's data is intact after switching away and back.
+    #[test]
+    fn owner_switch_db_reuse() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(owner_switch_db_reuse_impl());
+    }
+
+    async fn owner_switch_db_reuse_impl() {
+        let archi = Path::new("/path/to/archifiltre");
+        let sink: EventSink = Arc::new(|_l: String| {});
+        let (db_a, path_a) = ("switch-a", "/path/to/archifiltre/src"); // ~9 dirs
+        let db_b = "switch-b";
+        for db in [db_a, db_b] {
+            let _ = std::fs::remove_dir_all(archi.join(format!("dbdata-{}", db)));
+        }
+        let owner = Owner::spawn("bun", &dev_args(db_a), Some(archi), sink, Arc::new(std::sync::Mutex::new(String::new()))).await.expect("spawn");
+
+        // Scan A to completion.
+        let mut p = serde_json::Map::new();
+        p.insert("path".into(), json!(path_a));
+        p.insert("batchSize".into(), json!(100));
+        assert!(owner.send_request(&req("s", "start_scan", p), 5000).await.unwrap().ok);
+        for _ in 0..120 {
+            let scanning = owner.send_request(&req("pg", "ping", serde_json::Map::new()), 3000).await.unwrap()
+                .data.and_then(|d| d.get("scanning").and_then(|s| s.as_bool())).unwrap_or(true);
+            if !scanning { break; }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        let dirs_a = owner.send_request(&req("ta", "get_tree", serde_json::Map::new()), 8000).await.unwrap()
+            .data.and_then(|d| d.get("directories").and_then(|x| x.as_array()).map(|a| a.len())).unwrap_or(0);
+        assert!(dirs_a > 0, "A scanned ({} dirs)", dirs_a);
+
+        // Switch to a fresh B (in-process), then back to A.
+        let t = std::time::Instant::now();
+        owner.switch_db(db_b, 20000).await.expect("switch to B");
+        let switch_b_ms = t.elapsed().as_millis();
+
+        let t = std::time::Instant::now();
+        owner.switch_db(db_a, 20000).await.expect("switch back to A");
+        let switch_a_ms = t.elapsed().as_millis();
+        // owner.run_id is refreshed only on (re)open — switching back to A must reload
+        // A's completed run from scan_metadata (non-empty) and A's tree must be intact.
+        let run_a2 = owner.run_id.lock().unwrap().clone();
+        let dirs_a2 = owner.send_request(&req("ta2", "get_tree", serde_json::Map::new()), 8000).await.unwrap()
+            .data.and_then(|d| d.get("directories").and_then(|x| x.as_array()).map(|a| a.len())).unwrap_or(0);
+        owner.kill().await;
+
+        assert!(!run_a2.is_empty(), "switch back to A must reload A's run id (got empty)");
+        assert_eq!(dirs_a, dirs_a2, "A's data must be intact after switch away+back");
+        println!("SWITCH-DB OK: A={} dirs (run {}), switch->B(fresh) {}ms, switch->A(existing) {}ms, A intact={}", dirs_a, run_a2, switch_b_ms, switch_a_ms, dirs_a == dirs_a2);
     }
 }

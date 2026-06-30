@@ -111,7 +111,8 @@ interface DuplicateGroup {
 
 async function handleGetTree(
   db: DatabaseConnection,
-  runId: string
+  runId: string,
+  scanning = false
 ): Promise<{ root: string | null; directories: DirectoryNode[] }> {
   // Get the root path from scan metadata
   const metadataResult = await db.db
@@ -122,16 +123,19 @@ async function handleGetTree(
 
   const rootPath = metadataResult[0]?.root_path || null;
 
-  // Ensure the per-directory aggregates are materialized for this run. They never
-  // go stale (a new scan = a new run_id), so this runs the heavy descendant join
-  // only once — on the first tree read — and auto-migrates scans made before the
-  // dir_stats table existed. Subsequent reads (incl. every enrichment re-query)
-  // just join the cached aggregates with the enrichment tables.
-  const populated = await db.db.execute(
-    sql`SELECT 1 FROM dir_stats WHERE run_id = ${runId} LIMIT 1`
-  );
-  if (populated.rows.length === 0) {
-    await populateDirStats(db, runId);
+  // Ensure the per-directory aggregates are materialized for this run. During an
+  // owner-mode scan, dir_stats is maintained incrementally (rollupDirStatsBatch) and
+  // this read just returns the partial-but-growing tree — so we must NOT lazily
+  // recompute here (that would double-count against the rollup). When NOT scanning,
+  // lazily materialize once for scans made before incremental maintenance existed
+  // (a new scan = a new run_id, so it never goes stale).
+  if (!scanning) {
+    const populated = await db.db.execute(
+      sql`SELECT 1 FROM dir_stats WHERE run_id = ${runId} LIMIT 1`
+    );
+    if (populated.rows.length === 0) {
+      await populateDirStats(db, runId);
+    }
   }
 
   // Read the materialized aggregates and join the (cheap) enrichment flags.
@@ -196,6 +200,56 @@ async function handleGetTree(
   });
 
   return { root: rootPath, directories };
+}
+
+/**
+ * Phase 5 SPIKE — live, DB-backed icicle tree, cheap enough to read DURING a scan
+ * (no dir_stats materialization). Depth-capped ancestor attribution scoped to a
+ * focus subtree: every file/dir adds to each ancestor from depth 1 down to depthCap,
+ * so directories at depth ≤ cap carry their FULL subtree rollup — identical to the
+ * provisional stream's accumulate(), but computed in SQL. Prefix-LIKE on path uses
+ * idx_files_path_pattern. `focusPath=''` = whole tree (root LOD, the worst case).
+ */
+async function handleGetLiveTree(
+  db: DatabaseConnection,
+  runId: string,
+  focusPath: string,
+  depthCap: number
+): Promise<{ directories: Array<{ path: string; total_size: number; file_count: number; dir_count: number }> }> {
+  const scope = focusPath
+    ? sql`AND (path = ${focusPath} OR path LIKE ${`${focusPath}/%`})`
+    : sql``;
+  const rows = (
+    await db.db.execute(sql`
+      SELECT
+        anc_path AS path,
+        COALESCE(SUM(CASE WHEN kind = 'file' THEN sz ELSE 0 END), 0) AS total_size,
+        COALESCE(SUM(CASE WHEN kind = 'file' THEN 1 ELSE 0 END), 0) AS file_count,
+        COALESCE(SUM(CASE WHEN kind = 'dir'  THEN 1 ELSE 0 END), 0) AS dir_count
+      FROM (
+        SELECT
+          array_to_string((string_to_array(f.path, '/'))[1:i.i], '/') AS anc_path,
+          CASE WHEN f.is_directory THEN 'dir' ELSE 'file' END AS kind,
+          f.physical_size AS sz
+        FROM (
+          SELECT path, physical_size, is_directory,
+            (length(path) - length(replace(path, '/', '')) + 1) AS segs
+          FROM files
+          WHERE run_id = ${runId} ${scope}
+        ) f
+        CROSS JOIN LATERAL generate_series(1, LEAST(f.segs - 1, ${depthCap})) AS i(i)
+      ) anc
+      GROUP BY anc_path
+    `)
+  ).rows as Array<{ path: string; total_size: string | number; file_count: string | number; dir_count: string | number }>;
+  return {
+    directories: rows.map(r => ({
+      path: r.path,
+      total_size: Number(r.total_size) || 0,
+      file_count: Number(r.file_count) || 0,
+      dir_count: Number(r.dir_count) || 0,
+    })),
+  };
 }
 
 async function handleGetFiles(
@@ -521,11 +575,19 @@ async function handleGetComposition(
 export async function dispatchQuery(
   database: DatabaseConnection,
   runId: string,
-  request: QueryRequest
+  request: QueryRequest,
+  scanning = false
 ): Promise<unknown> {
   switch (request.action) {
     case 'get_tree':
-      return await handleGetTree(database, runId);
+      return await handleGetTree(database, runId, scanning);
+    case 'get_live_tree':
+      return await handleGetLiveTree(
+        database,
+        runId,
+        (request.path as string) ?? '',
+        (request.depthCap as number) ?? 4
+      );
     case 'get_files':
       return await handleGetFiles(
         database,

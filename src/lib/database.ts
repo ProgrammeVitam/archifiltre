@@ -290,7 +290,135 @@ export async function populateDirStats(
 }
 
 /**
- * Create database connection
+ * Incrementally fold ONE ingestion batch into dir_stats — the live, DB-central
+ * maintenance that lets the icicle read the tree straight from the DB at any moment
+ * (and leaves dir_stats fully materialized by completion, so there's no one-shot
+ * populateDirStats recompute spike, and nothing is retained in JS across batches).
+ *
+ * Computes the batch's ancestor deltas in a transient Map (discarded after the
+ * UPSERT) and folds them in additively, producing EXACTLY what populateDirStats
+ * would: size/counts are additive; max_depth is a running GREATEST; deepest_path is
+ * argmax by depth then path. O(batch × depth) — independent of total table size.
+ */
+export async function rollupDirStatsBatch(
+  connection: DatabaseConnection,
+  runId: string,
+  batch: FileRow[]
+): Promise<void> {
+  type Delta = { size: number; files: number; dirs: number; maxDepth: number; deepest: string | null };
+  const deltas = new Map<string, Delta>();
+  const ensure = (p: string): Delta => {
+    let d = deltas.get(p);
+    if (!d) {
+      d = { size: 0, files: 0, dirs: 0, maxDepth: 0, deepest: null };
+      deltas.set(p, d);
+    }
+    return d;
+  };
+
+  for (const row of batch) {
+    const parts = row.path.split('/').filter(Boolean);
+    const segs = parts.length;
+    if (segs === 0) continue;
+    const size = row.physical_size ?? 0;
+    // Attribute the item to each ancestor directory (strict path prefix), exactly
+    // like populateDirStats's generate_series(1, segs - 1).
+    for (let i = 1; i < segs; i++) {
+      const anc = ensure(parts.slice(0, i).join('/'));
+      const relDepth = segs - i; // how many levels this item sits below the ancestor
+      if (row.is_directory) anc.dirs += 1;
+      else {
+        anc.size += size;
+        anc.files += 1;
+      }
+      // deepest = argmax by depth, tie-broken by the lexically-larger path (matches
+      // populateDirStats's MAX(lpad(segs) || path)).
+      if (relDepth > anc.maxDepth || (relDepth === anc.maxDepth && (anc.deepest === null || row.path > anc.deepest))) {
+        anc.maxDepth = relDepth;
+        anc.deepest = row.path;
+      }
+    }
+    // Every directory gets its own row even with no descendants (the UNION ALL in
+    // populateDirStats); folds in as a 0-delta and merges with descendant deltas.
+    if (row.is_directory) ensure(row.path);
+  }
+
+  if (deltas.size === 0) return;
+
+  const values = [...deltas.entries()].map(
+    ([path, d]) => sql`(${runId}, ${path}, ${d.size}, ${d.files}, ${d.dirs}, ${d.maxDepth}, ${d.deepest})`
+  );
+  await connection.db.execute(sql`
+    INSERT INTO dir_stats (run_id, path, total_size, file_count, dir_count, max_depth, deepest_path)
+    VALUES ${sql.join(values, sql`, `)}
+    ON CONFLICT (run_id, path) DO UPDATE SET
+      total_size = dir_stats.total_size + EXCLUDED.total_size,
+      file_count = dir_stats.file_count + EXCLUDED.file_count,
+      dir_count  = dir_stats.dir_count  + EXCLUDED.dir_count,
+      deepest_path = CASE
+        WHEN EXCLUDED.max_depth > dir_stats.max_depth THEN EXCLUDED.deepest_path
+        WHEN EXCLUDED.max_depth = dir_stats.max_depth AND EXCLUDED.deepest_path > dir_stats.deepest_path THEN EXCLUDED.deepest_path
+        ELSE dir_stats.deepest_path
+      END,
+      max_depth = GREATEST(dir_stats.max_depth, EXCLUDED.max_depth)
+  `);
+}
+
+// ── Warm-start template ──────────────────────────────────────────────────────
+// Opening a fresh datadir runs PGlite's initdb (~2.5–3 s — the bulk of the DB cold
+// start). Instead we keep ONE pre-initialized template PGDATA (clean: schema only,
+// no rows) and a new db just COPIES it (~125 ms) then opens it with initdb already
+// done. The template is built lazily in the BACKGROUND so the very first scan isn't
+// penalised (it inits normally and seeds the template for next time). Fully optional:
+// if the template isn't ready yet, createDatabase falls back to a normal init.
+let _templateBuilding = false;
+
+function templateDir(): string {
+  return path.join(path.dirname(path.resolve(createDatabasePath('_t'))), '.dbtemplate');
+}
+
+async function pathExists(p: string): Promise<boolean> {
+  try {
+    await fs.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Build the clean template PGDATA once (background, fire-and-forget). No-op if ready.
+ *  Call this when the process is IDLE (e.g. right after a scan completes) — its initdb
+ *  blocks the single JS thread, so it must NOT overlap an active scan. */
+export async function ensureTemplateInBackground(): Promise<void> {
+  const dir = templateDir();
+  const ready = `${dir}.ready`;
+  if (_templateBuilding || (await pathExists(ready))) return;
+  _templateBuilding = true;
+  try {
+    const build = `${dir}.building-${process.pid}`;
+    await fs.rm(build, { recursive: true, force: true });
+    await ensureDirectory(build);
+    const pg = new PGlite({ dataDir: build, ...(await getStandalonePGliteOptions()) });
+    await pg.waitReady;
+    await initializeSchema(drizzle(pg, { schema: { files } }));
+    await pg.close();
+    await fs.rm(dir, { recursive: true, force: true });
+    await fs.rename(build, dir); // atomic swap into place
+    await fs.writeFile(ready, 'v1'); // sibling marker (kept OUT of the copied PGDATA)
+    logger.debug('Warm-start template built', { dir });
+  } catch (error) {
+    logger.warn('Warm-start template build failed; using normal init', {
+      error: (error as Error).message,
+    });
+  } finally {
+    _templateBuilding = false;
+  }
+}
+
+/**
+ * Create database connection. A fresh datadir is seeded from the warm-start template
+ * (copy, no initdb) when one is ready; otherwise it inits normally and triggers a
+ * background template build for next time.
  */
 export async function createDatabase(name: string): Promise<DatabaseConnection> {
   try {
@@ -299,10 +427,16 @@ export async function createDatabase(name: string): Promise<DatabaseConnection> 
 
     logger.debug('Creating database', { name, dbPath, resolvedPath });
 
-    // Ensure directory exists
-    await ensureDirectory(resolvedPath);
+    const fresh = !(await pathExists(resolvedPath));
+    if (fresh && (await pathExists(`${templateDir()}.ready`))) {
+      // Warm path: copy the pre-initialized template instead of running initdb.
+      await fs.cp(templateDir(), resolvedPath, { recursive: true });
+    } else {
+      await ensureDirectory(resolvedPath);
+    }
 
-    // Initialize PGlite with explicit dataDir for standalone compatibility
+    // Initialize PGlite with explicit dataDir for standalone compatibility. Opening a
+    // copied (already-initialized) datadir skips initdb; a fresh one inits as before.
     const pg = new PGlite({
       dataDir: resolvedPath,
       ...(await getStandalonePGliteOptions()),
@@ -313,6 +447,7 @@ export async function createDatabase(name: string): Promise<DatabaseConnection> 
 
     const db = drizzle(pg, { schema: { files } });
 
+    // Idempotent — confirms schema on the copied template and catches any drift.
     await initializeSchema(db);
 
     logger.info('Database created', { name, path: resolvedPath });
@@ -359,7 +494,9 @@ export function cleanDatabase(
     if (preserveConnection) {
       logger.debug('Clearing scan data in place (preserveConnection)', { runId, dbName: connection.name });
       await connection.db.execute(sql`DELETE FROM dir_stats`);
-      await connection.db.execute(sql`DELETE FROM scan_metadata`);
+      // Keep THIS run's scan_metadata (written at scan start so the root path — and thus
+      // the live tree's identity — is available DURING the scan); clear only stale runs.
+      await connection.db.execute(sql`DELETE FROM scan_metadata WHERE run_id <> ${runId}`);
       await connection.db.execute(sql`DELETE FROM files`);
       return void 0;
     }
