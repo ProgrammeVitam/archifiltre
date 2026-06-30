@@ -19,7 +19,7 @@ import { Command, Flags } from '@oclif/core';
 import * as readline from 'node:readline';
 import * as os from 'node:os';
 import { firstValueFrom, type Subscription } from 'rxjs';
-import { initializeLogging } from '@lib/logging.ts';
+import { initializeLogging, logger } from '@lib/logging.ts';
 import {
   createScanDatabase,
   getLatestRunId,
@@ -148,6 +148,21 @@ export default class Session extends Command {
       level: 'info',
       enableConsoleLogging: false,
       enableFileLogging: true,
+    });
+
+    // The owner must NEVER die from a stray async error — read-while-scanning depends on
+    // it staying alive. Pausing/cancelling tears the scan pipeline down mid-flight, which
+    // orphans in-flight ops (PGlite txns, the concurrent walker, hashing); if one rejects,
+    // SURVIVE and log instead of exiting. An exit closes stdout → every in-flight UI query
+    // fails with "session closed before responding" (the pause-time visualization error).
+    process.on('unhandledRejection', reason => {
+      logger.error(
+        'Unhandled rejection in session (survived)',
+        reason instanceof Error ? reason : new Error(String(reason))
+      );
+    });
+    process.on('uncaughtException', err => {
+      logger.error('Uncaught exception in session (survived)', err);
     });
 
     this.database = await createScanDatabase(flags.db);

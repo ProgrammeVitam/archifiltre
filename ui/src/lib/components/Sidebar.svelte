@@ -1,5 +1,12 @@
 <script lang="ts">
-	import { scans, activeScanId, scansStore, type Scan } from '$lib/stores';
+	import {
+		scans,
+		activeScanId,
+		scansStore,
+		resumeScanningScan,
+		type Scan
+	} from '$lib/stores';
+	import { resumeScan, cancelScan } from '$lib/tauri';
 	import {
 		Plus as PlusIcon,
 		FolderInput as FolderInputIcon,
@@ -7,6 +14,8 @@
 		Loader2 as Loader2Icon,
 		CheckCircle2 as CheckCircle2Icon,
 		AlertCircle as AlertCircleIcon,
+		Pause as PauseIcon,
+		Play as PlayIcon,
 		PanelLeftClose as PanelLeftCloseIcon,
 		Trash2 as Trash2Icon
 	} from '@lucide/svelte';
@@ -35,10 +44,13 @@
 	function handleDeleteScan(e: MouseEvent, scan: Scan) {
 		e.stopPropagation();
 
-		if (scan.state === 'scanning') {
-			if (!confirm('A scan is in progress. Are you sure you want to delete it?')) {
+		if (scan.state === 'scanning' || scan.state === 'paused') {
+			if (!confirm('A scan is in progress. Closing it will stop the scan. Continue?')) {
 				return;
 			}
+			// Close = cancel: stop the owner's scan so it doesn't keep running in the
+			// background (data is kept by the frontier, but this tab is being discarded).
+			if (scan.dbName) void cancelScan(scan.dbName);
 		} else if (scan.state === 'complete') {
 			if (!confirm(`Delete "${scan.name}"? This will also delete the scan database.`)) {
 				return;
@@ -46,6 +58,19 @@
 		}
 
 		scansStore.closeScan(scan.id);
+	}
+
+	// Tab status icon doubles as a resume control: hovering the paused ⏸ flips to ▶.
+	async function handleResume(e: MouseEvent, scan: Scan) {
+		e.stopPropagation(); // don't select the tab
+		resumeScanningScan(scan.id);
+		if (scan.dbName) {
+			try {
+				await resumeScan(scan.dbName);
+			} catch {
+				/* progress will reconcile */
+			}
+		}
 	}
 
 	function toggleCollapsed() {
@@ -56,6 +81,8 @@
 		switch (state) {
 			case 'scanning':
 				return Loader2Icon;
+			case 'paused':
+				return PauseIcon;
 			case 'complete':
 				return CheckCircle2Icon;
 			case 'error':
@@ -69,6 +96,8 @@
 		switch (state) {
 			case 'scanning':
 				return 'text-blue-500';
+			case 'paused':
+				return 'text-amber-500';
 			case 'complete':
 				return 'text-green-500';
 			case 'error':
@@ -130,9 +159,20 @@
 				tabindex="0"
 				title={scan.path ?? scan.name}
 			>
-				<span class="scan-icon {stateClass}">
-					<Icon size={16} class={iconClass} />
-				</span>
+				{#if scan.state === 'paused'}
+					<button
+						class="scan-icon resume-icon {stateClass}"
+						onclick={(e) => handleResume(e, scan)}
+						title="Continue scan"
+					>
+						<PauseIcon size={16} class="paused-glyph" />
+						<PlayIcon size={16} class="resume-glyph" />
+					</button>
+				{:else}
+					<span class="scan-icon {stateClass}">
+						<Icon size={16} class={iconClass} />
+					</span>
+				{/if}
 				<span class="scan-name">{scan.name}</span>
 				<button class="delete-btn" onclick={(e) => handleDeleteScan(e, scan)} title="Delete scan">
 					<Trash2Icon size={14} />
@@ -325,6 +365,23 @@
 		align-items: center;
 		justify-content: center;
 		flex-shrink: 0;
+	}
+
+	/* Paused tab icon = a resume control: ⏸ by default, ▶ on hover. */
+	.resume-icon {
+		background: transparent;
+		border: none;
+		padding: 0;
+		cursor: pointer;
+	}
+	.resume-icon :global(.resume-glyph) {
+		display: none;
+	}
+	.resume-icon:hover :global(.paused-glyph) {
+		display: none;
+	}
+	.resume-icon:hover :global(.resume-glyph) {
+		display: inline;
 	}
 
 	.scan-name {

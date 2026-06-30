@@ -420,6 +420,31 @@ export async function sendQuery(request: QueryRequest, dbName?: string): Promise
 	return await invoke<QueryResponse>('send_query', { request });
 }
 
+// ── Scan control (owner mode) ──────────────────────────────────────────────
+// Routed through the session control channel (session_request), so a paused scan's
+// owner keeps all committed data and resume re-walks only the un-enumerated remainder.
+// `job:paused` streams back via onJobUpdate. NOTE: distinct from the legacy
+// pauseJob/resumeJob/cancelJob above, which drive the old CLI job-control signals.
+
+/** Pause the running scan on this db's owner (soft-stop; fully resumable). */
+export async function pauseScan(dbName: string): Promise<void> {
+	if (!useOwnerDb()) return;
+	await sendQuery({ id: `pause_${Date.now()}`, action: 'pause_scan' }, dbName);
+}
+
+/** Resume a paused/interrupted scan on this db's owner (re-runs with resume:true). */
+export async function resumeScan(dbName: string): Promise<void> {
+	if (!useOwnerDb()) return;
+	await sendQuery({ id: `resume_${Date.now()}`, action: 'resume_scan' }, dbName);
+}
+
+/** Stop the scan on this db's owner, persisted as cancelled — used when closing a tab.
+ *  Same mechanism as pause (data kept, resumable); only the persisted status differs. */
+export async function cancelScan(dbName: string): Promise<void> {
+	if (!useOwnerDb()) return;
+	await sendQuery({ id: `cancel_${Date.now()}`, action: 'cancel_scan' }, dbName);
+}
+
 /**
  * Check if a query session is currently active.
  */

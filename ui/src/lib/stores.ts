@@ -12,7 +12,7 @@ import type { Tag, TreeData, DirectoryNode } from '$lib/tauri';
 // Types
 // ================================
 
-export type ScanState = 'idle' | 'scanning' | 'complete' | 'error';
+export type ScanState = 'idle' | 'scanning' | 'paused' | 'complete' | 'error';
 
 export type Platform = 'windows' | 'macos' | 'gnome';
 
@@ -167,9 +167,11 @@ function saveToStorage(state: ScansState): void {
 			scans: state.scans.map((scan) => ({
 				...scan,
 				terminalOutput: [], // Clear terminal output for storage
-				// Reset scanning scans to idle (scan won't resume after restart)
-				state: scan.state === 'scanning' ? 'idle' : scan.state,
-				scanId: scan.state === 'scanning' ? null : scan.scanId
+				// An interrupted scan (still 'scanning' when the app closes) persists as
+				// 'paused', KEEPING scanId/dbName, so on relaunch the tab offers Continue
+				// (resume the frontier remainder) instead of dropping to the Drop-zone.
+				state: scan.state === 'scanning' ? 'paused' : scan.state,
+				scanId: scan.scanId
 			}))
 		};
 		localStorage.setItem(STORAGE_KEY, JSON.stringify(persistableState));
@@ -835,6 +837,17 @@ export function finishScanning(success: boolean): void {
 	if (scan) {
 		finishScanningScan(scan.id, success);
 	}
+}
+
+/** Mark a scan paused (keeps scanId/dbName + the partial data so the frozen tree shows
+ *  and Continue can resume). State only — the caller issues the owner pause_scan. */
+export function pauseScanningScan(scanId: string): void {
+	scansStore.updateScan(scanId, { state: 'paused' });
+}
+
+/** Mark a paused scan scanning again (the caller issues the owner resume_scan). */
+export function resumeScanningScan(scanId: string): void {
+	scansStore.updateScan(scanId, { state: 'scanning', errorMessage: null });
 }
 
 // Legacy alias

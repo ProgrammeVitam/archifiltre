@@ -10,6 +10,8 @@
 		parseScanOutputForScan,
 		startScanningScan,
 		finishScanningScan,
+		pauseScanningScan,
+		resumeScanningScan,
 		setErrorForScan,
 		resetScan,
 		viewMode,
@@ -136,6 +138,13 @@
 							clearProvisionalTree(scan.id);
 							finishScanningScan(scan.id, false);
 						}
+
+						// Scan paused (user pressed Pause, or cancel): keep the partial data and
+						// the frozen tree so it stays browseable; the status bar offers Continue.
+						if (parsed?.event === 'job:paused') {
+							addTerminalLineToScan(scan.id, '⏸ Scan paused', 'stdout');
+							pauseScanningScan(scan.id);
+						}
 					}
 				})
 			);
@@ -188,7 +197,8 @@
 				// Make the completed tab's OWN tree the one on screen. loadVisualizationData
 				// paints from the settled cache instantly when present, so switching back is
 				// instant and never blank; skipped when its tree is already shown (no storm).
-				if (scan.state === 'complete' && shownScanId !== scan.id) {
+				// 'paused' is browseable like 'complete' — load its partial tree from the DB.
+				if ((scan.state === 'complete' || scan.state === 'paused') && shownScanId !== scan.id) {
 					loadVisualizationData(scan.dbName, scan.id);
 				}
 			});
@@ -435,7 +445,7 @@
 	// !$selectedItem guard means it stands down once the user picks a folder.
 	$effect(() => {
 		if (
-			$activeScan?.state === 'complete' &&
+			($activeScan?.state === 'complete' || $activeScan?.state === 'paused') &&
 			shownScanId === $activeScan.id &&
 			treeData &&
 			statsData &&
@@ -604,7 +614,10 @@
 		{:else}
 			<SkeletonIcicle class="h-full" />
 		{/if}
-	{:else if $activeScan?.state === 'complete'}
+	{:else if $activeScan?.state === 'complete' || $activeScan?.state === 'paused'}
+		<!-- Complete OR paused: both show the (full / partial) visualization from the DB.
+		     A paused scan's tree is the frozen partial — browseable, with Continue in the
+		     status bar resuming the un-enumerated remainder. -->
 		<!-- Analysis Complete State with Visualization -->
 		<div class="flex h-full flex-col">
 			{#if isLoadingVisualization}
