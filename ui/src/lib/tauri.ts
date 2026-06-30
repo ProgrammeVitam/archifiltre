@@ -462,6 +462,32 @@ export async function deleteDatabase(dbName: string): Promise<void> {
 	}
 }
 
+// ── Undo / redo (per-scan enrichment history) ──────────────────────────────
+export interface UndoRedoState {
+	ok?: boolean; // whether an op was actually applied
+	summary?: string; // human description of the undone/redone op
+	canUndo: boolean;
+	canRedo: boolean;
+}
+
+/** Undo the last enrichment op on this scan's db. Returns the new can-undo/redo + summary. */
+export async function undo(dbName?: string): Promise<UndoRedoState | null> {
+	const res = await sendQuery({ id: `undo_${Date.now()}`, action: 'undo' }, dbName);
+	return res.ok ? (res.data as UndoRedoState) : null;
+}
+
+/** Redo the next enrichment op on this scan's db. */
+export async function redo(dbName?: string): Promise<UndoRedoState | null> {
+	const res = await sendQuery({ id: `redo_${Date.now()}`, action: 'redo' }, dbName);
+	return res.ok ? (res.data as UndoRedoState) : null;
+}
+
+/** Cheap can-undo / can-redo for enabling the controls. */
+export async function getUndoState(dbName?: string): Promise<{ canUndo: boolean; canRedo: boolean } | null> {
+	const res = await sendQuery({ id: `ustate_${Date.now()}`, action: 'undo_state' }, dbName);
+	return res.ok ? (res.data as { canUndo: boolean; canRedo: boolean }) : null;
+}
+
 /**
  * Check if a query session is currently active.
  */

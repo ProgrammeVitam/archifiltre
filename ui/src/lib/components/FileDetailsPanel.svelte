@@ -5,6 +5,7 @@
 		tagDictionary,
 		addTagToDictionary,
 		invalidateEnrichment,
+		enrichmentInvalidation,
 		reportSaveStatus,
 		scanResult
 	} from '$lib/stores';
@@ -210,6 +211,21 @@
 			commentInput = '';
 			tagInput = '';
 		}
+	});
+
+	// Re-query the selected element when ANY enrichment changes (undo/redo, or a tag
+	// touched elsewhere) so the panel reflects the new state without a selection change.
+	$effect(() => {
+		if (!$enrichmentInvalidation) return;
+		const item = $selectedItem;
+		if (!item) return;
+		getElementEnrichment(item.path).then((result) => {
+			if (($selectedItem?.path ?? null) === item.path) {
+				elementEnrichment = result;
+				aliasInput = result?.alias ?? '';
+				commentInput = result?.comment ?? '';
+			}
+		});
 	});
 
 	// The element's original (real) name, used to detect a no-op alias. Falls back

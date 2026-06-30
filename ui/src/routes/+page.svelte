@@ -44,6 +44,7 @@
 		type TreeData,
 		type ScanStats
 	} from '$lib/tauri';
+	import { doUndo, doRedo, refreshUndoState } from '$lib/history';
 	import { jobsStore } from '$lib/jobs';
 	import { Button } from '$lib/components/ui/button';
 	import { Alert, AlertDescription, AlertTitle } from '$lib/components/ui/alert';
@@ -544,6 +545,34 @@
 	}
 
 	// ================================
+	// Undo / redo (per-scan enrichment history) — actions live in $lib/history
+	// ================================
+
+	// Keep the header buttons' enabled state fresh: on tab switch and after any enrichment
+	// change (mutations + undo/redo both bump enrichmentInvalidation).
+	let undoStateDb = $derived($activeScan?.dbName);
+	$effect(() => {
+		undoStateDb;
+		$enrichmentInvalidation;
+		void refreshUndoState();
+	});
+
+	function handleHistoryKeydown(e: KeyboardEvent): void {
+		// Leave the browser's native text undo alone while editing a field.
+		const t = e.target as HTMLElement | null;
+		if (t && (t.isContentEditable || t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
+		if (!(e.metaKey || e.ctrlKey)) return;
+		const k = e.key.toLowerCase();
+		if (k === 'z' && !e.shiftKey) {
+			e.preventDefault();
+			void doUndo();
+		} else if ((k === 'z' && e.shiftKey) || k === 'y') {
+			e.preventDefault();
+			void doRedo();
+		}
+	}
+
+	// ================================
 	// Computed values for status bar
 	// ================================
 
@@ -559,6 +588,9 @@
 	);
 	let totalSize = $derived(activeStats?.totalPhysicalSize ?? $activeScan?.scanResult.totalSize ?? 0);
 </script>
+
+<!-- Global undo/redo: Cmd/Ctrl+Z and Cmd/Ctrl+Shift+Z (or Ctrl+Y). -->
+<svelte:window onkeydown={handleHistoryKeydown} />
 
 <!-- Main Container -->
 <div class="flex h-full flex-col">

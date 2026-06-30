@@ -13,6 +13,7 @@
 	} from '$lib/stores';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
+	import { ButtonGroup } from '$lib/components/ui/button-group';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import ArchifiltreLogo from '$lib/components/ArchifiltreLogo.svelte';
 	import {
@@ -22,8 +23,11 @@
 		PanelLeftIcon,
 		LayoutGridIcon,
 		FolderTreeIcon,
-		ListIcon
+		ListIcon,
+		Undo2Icon,
+		Redo2Icon
 	} from '@lucide/svelte';
+	import { doUndo, doRedo, undoRedoState } from '$lib/history';
 	import ExportDropdown from '$lib/components/ExportDropdown.svelte';
 	import BackgroundJobsPanel from '$lib/components/BackgroundJobsPanel.svelte';
 	import { extensionRegistry } from '$lib/extensions/registry';
@@ -147,6 +151,10 @@
 
 	// Derived state for showing view toggle and export button
 	let showViewControls = $derived($activeScan?.state === 'complete');
+	// Undo/redo + enrichment apply to a browseable scan — completed OR paused (partial tree).
+	let showHistoryControls = $derived(
+		$activeScan?.state === 'complete' || $activeScan?.state === 'paused'
+	);
 </script>
 
 <!-- Window container - padding and shadow only on Linux -->
@@ -297,60 +305,94 @@
 						</button>
 					{/if}
 
-					<!-- View toggle (Visual/Tree/Flat) - only shown when scan complete -->
+					<!-- View toggle (Visual/Tree/Flat) — the LEFT "lens" group. -->
 					{#if showViewControls}
-						<div class="titlebar-view-toggle" data-no-drag>
-							<button
-								class="view-toggle-btn"
-								class:active={$viewMode === 'stalactite'}
+						<ButtonGroup class="ml-3" data-no-drag>
+							<Button
+								variant="outline"
+								size="sm"
+								class="h-7 gap-1.5 text-xs {$viewMode === 'stalactite'
+									? 'bg-accent text-accent-foreground'
+									: 'text-muted-foreground'}"
 								onclick={() => setViewMode('stalactite')}
 								title="Visual view"
 							>
-								<LayoutGridIcon size={14} />
-								<span>Visual</span>
-							</button>
-							<button
-								class="view-toggle-btn"
-								class:active={$viewMode === 'tree'}
+								<LayoutGridIcon size={14} /> Visual
+							</Button>
+							<Button
+								variant="outline"
+								size="sm"
+								class="h-7 gap-1.5 text-xs {$viewMode === 'tree'
+									? 'bg-accent text-accent-foreground'
+									: 'text-muted-foreground'}"
 								onclick={() => setViewMode('tree')}
 								title="Tree view"
 							>
-								<FolderTreeIcon size={14} />
-								<span>Tree</span>
-							</button>
-							<button
-								class="view-toggle-btn"
-								class:active={$viewMode === 'flat'}
+								<FolderTreeIcon size={14} /> Tree
+							</Button>
+							<Button
+								variant="outline"
+								size="sm"
+								class="h-7 gap-1.5 text-xs {$viewMode === 'flat'
+									? 'bg-accent text-accent-foreground'
+									: 'text-muted-foreground'}"
 								onclick={() => setViewMode('flat')}
 								title="Flat list"
 							>
-								<ListIcon size={14} />
-								<span>Flat</span>
-							</button>
-						</div>
+								<ListIcon size={14} /> Flat
+							</Button>
+						</ButtonGroup>
 					{/if}
 
 					<!-- Spacer to push export and controls to the right -->
 					<div class="titlebar-spacer"></div>
 
+					<!-- Undo / redo — head of the right actions cluster (Cmd/Ctrl+Z mirror). -->
+					{#if showHistoryControls}
+						<ButtonGroup class="mr-2" data-no-drag>
+							<Button
+								variant="outline"
+								size="icon"
+								class="size-7"
+								disabled={!$undoRedoState.canUndo}
+								onclick={doUndo}
+								title="Undo (Ctrl+Z)"
+							>
+								<Undo2Icon size={14} />
+							</Button>
+							<Button
+								variant="outline"
+								size="icon"
+								class="size-7"
+								disabled={!$undoRedoState.canRedo}
+								onclick={doRedo}
+								title="Redo (Ctrl+Shift+Z)"
+							>
+								<Redo2Icon size={14} />
+							</Button>
+						</ButtonGroup>
+					{/if}
+
 					<!-- Icicle colour mode (Visual view only) -->
 					{#if showViewControls && $viewMode === 'stalactite'}
-						<div class="flex items-center gap-0.5 rounded-lg bg-muted p-[3px]" data-no-drag>
-							<button
-								class="cursor-pointer rounded-md border-none px-2.5 py-[5px] text-xs font-medium transition-all {$colorMode ===
-								'type'
-									? 'bg-background text-foreground shadow-sm'
-									: 'bg-transparent text-muted-foreground'}"
-								onclick={() => colorMode.set('type')}>Type</button
+						<ButtonGroup class="mr-2" data-no-drag>
+							<Button
+								variant="outline"
+								size="sm"
+								class="h-7 text-xs {$colorMode === 'type'
+									? 'bg-accent text-accent-foreground'
+									: 'text-muted-foreground'}"
+								onclick={() => colorMode.set('type')}>Type</Button
 							>
-							<button
-								class="cursor-pointer rounded-md border-none px-2.5 py-[5px] text-xs font-medium transition-all {$colorMode ===
-								'date'
-									? 'bg-background text-foreground shadow-sm'
-									: 'bg-transparent text-muted-foreground'}"
-								onclick={() => colorMode.set('date')}>Date</button
+							<Button
+								variant="outline"
+								size="sm"
+								class="h-7 text-xs {$colorMode === 'date'
+									? 'bg-accent text-accent-foreground'
+									: 'text-muted-foreground'}"
+								onclick={() => colorMode.set('date')}>Date</Button
 							>
-						</div>
+						</ButtonGroup>
 					{/if}
 
 					<!-- Export dropdown - only shown when scan complete -->
@@ -480,45 +522,6 @@
 		text-overflow: ellipsis;
 		white-space: nowrap;
 		color: var(--foreground);
-	}
-
-	/* ================================
-	   View Toggle Tabs
-	   ================================ */
-
-	.titlebar-view-toggle {
-		display: flex;
-		align-items: center;
-		gap: 2px;
-		background-color: var(--muted);
-		padding: 3px;
-		border-radius: 8px;
-		margin-left: 12px;
-	}
-
-	.view-toggle-btn {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-		padding: 5px 10px;
-		border: none;
-		border-radius: 6px;
-		background-color: transparent;
-		color: var(--muted-foreground);
-		font-size: 12px;
-		font-weight: 500;
-		cursor: pointer;
-		transition: all 0.15s ease;
-	}
-
-	.view-toggle-btn:hover {
-		color: var(--foreground);
-	}
-
-	.view-toggle-btn.active {
-		background-color: var(--background);
-		color: var(--foreground);
-		box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
 	}
 
 	/* ================================

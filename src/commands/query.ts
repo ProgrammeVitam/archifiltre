@@ -46,6 +46,9 @@ import {
   handleUnassignTag,
   handleGetEnrichment,
   handleGetElementEnrichment,
+  handleUndo,
+  handleRedo,
+  handleUndoState,
   ensureEnrichmentTables,
 } from '@extensions/enrichment/index.ts';
 
@@ -682,6 +685,12 @@ export async function dispatchQuery(
       return await handleGetEnrichment(database, runId);
     case 'get_element_enrichment':
       return await handleGetElementEnrichment(database, runId, (request.path as string) ?? '');
+    case 'undo':
+      return await handleUndo(database, runId);
+    case 'redo':
+      return await handleRedo(database, runId);
+    case 'undo_state':
+      return await handleUndoState(database, runId);
     default:
       throw new Error(`Unknown action: ${request.action}`);
   }
