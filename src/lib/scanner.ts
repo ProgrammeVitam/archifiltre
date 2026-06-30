@@ -1257,11 +1257,27 @@ function walkFilesConcurrent(
     let closed = false;
     let retryTimer: ReturnType<typeof setTimeout> | undefined;
 
+    // Auto-ramp the launch concurrency on MEASURED per-FS-op latency (no mount-type
+    // detection): stay near the floor on a fast local disk — there's no round-trip to hide,
+    // so extra concurrency is just overhead — and climb toward the cap on a slow NAS/cloud
+    // mount, where overlapping the latency is the whole game. The `concurrency` arg is the CAP.
+    const FLOOR = 4;
+    let ewmaOpMs = 0; // EWMA of per-op (readdir + per-file stat) wall-time, ms
+    const target = (): number =>
+      ewmaOpMs === 0
+        ? Math.min(8, concurrency) // initial, until we have a latency measure
+        : Math.max(FLOOR, Math.min(concurrency, Math.round(FLOOR + ewmaOpMs)));
+
     const launch = (currentDir: string): void => {
       active++;
       const currentRel = path.relative(rootPath, currentDir).replace(/\\/g, '/');
+      const startedAt = performance.now();
       void enumerateDir(rootPath, currentDir, enumeratedDirs, queued)
         .then(({ emitted, pushDirs }) => {
+          // per-op latency ≈ this dir's wall-time / (readdir + one stat per entry) → feed
+          // the ramp so concurrency tracks the mount's actual round-trip cost.
+          const perOp = (performance.now() - startedAt) / (emitted.length + 1);
+          ewmaOpMs = ewmaOpMs === 0 ? perOp : ewmaOpMs * 0.8 + perOp * 0.2;
           if (closed) return;
           for (const d of pushDirs) stack.push(d);
           for (const e of emitted) subscriber.next(e);
@@ -1282,7 +1298,7 @@ function walkFilesConcurrent(
       // Pause: stop launching new directories; complete once in-flight drains.
       const paused = shouldContinue ? !shouldContinue() : false;
       if (!paused) {
-        while (active < concurrency && stack.length > 0 && (!canEnumerate || canEnumerate())) {
+        while (active < target() && stack.length > 0 && (!canEnumerate || canEnumerate())) {
           launch(stack.pop()!);
         }
       }

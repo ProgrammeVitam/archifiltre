@@ -384,12 +384,14 @@ export default class Session extends Command {
       resume, // ← keep partial files + continue hashing from hash IS NULL
       frontier: true, // ← owner mode: discovery is always resumable (re-walk only remainder)
       shouldContinue: () => !this.scanPaused, // ← pause/cancel stops pulling new directories
-      // Concurrent enumeration (3b): the lever for high-latency NAS/cloud mounts. Default 16;
-      // overridable per scan. (A measured-latency auto-ramp is a planned follow-on.)
+      // Concurrent enumeration: the lever for high-latency NAS/cloud mounts. This is the
+      // CAP — the walker auto-ramps the live concurrency below it on measured per-op
+      // latency (≈floor on SSD, climbs to the cap on a slow mount). 32 matches the
+      // measured cloud sweet spot; overridable per scan.
       enumerateConcurrency:
         typeof req.enumerateConcurrency === 'number'
           ? Math.max(1, Math.min(64, req.enumerateConcurrency))
-          : 16,
+          : 32,
     };
 
     try {
