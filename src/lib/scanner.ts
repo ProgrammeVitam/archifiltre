@@ -9,12 +9,13 @@
 
 import * as path from 'node:path';
 import { promises as fsp } from 'node:fs';
-import type { Observable } from 'rxjs';
-import { from, of } from 'rxjs';
+import type { OperatorFunction } from 'rxjs';
+import { Observable, from, of, concat, firstValueFrom } from 'rxjs';
 import {
   tap,
   map,
   bufferCount,
+  bufferTime,
   finalize,
   switchMap,
   last,
@@ -34,12 +35,19 @@ import {
   cleanDatabase,
   insertFileBatch,
   rollupDirStatsBatch,
+  populateDirStats,
+  markEnumerated,
+  getFrontierDirs,
+  getEnumeratedDirs,
+  getFrontierArchives,
   findDuplicateSizes,
   countRealDuplicateGroups,
   type DatabaseConnection,
   type FileRow,
+  type FileSelect,
   files as _files,
 } from '@lib/database.ts';
+import { Frontier } from '@lib/frontier.ts';
 import { ArchiveReader } from 'libarchive-wasm';
 import { initializeLibarchiveWasm } from '@lib/libarchive-init.ts';
 import { performHashing } from '@lib/hash-calculator.ts';
@@ -355,7 +363,12 @@ async function processArchiveEntries(
 function processFileEntry(
   rootPath: string,
   entry: FileEntry,
-  config: ArchiveProcessingConfig
+  config: ArchiveProcessingConfig,
+  // Frontier producer signal for archives: an archive container is an enumeration unit
+  // whose children are its entries. Announce its exact child count once expanded, so the
+  // Frontier can stamp it when those entries commit (and stamp nested-but-unexpanded
+  // containers with 0 so they never sit on the frontier).
+  onUnitComplete?: (unit: string, count: number) => void
 ): Observable<FileEntry[]> {
   return from(
     (async () => {
@@ -382,7 +395,18 @@ function processFileEntry(
         };
 
         // Process the archive and return all entries (container + contents)
-        return await processArchiveEntries(entry.path, rootPath, archiveEntry, config);
+        const results = await processArchiveEntries(entry.path, rootPath, archiveEntry, config);
+        if (onUnitComplete) {
+          // results[0] is the container itself (belongs to its parent dir); results[1..]
+          // are its inner entries, all with archive_parent_path === entry.path.
+          onUnitComplete(entry.path, results.length - 1);
+          // Nested archive containers are detected but NOT expanded — stamp them done (0
+          // children) so they don't linger on the frontier and trigger futile re-reads.
+          for (const r of results) {
+            if (r.isArchiveContainer && r.path !== entry.path) onUnitComplete(r.path, 0);
+          }
+        }
+        return results;
       }
 
       // Regular file, return as-is
@@ -449,6 +473,39 @@ export interface ScanConfig {
    * datadir. Set together with betweenBatches for the single-owner session.
    */
   preserveConnection?: boolean;
+  /**
+   * Resume an interrupted scan instead of starting fresh: KEEP the existing `files`
+   * rows (so discovery's onConflictDoNothing skips them and hashing's `WHERE hash IS
+   * NULL` picks up exactly where it stopped) and only clear `dir_stats` — the re-walk
+   * emits every file once, so the incremental rollup rebuilds dir_stats correctly with
+   * no double-count. Requires the SAME runId as the partial data. Owner mode only
+   * (set with preserveConnection).
+   */
+  resume?: boolean;
+  /**
+   * Resumable DISCOVERY (Phase 7 increment 2). When set, every enumeration unit (a
+   * directory, or an archive container) is stamped `enumerated_at` once all its children
+   * commit, so a resume re-lists ONLY the un-stamped frontier instead of re-walking the
+   * whole tree (decisive on slow NAS/cloud mounts). Flag-gated and PARALLEL to the legacy
+   * walk: when unset, discovery behaves exactly as before. Pairs with `resume` to make
+   * resume cheap; on a fresh scan it just maintains the marks (≈free per the bench).
+   */
+  frontier?: boolean;
+  /**
+   * Cooperative pause gate, polled by the walker before it pops each directory. Returns
+   * true to keep going, false to stop pulling NEW work (in-flight readdir/stat drain).
+   * Set by the owner session's pause/resume control channel. Absent → never pauses.
+   */
+  shouldContinue?: () => boolean;
+  /**
+   * Enumerate directories concurrently (increment 3b). >1 turns the sequential walk into a
+   * bounded worker pool — the lever for high-latency NAS/cloud mounts, where enumeration is
+   * round-trip-bound and concurrency divides the wall-clock. Default 1 (sequential, legacy
+   * behaviour untouched); the owner session sets 16. Resumability/correctness are unaffected
+   * (the frontier reconciler is order-independent); the only effect is a wider but still
+   * cheap crash-replay set (~concurrency dirs).
+   */
+  enumerateConcurrency?: number;
 }
 
 export interface ScanResult {
@@ -578,13 +635,142 @@ export function scanDirectory(
     }
   };
 
-  // Phase 1: Clean database first (hot observable, no defer)
-  return cleanDatabase(connection, config.runId, config.preserveConnection).pipe(
-    tap(() => logger.debug('Database cleaned', { runId: config.runId })),
+  // ── Resumable-discovery frontier (increment 2) ──────────────────────────────
+  const FLUSH_T_MS = 500; // hybrid flush time cap — sim-derived, non-critical (see spec §4)
+  const ROW_CAP = config.batchSize || 1000;
+  const frontier = config.frontier ? new Frontier() : undefined;
+  // Incremental dir_stats rollup gives the live tree during a FRESH owner scan. On a
+  // FRONTIER RESUME we deliberately DON'T re-walk already-enumerated subtrees, so the
+  // rollup can't observe them — instead dir_stats is recomputed once at the end from the
+  // full `files` table (populateDirStats). Non-frontier resume still re-walks everything,
+  // so it keeps the incremental rollup.
+  const incrementalRollup = !!config.betweenBatches && !(config.frontier && config.resume);
+  const finalPopulate = !!config.frontier && !!config.resume;
+  // Hybrid flush (ROW_CAP rows OR FLUSH_T_MS) on the frontier path; the legacy fixed-count
+  // batching on the default path, byte-for-byte unchanged.
+  const bufferOp: OperatorFunction<FileRow, FileRow[]> = config.frontier
+    ? bufferTime<FileRow>(FLUSH_T_MS, null, ROW_CAP)
+    : bufferCount<FileRow>(ROW_CAP);
+  // Concurrent enumeration (increment 3b). The backpressure gate keeps the
+  // discovered-but-not-yet-ingested backlog bounded so a fast walker can't pile entries up
+  // in memory ahead of PGlite ingestion.
+  const enumerateConcurrency = Math.max(1, config.enumerateConcurrency ?? 1);
+  const ENUMERATE_HIGH_WATER = 50_000;
+  const canEnumerate = () => filesDiscovered - filesIngested < ENUMERATE_HIGH_WATER;
+
+  // A DB archive-container row → a synthetic FileEntry that re-expands when fed through
+  // processFileEntry (isArchiveContainer:false forces the archive path, not the skip).
+  const archiveRowToEntry = (row: FileSelect): FileEntry => ({
+    path: row.path,
+    physical_size: row.physical_size,
+    content_size: row.content_size,
+    mtime: row.mtime,
+    isDirectory: false,
+    isHidden: row.is_hidden,
+    isSystem: row.is_system,
+    isArchiveContainer: false,
+    archiveParentPath: row.archive_parent_path,
+    archiveDepth: row.archive_depth ?? 0,
+    archiveFormat: row.archive_format,
+    extractionError: null,
+  });
+
+  // Resume seed (frontier only). Returns empty on fresh/non-frontier scans, so the walk
+  // starts from root exactly as before.
+  const loadFrontierSeed = async (): Promise<{
+    seedDirs: string[];
+    enumeratedDirs: Set<string>;
+    archiveEntries: FileEntry[];
+  }> => {
+    if (!config.frontier || !config.resume) {
+      return { seedDirs: [], enumeratedDirs: new Set(), archiveEntries: [] };
+    }
+    const [seedDirs, enumDirs, archiveRows] = await Promise.all([
+      firstValueFrom(getFrontierDirs(connection, config.runId)),
+      firstValueFrom(getEnumeratedDirs(connection, config.runId)),
+      firstValueFrom(getFrontierArchives(connection, config.runId)),
+    ]);
+    // Re-expand only top-level archives; a nested archive can't be re-read standalone and
+    // is already stamped (0 children) at creation, so it shouldn't appear here anyway.
+    const archiveEntries = archiveRows.filter(r => !r.archive_parent_path).map(archiveRowToEntry);
+    logger.debug('Frontier resume seed loaded', {
+      runId: config.runId,
+      frontierDirs: seedDirs.length,
+      enumeratedDirs: enumDirs.length,
+      frontierArchives: archiveEntries.length,
+    });
+    return { seedDirs, enumeratedDirs: new Set(enumDirs), archiveEntries };
+  };
+
+  // Phase 1: Clean database first (hot observable, no defer). On resume this keeps the
+  // partial files and only clears dir_stats (frontier resume rebuilds it via populateDirStats).
+  return cleanDatabase(connection, config.runId, config.preserveConnection, config.resume).pipe(
+    tap(() =>
+      logger.debug('Database cleaned', {
+        runId: config.runId,
+        resume: config.resume,
+        frontier: config.frontier,
+      })
+    ),
+
+    // Frontier resume: dir_stats was just cleared and the already-enumerated subtrees won't
+    // be re-walked, so the live icicle would stay blank until the final populate at the end.
+    // Populate ONCE from the partial `files` now so the chart shows the ~done tree right
+    // away; the walk's remainder + the final populate fill in the rest. SEQUENCED before the
+    // walk (awaited, not fire-and-forget) — a fire-and-forget populate can land AFTER the
+    // final one and clobber it with stale partial aggregates.
+    switchMap(v =>
+      finalPopulate
+        ? from(populateDirStats(connection, config.runId)).pipe(
+            map(() => v),
+            catchError((err: unknown) => {
+              logger.warn('resume start populate failed', {
+                runId: config.runId,
+                error: (err as Error).message,
+              });
+              return of(v);
+            })
+          )
+        : of(v)
+    ),
+
+    // Load the resume frontier seed (no-op on fresh scans), then stream discovery.
+    switchMap(() => from(loadFrontierSeed())),
 
     // Phase 2-3: Streaming discovery + immediate ingestion (hot observable)
-    switchMap(() =>
-      from(walkFilesGenerator(config.rootPath, config.includeHidden)).pipe(
+    switchMap(seed => {
+      // Resume: the frontier dirs' own rows are durable from the prior run but won't be
+      // re-emitted (their parents are done), so tell the Frontier they're self-committed.
+      if (frontier && seed.seedDirs.length) frontier.seedSelfCommitted(seed.seedDirs);
+      const walkOpts: WalkOptions = {
+        shouldContinue: config.shouldContinue,
+        ...(frontier
+          ? {
+              onDirComplete: (rel: string, n: number) => frontier.unitComplete(rel, n),
+              seedDirs: seed.seedDirs,
+              enumeratedDirs: seed.enumeratedDirs,
+            }
+          : {}),
+      };
+      // Concurrent worker pool for high-latency mounts (3b), else the legacy sequential
+      // generator (default, byte-for-byte unchanged).
+      const walkerEntries =
+        enumerateConcurrency > 1
+          ? walkFilesConcurrent(
+              config.rootPath,
+              config.includeHidden,
+              walkOpts,
+              enumerateConcurrency,
+              canEnumerate
+            )
+          : from(walkFilesGenerator(config.rootPath, config.includeHidden, walkOpts));
+      // On resume, re-expand un-enumerated archives by feeding synthetic container entries
+      // AFTER the walk (they re-expand even when their parent dir is already enumerated).
+      const discovery = seed.archiveEntries.length
+        ? concat(walkerEntries, from(seed.archiveEntries))
+        : walkerEntries;
+
+      return discovery.pipe(
         tap(_entry => {
           filesDiscovered++;
 
@@ -602,9 +788,12 @@ export function scanDirectory(
         mergeMap(entry => {
           if (config.enableArchiveProcessing !== false) {
             const archiveConfig = getArchiveConfig(config);
-            return processFileEntry(config.rootPath, entry, archiveConfig).pipe(
-              mergeMap(entries => from(entries))
-            );
+            return processFileEntry(
+              config.rootPath,
+              entry,
+              archiveConfig,
+              frontier ? (u, c) => frontier.unitComplete(u, c) : undefined
+            ).pipe(mergeMap(entries => from(entries)));
           }
           return of(entry);
         }, config.archiveConcurrency ?? 7),
@@ -641,8 +830,8 @@ export function scanDirectory(
           }
         }),
 
-        // Batch for efficient database writes
-        bufferCount(config.batchSize || 1000),
+        // Batch for efficient database writes (hybrid flush on the frontier path)
+        bufferOp,
 
         // Insert batches with limited concurrency (PGlite handles concurrent writes).
         // With betweenBatches set (single-owner session) we drop to concurrency 1 and
@@ -671,7 +860,7 @@ export function scanDirectory(
               // tree LIVE from the DB and dir_stats is fully materialized by completion
               // (no one-shot populateDirStats spike). Own catchError so a rollup hiccup
               // never fails the batch. O(batch) — independent of table size.
-              config.betweenBatches
+              incrementalRollup
                 ? mergeMap((inserted: number) =>
                     from(rollupDirStatsBatch(connection, config.runId, batch)).pipe(
                       map(() => inserted),
@@ -685,6 +874,41 @@ export function scanDirectory(
                     )
                   )
                 : tap(),
+              // Frontier: stamp every unit whose children are now ALL committed, in a txn
+              // AFTER this (successful) insert. A failed batch emits 0 → we skip tallying
+              // and stamping, so its units stay on the frontier and replay.
+              //
+              // Deliberately a SEPARATE txn from the insert, not folded in: `rowsCommitted`
+              // tallies committed children, and it must run only AFTER the insert COMMITS —
+              // folding the stamp into the insert txn would force tallying before commit
+              // confirmation and leave the in-memory frontier inconsistent on a rollback.
+              // Strictly-after is safe (children are durable before the stamp); the worst a
+              // crash in the gap costs is re-walking a handful of dirs on resume.
+              //
+              // Marks are confirmed only once the stamp UPDATE itself commits; on failure
+              // they're requeued so the next drain retries (no silent re-walk on next resume).
+              frontier
+                ? mergeMap((inserted: number) => {
+                    if (inserted <= 0) return of(inserted);
+                    frontier.rowsCommitted(batch);
+                    const marks = frontier.takeReady();
+                    if (!marks.length) return of(inserted);
+                    return from(markEnumerated(connection, config.runId, marks)).pipe(
+                      map(() => {
+                        frontier.confirm(marks);
+                        return inserted;
+                      }),
+                      catchError(err => {
+                        frontier.requeue(marks);
+                        logger.warn('markEnumerated failed for batch', {
+                          runId: config.runId,
+                          error: (err as Error).message,
+                        });
+                        return of(inserted);
+                      })
+                    );
+                  })
+                : tap(),
               catchError(error => {
                 logger.error('Failed to insert batch', error as Error, {
                   runId: config.runId,
@@ -696,7 +920,10 @@ export function scanDirectory(
                 ? mergeMap((n: number) => from(config.betweenBatches!()).pipe(map(() => n)))
                 : tap()
             ),
-          config.betweenBatches ? 1 : 2
+          // Frontier mode REQUIRES concurrency 1: the reconciler's `rowsCommitted` tally is
+          // mutated here per batch and is not safe under interleaving. Tie it to `frontier`
+          // directly (not just `betweenBatches`) so the safety is explicit, not incidental.
+          config.frontier || config.betweenBatches ? 1 : 2
         ),
 
         // Final ingestion update
@@ -709,11 +936,42 @@ export function scanDirectory(
           emitProgress('ingestion', `ingested ${filesIngested.toLocaleString()} files`);
           emitTree(); // force a final provisional snapshot (full structure so far)
         })
-      )
-    ),
+      );
+    }),
 
     // Phase 4: Prefilter after ingestion completes
     last(), // Wait for ingestion to complete
+
+    // Frontier: drain any straggler marks (units whose producer-completion landed after
+    // their last child committed, with no further batch to flush them). Confirm on success;
+    // on failure leave them un-stamped → re-walked on the next resume (the safe fallback).
+    switchMap(v => {
+      if (!frontier) return of(v);
+      const marks = frontier.takeReady();
+      if (!marks.length) return of(v);
+      return from(markEnumerated(connection, config.runId, marks)).pipe(
+        map(() => {
+          frontier.confirm(marks);
+          return v;
+        }),
+        catchError(() => {
+          frontier.requeue(marks);
+          return of(v);
+        })
+      );
+    }),
+
+    // Frontier resume: dir_stats was cleared and NOT incrementally rolled up (we skipped
+    // the done subtrees), so recompute it once now from the full files table.
+    switchMap(v =>
+      finalPopulate
+        ? from(populateDirStats(connection, config.runId)).pipe(
+            map(() => v),
+            catchError(() => of(v))
+          )
+        : of(v)
+    ),
+
     switchMap(() => findDuplicateSizes(connection, config.runId)),
     tap(duplicateSizes => {
       logger.debug('Prefilter found potential duplicate sizes', {
@@ -728,18 +986,26 @@ export function scanDirectory(
 
     // Phase 5: Hash calculation for files with duplicate content_size
     switchMap(() =>
-      performHashing({ database: connection, runId: config.runId, rootPath: config.rootPath, betweenBatches: config.betweenBatches }, (processed, total, errors) => {
-        if (processed % 100 === 0 || processed === total) {
-          const percentage = total > 0 ? ((processed / total) * 100).toFixed(1) : '0.0';
-          const status = `hashed ${processed.toLocaleString()}/${total.toLocaleString()} files (${percentage}%)`;
-          emitProgress('hashing', errors > 0 ? `${status}, ${errors} errors` : status, {
-            filesHashed: processed,
-            filesToHash: total,
-            hashErrors: errors,
-            duplicateSizes: duplicateSizesCount,
-          });
+      performHashing(
+        {
+          database: connection,
+          runId: config.runId,
+          rootPath: config.rootPath,
+          betweenBatches: config.betweenBatches,
+        },
+        (processed, total, errors) => {
+          if (processed % 100 === 0 || processed === total) {
+            const percentage = total > 0 ? ((processed / total) * 100).toFixed(1) : '0.0';
+            const status = `hashed ${processed.toLocaleString()}/${total.toLocaleString()} files (${percentage}%)`;
+            emitProgress('hashing', errors > 0 ? `${status}, ${errors} errors` : status, {
+              filesHashed: processed,
+              filesToHash: total,
+              hashErrors: errors,
+              duplicateSizes: duplicateSizesCount,
+            });
+          }
         }
-      })
+      )
     ),
 
     // Phase 6: Real duplicate detection by hash
@@ -808,88 +1074,237 @@ function isDangerousPath(fullPath: string): boolean {
 }
 
 /**
- * Simple file walker like ArchiScan - stack-based approach (not recursive)
- * Yields files immediately as discovered for streaming processing
- * Catalogs ALL files with metadata flags for flexible filtering later
+ * Options that turn the plain walk into a resumable, pausable, frontier-aware one. All
+ * optional — with none of them set the walker behaves byte-for-byte like the original
+ * (fresh full DFS, no callbacks), so the legacy scan path is untouched.
  */
-async function* walkFilesGenerator(
+interface WalkOptions {
+  /** Called after a directory's readdir loop completes, with its relative path and the
+   *  exact number of child entries emitted — the producer signal the Frontier needs to
+   *  know when the directory's children are all accounted for. */
+  onDirComplete?: (relDir: string, childCount: number) => void;
+  /** Resume: relative directory paths still on the frontier, seeded onto the stack in
+   *  addition to root, so we re-list exactly the unfinished directories. */
+  seedDirs?: string[];
+  /** Resume: relative paths of already-enumerated directories. A subdirectory found while
+   *  re-listing is re-pushed ONLY if it is not in here — so completed subtrees are never
+   *  re-walked even though their (frontier) parent is being re-listed. */
+  enumeratedDirs?: Set<string>;
+  /** Cooperative pause: polled before popping each directory. false → stop pulling new
+   *  work (the generator returns; in-flight ops have already drained). */
+  shouldContinue?: () => boolean;
+}
+
+/**
+ * Enumerate ONE directory: readdir + stat + classify its entries. The shared core of both
+ * the sequential generator and the concurrent worker pool (so the classification rules
+ * live in exactly one place). Pure of any emit mechanism — returns the entries to emit and
+ * the absolute subdirectory paths to enqueue. Mutates `queued` (cross-call dedup) and
+ * honours `enumeratedDirs` (resume skip-set). Never throws — an unreadable dir/file is
+ * logged and contributes nothing (so a dir's child count stays exact).
+ */
+async function enumerateDir(
   rootPath: string,
-  _includeHidden = false
-): AsyncGenerator<FileEntry> {
-  const stack: string[] = [rootPath];
+  currentDir: string,
+  enumeratedDirs: Set<string> | undefined,
+  queued: Set<string>
+): Promise<{ emitted: FileEntry[]; pushDirs: string[] }> {
+  const emitted: FileEntry[] = [];
+  const pushDirs: string[] = [];
+  try {
+    const entries = await fsp.readdir(toLongPath(currentDir), { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name);
 
-  while (stack.length > 0) {
-    const currentDir = stack.pop()!;
+      // Only skip truly dangerous paths (virtual filesystems, etc.)
+      if (isDangerousPath(fullPath)) {
+        logger.debug('Skipping dangerous path', { path: fullPath });
+        continue;
+      }
 
-    try {
-      const entries = await fsp.readdir(toLongPath(currentDir), { withFileTypes: true });
+      const relativePath = path.relative(rootPath, fullPath).replace(/\\/g, '/');
+      const isHidden = isHiddenFile(entry.name);
+      const isSystem = isSystemFile(fullPath, entry.name);
 
-      for (const entry of entries) {
-        const fullPath = path.join(currentDir, entry.name);
-
-        // Only skip truly dangerous paths (virtual filesystems, etc.)
-        if (isDangerousPath(fullPath)) {
-          logger.debug('Skipping dangerous path', { path: fullPath });
-          continue;
+      if (entry.isDirectory()) {
+        // Enqueue — but on resume, never re-walk an already-enumerated subtree, and never
+        // queue the same dir twice. (Fresh scan: both sets empty/trivial, so every subdir
+        // is enqueued exactly once, as before.)
+        if (!(enumeratedDirs && enumeratedDirs.has(relativePath)) && !queued.has(relativePath)) {
+          queued.add(relativePath);
+          pushDirs.push(fullPath);
         }
-
-        const relativePath = path.relative(rootPath, fullPath).replace(/\\/g, '/');
-        const isHidden = isHiddenFile(entry.name);
-        const isSystem = isSystemFile(fullPath, entry.name);
-
-        if (entry.isDirectory()) {
-          // Add directory to stack for processing
-          stack.push(fullPath);
-
-          // Yield directory for complete inventory with metadata
-          yield {
+        emitted.push({
+          path: relativePath,
+          physical_size: 0,
+          content_size: null, // Directories don't have content_size
+          mtime: 0,
+          isDirectory: true,
+          isHidden,
+          isSystem,
+          isArchiveContainer: false,
+          archiveParentPath: null,
+          archiveDepth: 0,
+          archiveFormat: null,
+          extractionError: null,
+        });
+      } else if (entry.isFile()) {
+        try {
+          const stats = await fsp.stat(toLongPath(fullPath));
+          emitted.push({
             path: relativePath,
-            physical_size: 0,
-            content_size: null, // Directories don't have content_size
-            mtime: 0,
-            isDirectory: true,
+            physical_size: stats.size,
+            content_size: stats.size, // For regular files, content_size = physical_size (updated for archives)
+            mtime: Math.floor(stats.mtimeMs / 1000),
+            isDirectory: false,
             isHidden,
             isSystem,
-            isArchiveContainer: false,
+            isArchiveContainer: false, // Will be updated during archive processing
             archiveParentPath: null,
             archiveDepth: 0,
             archiveFormat: null,
             extractionError: null,
-          };
-        } else if (entry.isFile()) {
-          try {
-            const stats = await fsp.stat(toLongPath(fullPath));
-
-            // Yield file immediately with metadata for flexible filtering
-            yield {
-              path: relativePath,
-              physical_size: stats.size,
-              content_size: stats.size, // For regular files, content_size = physical_size (will be updated for archives)
-              mtime: Math.floor(stats.mtimeMs / 1000),
-              isDirectory: false,
-              isHidden,
-              isSystem,
-              isArchiveContainer: false, // Will be updated during archive processing
-              archiveParentPath: null,
-              archiveDepth: 0,
-              archiveFormat: null,
-              extractionError: null,
-            };
-          } catch (error) {
-            logger.warn('Cannot access file', {
-              path: fullPath,
-              error: (error as Error).message,
-            });
-          }
+          });
+        } catch (error) {
+          logger.warn('Cannot access file', { path: fullPath, error: (error as Error).message });
         }
       }
-    } catch (error) {
-      logger.warn('Cannot access directory', {
-        path: currentDir,
-        error: (error as Error).message,
-      });
+    }
+  } catch (error) {
+    logger.warn('Cannot access directory', {
+      path: currentDir,
+      error: (error as Error).message,
+    });
+  }
+  return { emitted, pushDirs };
+}
+
+/** Seed the walk stack: root first, then (on resume) every still-un-enumerated frontier
+ *  directory. Returns the `queued` dedup set pre-populated so re-finding a seeded dir while
+ *  re-listing its parent doesn't double-walk it. */
+function seedWalk(rootPath: string, seedDirs?: string[]): { stack: string[]; queued: Set<string> } {
+  const stack: string[] = [rootPath];
+  const queued = new Set<string>(['']); // '' = root rel
+  if (seedDirs) {
+    for (const rel of seedDirs) {
+      if (rel && !queued.has(rel)) {
+        queued.add(rel);
+        stack.push(path.join(rootPath, rel));
+      }
     }
   }
+  return { stack, queued };
+}
+
+/**
+ * Simple file walker like ArchiScan - stack-based approach (not recursive)
+ * Yields files immediately as discovered for streaming processing
+ * Catalogs ALL files with metadata flags for flexible filtering later
+ *
+ * Sequential (concurrency 1). The default/legacy path — behaviour is byte-for-byte as
+ * before. For concurrent enumeration (increment 3b) see walkFilesConcurrent.
+ */
+async function* walkFilesGenerator(
+  rootPath: string,
+  _includeHidden = false,
+  opts: WalkOptions = {}
+): AsyncGenerator<FileEntry> {
+  const { onDirComplete, seedDirs, enumeratedDirs, shouldContinue } = opts;
+  const { stack, queued } = seedWalk(rootPath, seedDirs);
+
+  while (stack.length > 0) {
+    // Pause: stop pulling NEW directories. Any readdir/stat already issued has resolved
+    // by the time we're back at the top of the loop, so this is the clean stop point.
+    if (shouldContinue && !shouldContinue()) return;
+
+    const currentDir = stack.pop()!;
+    const currentRel = path.relative(rootPath, currentDir).replace(/\\/g, '/');
+    const { emitted, pushDirs } = await enumerateDir(rootPath, currentDir, enumeratedDirs, queued);
+    for (const d of pushDirs) stack.push(d);
+    for (const e of emitted) yield e;
+
+    // Producer completion signal: this directory's children are all emitted. The Frontier
+    // stamps it enumerated once that many children have also COMMITTED.
+    onDirComplete?.(currentRel, emitted.length);
+  }
+}
+
+/**
+ * Concurrent file walker (increment 3b) — a bounded worker pool over the SAME frontier
+ * stack, so up to `concurrency` directories are readdir+stat'd at once. This is the lever
+ * for high-latency backends: enumeration cost is round-trips × latency ÷ concurrency, so a
+ * NAS/cloud scan that is minutes/hours sequential becomes seconds/minutes. Correctness is
+ * unchanged because the Frontier reconciler is ORDER-INDEPENDENT (each row carries its unit
+ * key) — concurrent, out-of-order emission still stamps every unit exactly when its
+ * children commit.
+ *
+ * `canEnumerate` is the backpressure gate: discovery must not outrun ingestion and pile up
+ * unbounded entries in memory (PGlite-is-the-centre). When it returns false the pool stops
+ * launching new directories until ingestion drains. Pause (`shouldContinue` false) stops
+ * launching and completes once in-flight directories drain; unsubscribe tears down at once.
+ */
+function walkFilesConcurrent(
+  rootPath: string,
+  _includeHidden: boolean | undefined,
+  opts: WalkOptions,
+  concurrency: number,
+  canEnumerate?: () => boolean
+): Observable<FileEntry> {
+  return new Observable<FileEntry>(subscriber => {
+    const { onDirComplete, seedDirs, enumeratedDirs, shouldContinue } = opts;
+    const { stack, queued } = seedWalk(rootPath, seedDirs);
+    let active = 0;
+    let closed = false;
+    let retryTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const launch = (currentDir: string): void => {
+      active++;
+      const currentRel = path.relative(rootPath, currentDir).replace(/\\/g, '/');
+      void enumerateDir(rootPath, currentDir, enumeratedDirs, queued)
+        .then(({ emitted, pushDirs }) => {
+          if (closed) return;
+          for (const d of pushDirs) stack.push(d);
+          for (const e of emitted) subscriber.next(e);
+          onDirComplete?.(currentRel, emitted.length);
+        })
+        .finally(() => {
+          active--;
+          if (!closed) pump();
+        });
+    };
+
+    const pump = (): void => {
+      if (closed) return;
+      if (retryTimer) {
+        clearTimeout(retryTimer);
+        retryTimer = undefined;
+      }
+      // Pause: stop launching new directories; complete once in-flight drains.
+      const paused = shouldContinue ? !shouldContinue() : false;
+      if (!paused) {
+        while (active < concurrency && stack.length > 0 && (!canEnumerate || canEnumerate())) {
+          launch(stack.pop()!);
+        }
+      }
+      // Done when nothing is in flight and either the stack is empty or we're paused.
+      if (active === 0 && (stack.length === 0 || paused)) {
+        closed = true;
+        subscriber.complete();
+        return;
+      }
+      // Backpressure (or pause) with work still queued but nothing in flight to re-trigger
+      // pump on completion → poll until the gate reopens.
+      if (active === 0 && stack.length > 0) {
+        retryTimer = setTimeout(pump, 10);
+      }
+    };
+
+    pump();
+    return () => {
+      closed = true;
+      if (retryTimer) clearTimeout(retryTimer);
+    };
+  });
 }
 
 /**

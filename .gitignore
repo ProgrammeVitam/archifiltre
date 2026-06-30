@@ -40,6 +40,10 @@ lerna-debug.log*
 
 # Database files
 dbdata-*/
+# Warm-start template (a pre-initialized PGDATA the first scan copies instead of running
+# initdb) + its ready marker — regenerated on demand, in-repo only in dev.
+.dbtemplate/
+.dbtemplate.ready
 *.sqlite
 *.db
 

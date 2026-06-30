@@ -59,6 +59,12 @@ export const files = pgTable(
     is_hidden: boolean('is_hidden').notNull(),
     is_system: boolean('is_system').notNull(),
     hash: text('hash'), // Only files get hashed, directories remain NULL
+    // Resumable-discovery frontier (Phase 7 increment 2): NULL = this enumeration unit
+    // (a directory, or an archive container) has NOT had all its children durably
+    // committed yet, so it's still on the frontier and must be (re-)enumerated on resume.
+    // Stamped (epoch seconds) only after the LAST child of the unit commits, in the same
+    // transaction (see frontier.ts / scanner.ts).
+    enumerated_at: integer('enumerated_at'),
     // Archive preprocessing fields
     is_archive_container: boolean('is_archive_container').default(false),
     archive_parent_path: text('archive_parent_path'), // Path to parent archive if nested
@@ -93,6 +99,9 @@ export const scanMetadata = pgTable('scan_metadata', {
   started_at: integer('started_at').notNull(),
   completed_at: integer('completed_at'),
   file_count: integer('file_count'),
+  // running | paused | complete | cancelled — drives the UI's "Continue" vs live vs
+  // done state without inferring from completed_at. NULL on legacy rows.
+  status: text('status'),
 });
 
 // === Types ===
@@ -146,6 +155,7 @@ async function initializeSchema(db: ReturnType<typeof drizzle>): Promise<void> {
         is_hidden BOOLEAN NOT NULL,
         is_system BOOLEAN NOT NULL,
         hash TEXT,
+        enumerated_at INTEGER,
         is_archive_container BOOLEAN DEFAULT FALSE,
         archive_parent_path TEXT,
         archive_depth INTEGER DEFAULT 0,
@@ -154,6 +164,11 @@ async function initializeSchema(db: ReturnType<typeof drizzle>): Promise<void> {
         CONSTRAINT files_pkey PRIMARY KEY (run_id, path)
       )
     `);
+
+    // Migration for datadirs created before the frontier column existed (the CREATE
+    // TABLE above is IF NOT EXISTS, so an existing table keeps its old shape). Also
+    // covers the warm-start template once it's copied. Idempotent.
+    await db.execute(sql`ALTER TABLE files ADD COLUMN IF NOT EXISTS enumerated_at INTEGER`);
 
     // Create indexes for performance
     await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_files_run_id ON files (run_id)`);
@@ -182,6 +197,12 @@ async function initializeSchema(db: ReturnType<typeof drizzle>): Promise<void> {
     await db.execute(
       sql`CREATE INDEX IF NOT EXISTS idx_files_archive_depth ON files (archive_depth)`
     );
+    // Frontier lookup on resume: the set of un-enumerated units per run. Partial index —
+    // only frontier rows are indexed, so it stays tiny (empties out as the scan completes)
+    // and the resume seed query is a cheap index scan, not a table scan.
+    await db.execute(
+      sql`CREATE INDEX IF NOT EXISTS idx_files_frontier ON files (run_id) WHERE enumerated_at IS NULL`
+    );
 
     // Create scan_metadata table - stores information about each scan run
     await db.execute(sql`
@@ -190,9 +211,14 @@ async function initializeSchema(db: ReturnType<typeof drizzle>): Promise<void> {
         root_path TEXT NOT NULL,
         started_at INTEGER NOT NULL,
         completed_at INTEGER,
-        file_count INTEGER
+        file_count INTEGER,
+        status TEXT
       )
     `);
+    // Migration for pre-existing scan_metadata tables (CREATE above is IF NOT EXISTS).
+    // status ∈ running|paused|complete|cancelled; NULL on old rows is treated as
+    // 'complete' if completed_at is set, else 'running'.
+    await db.execute(sql`ALTER TABLE scan_metadata ADD COLUMN IF NOT EXISTS status TEXT`);
 
     // Materialized per-directory aggregates (size/counts + max subtree depth).
     // Computed once per run (see populateDirStats) so get_tree is O(dirs) instead
@@ -243,7 +269,14 @@ export async function populateDirStats(
   connection: DatabaseConnection,
   runId: string
 ): Promise<void> {
-  await connection.db.execute(sql`
+  // Idempotent: clear this run's rows first so it can run more than once (a frontier
+  // resume populates from the PARTIAL files at the start so the icicle isn't blank, then
+  // from the COMPLETE tree at the end). Without the clear, the second INSERT collides on
+  // the (run_id, path) PK and ON CONFLICT DO NOTHING keeps the stale partial. Wrapped in a
+  // txn so a concurrent get_tree never sees a half-cleared table.
+  await connection.db.transaction(async tx => {
+    await tx.execute(sql`DELETE FROM dir_stats WHERE run_id = ${runId}`);
+    await tx.execute(sql`
     INSERT INTO dir_stats (run_id, path, total_size, file_count, dir_count, max_depth, deepest_path)
     SELECT
       ${runId} AS run_id,
@@ -287,6 +320,7 @@ export async function populateDirStats(
     GROUP BY anc.anc_path
     ON CONFLICT (run_id, path) DO NOTHING
   `);
+  });
 }
 
 /**
@@ -305,7 +339,13 @@ export async function rollupDirStatsBatch(
   runId: string,
   batch: FileRow[]
 ): Promise<void> {
-  type Delta = { size: number; files: number; dirs: number; maxDepth: number; deepest: string | null };
+  type Delta = {
+    size: number;
+    files: number;
+    dirs: number;
+    maxDepth: number;
+    deepest: string | null;
+  };
   const deltas = new Map<string, Delta>();
   const ensure = (p: string): Delta => {
     let d = deltas.get(p);
@@ -333,7 +373,10 @@ export async function rollupDirStatsBatch(
       }
       // deepest = argmax by depth, tie-broken by the lexically-larger path (matches
       // populateDirStats's MAX(lpad(segs) || path)).
-      if (relDepth > anc.maxDepth || (relDepth === anc.maxDepth && (anc.deepest === null || row.path > anc.deepest))) {
+      if (
+        relDepth > anc.maxDepth ||
+        (relDepth === anc.maxDepth && (anc.deepest === null || row.path > anc.deepest))
+      ) {
         anc.maxDepth = relDepth;
         anc.deepest = row.path;
       }
@@ -346,7 +389,8 @@ export async function rollupDirStatsBatch(
   if (deltas.size === 0) return;
 
   const values = [...deltas.entries()].map(
-    ([path, d]) => sql`(${runId}, ${path}, ${d.size}, ${d.files}, ${d.dirs}, ${d.maxDepth}, ${d.deepest})`
+    ([path, d]) =>
+      sql`(${runId}, ${path}, ${d.size}, ${d.files}, ${d.dirs}, ${d.maxDepth}, ${d.deepest})`
   );
   await connection.db.execute(sql`
     INSERT INTO dir_stats (run_id, path, total_size, file_count, dir_count, max_depth, deepest_path)
@@ -362,6 +406,125 @@ export async function rollupDirStatsBatch(
       END,
       max_depth = GREATEST(dir_stats.max_depth, EXCLUDED.max_depth)
   `);
+}
+
+/**
+ * Frontier (Phase 7 increment 2): stamp `enumerated_at` on a set of enumeration units
+ * (directory or archive-container paths) whose children are now ALL durably committed.
+ * Runs in its OWN transaction, AFTER the batch that committed those children — never
+ * before. That ordering is the safety property: a crash (or a failed mark) between the
+ * insert and the mark leaves the unit un-stamped, so resume re-enumerates it (idempotent
+ * re-insert + re-stamp). We therefore never need insert+mark in one txn for correctness;
+ * the only cost is one small extra UPDATE per batch. Chunked to keep the IN-list bounded.
+ */
+export async function markEnumerated(
+  connection: DatabaseConnection,
+  runId: string,
+  unitPaths: string[]
+): Promise<void> {
+  if (!unitPaths.length) return;
+  const at = Math.floor(Date.now() / 1000);
+  for (let i = 0; i < unitPaths.length; i += 1000) {
+    const chunk = unitPaths.slice(i, i + 1000);
+    await connection.db
+      .update(files)
+      .set({ enumerated_at: at })
+      .where(and(eq(files.run_id, runId), inArray(files.path, chunk)));
+  }
+}
+
+/**
+ * Resume seed — directories still on the frontier (children not all committed). The
+ * walker re-readdirs exactly these (plus root); enumerated subtrees are read from the DB,
+ * never re-listed. Backed by the partial idx_files_frontier index.
+ */
+export function getFrontierDirs(
+  connection: DatabaseConnection,
+  runId: string
+): Observable<string[]> {
+  return defer(() =>
+    from(
+      connection.db
+        .select({ path: files.path })
+        .from(files)
+        .where(
+          and(
+            eq(files.run_id, runId),
+            eq(files.is_directory, true),
+            // Real filesystem directories only. Directory ENTRIES inside an archive carry
+            // is_directory=true but are produced by expanding their container (never
+            // readdir'd), so they're not frontier units and stay enumerated_at=NULL — must
+            // not be re-listed on resume.
+            isNull(files.archive_parent_path),
+            isNull(files.enumerated_at)
+          )
+        )
+    ).pipe(
+      map(rows => rows.map(r => r.path)),
+      catchError(error => {
+        logger.error('Failed to load frontier dirs', error as Error, { runId });
+        return of([]);
+      })
+    )
+  );
+}
+
+/**
+ * Resume seed — the set of ALREADY-enumerated directory paths. During the resume walk,
+ * a subdirectory found inside a frontier dir is re-pushed ONLY if it is not in this set,
+ * so completed subtrees are never re-walked even though their parent was on the frontier.
+ */
+export function getEnumeratedDirs(
+  connection: DatabaseConnection,
+  runId: string
+): Observable<string[]> {
+  return defer(() =>
+    from(
+      connection.db
+        .select({ path: files.path })
+        .from(files)
+        .where(
+          and(eq(files.run_id, runId), eq(files.is_directory, true), isNotNull(files.enumerated_at))
+        )
+    ).pipe(
+      map(rows => rows.map(r => r.path)),
+      catchError(error => {
+        logger.error('Failed to load enumerated dirs', error as Error, { runId });
+        return of([]);
+      })
+    )
+  );
+}
+
+/**
+ * Resume seed — archive containers still on the frontier (their inner entries weren't all
+ * committed). These re-expand by re-reading the archive file directly, NOT by re-walking,
+ * because an archive can be un-enumerated even under a fully-enumerated parent directory
+ * (the container row is a child of its parent dir; its inner entries are a separate unit).
+ */
+export function getFrontierArchives(
+  connection: DatabaseConnection,
+  runId: string
+): Observable<FileSelect[]> {
+  return defer(() =>
+    from(
+      connection.db
+        .select()
+        .from(files)
+        .where(
+          and(
+            eq(files.run_id, runId),
+            eq(files.is_archive_container, true),
+            isNull(files.enumerated_at)
+          )
+        )
+    ).pipe(
+      catchError(error => {
+        logger.error('Failed to load frontier archives', error as Error, { runId });
+        return of([]);
+      })
+    )
+  );
 }
 
 // ── Warm-start template ──────────────────────────────────────────────────────
@@ -483,7 +646,8 @@ export async function closeDatabase(connection: DatabaseConnection): Promise<voi
 export function cleanDatabase(
   connection: DatabaseConnection,
   runId: string,
-  preserveConnection = false
+  preserveConnection = false,
+  resume = false
 ): Observable<void> {
   return defer(async () => {
     // Single-owner session: the connection is shared with live readers, so it must
@@ -492,12 +656,22 @@ export function cleanDatabase(
     // queries join). Clear the scan-data tables in place instead; the schema +
     // enrichment tables created at startup stay intact.
     if (preserveConnection) {
-      logger.debug('Clearing scan data in place (preserveConnection)', { runId, dbName: connection.name });
+      logger.debug('Clearing scan data in place (preserveConnection)', {
+        runId,
+        resume,
+        dbName: connection.name,
+      });
+      // dir_stats is always cleared: the re-walk re-emits every file, so the
+      // incremental rollup rebuilds it from scratch with no double-count.
       await connection.db.execute(sql`DELETE FROM dir_stats`);
       // Keep THIS run's scan_metadata (written at scan start so the root path — and thus
       // the live tree's identity — is available DURING the scan); clear only stale runs.
       await connection.db.execute(sql`DELETE FROM scan_metadata WHERE run_id <> ${runId}`);
-      await connection.db.execute(sql`DELETE FROM files`);
+      // Resume: KEEP the partial `files` rows so discovery skips them (onConflictDoNothing)
+      // and hashing continues from `hash IS NULL`. Fresh scan: wipe them.
+      if (!resume) {
+        await connection.db.execute(sql`DELETE FROM files`);
+      }
       return void 0;
     }
 
@@ -932,11 +1106,17 @@ export function insertScanMetadata(
 ): Observable<void> {
   return defer(() => {
     return from(
-      connection.db.insert(scanMetadata).values({
-        run_id: runId,
-        root_path: rootPath,
-        started_at: startedAt,
-      })
+      // onConflictDoNothing: on RESUME this row already exists (written at the original
+      // scan start) — re-inserting must be a harmless no-op, not a PK violation.
+      connection.db
+        .insert(scanMetadata)
+        .values({
+          run_id: runId,
+          root_path: rootPath,
+          started_at: startedAt,
+          status: 'running',
+        })
+        .onConflictDoNothing()
     ).pipe(
       map(() => void 0),
       tap(() => logger.debug('Scan metadata inserted', { runId, rootPath })),
@@ -961,7 +1141,7 @@ export function updateScanMetadata(
     return from(
       connection.db
         .update(scanMetadata)
-        .set({ completed_at: completedAt, file_count: fileCount })
+        .set({ completed_at: completedAt, file_count: fileCount, status: 'complete' })
         .where(eq(scanMetadata.run_id, runId))
     ).pipe(
       map(() => void 0),
@@ -972,6 +1152,29 @@ export function updateScanMetadata(
       })
     );
   });
+}
+
+/**
+ * Set just the lifecycle status of a run (running | paused | complete | cancelled).
+ * Used by the owner session's pause/resume/cancel control channel. Resume re-sets
+ * 'running' (insertScanMetadata's onConflictDoNothing won't, since the row exists).
+ */
+export function setScanStatus(
+  connection: DatabaseConnection,
+  runId: string,
+  status: 'running' | 'paused' | 'complete' | 'cancelled'
+): Observable<void> {
+  return defer(() =>
+    from(
+      connection.db.update(scanMetadata).set({ status }).where(eq(scanMetadata.run_id, runId))
+    ).pipe(
+      map(() => void 0),
+      catchError(error => {
+        logger.error('Failed to set scan status', error as Error, { runId, status });
+        return of(void 0);
+      })
+    )
+  );
 }
 
 /**
@@ -1019,5 +1222,10 @@ export const dbOperations = {
   healthCheck: checkHealth,
   insertScanMetadata,
   updateScanMetadata,
+  setScanStatus,
   getScanMetadata,
+  markEnumerated,
+  getFrontierDirs,
+  getEnumeratedDirs,
+  getFrontierArchives,
 };

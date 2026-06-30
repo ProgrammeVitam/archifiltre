@@ -18,13 +18,15 @@
 import { Command, Flags } from '@oclif/core';
 import * as readline from 'node:readline';
 import * as os from 'node:os';
-import { lastValueFrom } from 'rxjs';
+import { firstValueFrom, type Subscription } from 'rxjs';
 import { initializeLogging } from '@lib/logging.ts';
 import {
   createScanDatabase,
   getLatestRunId,
   insertScanMetadata,
   updateScanMetadata,
+  setScanStatus,
+  getScanMetadata,
   ensureTemplateInBackground,
   type DatabaseConnection,
 } from '@lib/database.ts';
@@ -34,6 +36,7 @@ import {
   scanProgressMetrics,
   type ScanConfig,
   type ScanProgressEvent,
+  type ScanResult,
 } from '@lib/scanner.ts';
 import { ensureEnrichmentTables } from '@extensions/enrichment/index.ts';
 import { dispatchQuery, type QueryRequest } from './query.ts';
@@ -50,6 +53,15 @@ export default class Session extends Command {
   private database: DatabaseConnection | undefined;
   private runId: string | undefined;
   private scanning = false;
+  /** The live scan's subscription, so pause/cancel can stop it (an intentional "soft
+   *  crash"): unsubscribe tears the pipeline down mid-flight; the frontier means resume
+   *  re-walks only the un-enumerated remainder. undefined when no scan is running. */
+  private scanSubscription: Subscription | undefined;
+  /** Set true on pause/cancel — the walker polls it (shouldContinue) and stops pulling new
+   *  directories. Belt-and-suspenders with unsubscribe. */
+  private scanPaused = false;
+  /** jobId of the running scan, so a pause triggered out-of-band can address job:paused. */
+  private currentJobId = '';
   /** True while switch_db swaps the connection, so a second switch can't race it. */
   private switching = false;
   /** In-flight read queries. The scan's betweenBatches hook waits on this so reads
@@ -90,15 +102,15 @@ export default class Session extends Command {
   private async betweenBatches(): Promise<void> {
     const workMs = this.batchStart ? Date.now() - this.batchStart : 0;
     // (1) read priority
-    await new Promise<void>((r) => setImmediate(r));
+    await new Promise<void>(r => setImmediate(r));
     while (this.pendingReads > 0) {
-      await new Promise<void>((r) => setImmediate(r));
+      await new Promise<void>(r => setImmediate(r));
     }
     // (2) duty-cycle backoff: to run at `budget` duty, idle workMs*(1/budget - 1).
     const budget = this.effectiveBudget();
     if (budget < 1 && workMs > 0) {
       const sleepMs = Math.min(250, Math.round(workMs * (1 / budget - 1)));
-      if (sleepMs > 0) await new Promise<void>((r) => setTimeout(r, sleepMs));
+      if (sleepMs > 0) await new Promise<void>(r => setTimeout(r, sleepMs));
     }
     this.batchStart = Date.now();
   }
@@ -112,7 +124,7 @@ export default class Session extends Command {
       const now = Date.now();
       const d = process.cpuUsage(lastCpu); // delta since last sample, microseconds
       const elapsed = now - lastT;
-      const cpuPct = elapsed > 0 ? Math.round((d.user + d.system) / 1000 / elapsed * 100) : 0;
+      const cpuPct = elapsed > 0 ? Math.round(((d.user + d.system) / 1000 / elapsed) * 100) : 0;
       lastCpu = process.cpuUsage();
       lastT = now;
       this.send({
@@ -132,7 +144,11 @@ export default class Session extends Command {
     const { flags } = await this.parse(Session);
 
     // Console logging OFF — stdout is the JSON protocol.
-    await initializeLogging({ level: 'info', enableConsoleLogging: false, enableFileLogging: true });
+    await initializeLogging({
+      level: 'info',
+      enableConsoleLogging: false,
+      enableFileLogging: true,
+    });
 
     this.database = await createScanDatabase(flags.db);
     await ensureEnrichmentTables(this.database);
@@ -157,7 +173,7 @@ export default class Session extends Command {
     }
 
     const rl = readline.createInterface({ input: process.stdin, terminal: false });
-    rl.on('line', (line) => {
+    rl.on('line', line => {
       const trimmed = line.trim();
       if (trimmed) void this.handle(trimmed);
     });
@@ -185,8 +201,26 @@ export default class Session extends Command {
         return;
       }
 
+      // ── Pause / cancel / resume control channel (Phase 7 increment 3) ──────────
+      // pause and cancel are the same mechanism (stop the scan, keep all data, stay
+      // resumable); they differ only in the persisted status. resume re-runs the scan
+      // with resume:true — the frontier makes that cheap (re-walk only the remainder).
+      if (action === 'pause_scan' || action === 'cancel_scan') {
+        await this.stopScan(action === 'pause_scan' ? 'paused' : 'cancelled');
+        this.send({ id, ok: true });
+        return;
+      }
+      if (action === 'resume_scan') {
+        await this.handleResumeScan(req);
+        return;
+      }
+
       if (action === 'ping') {
-        this.send({ id, ok: true, data: { pong: true, scanning: this.scanning, run_id: this.runId ?? null } });
+        this.send({
+          id,
+          ok: true,
+          data: { pong: true, scanning: this.scanning, run_id: this.runId ?? null },
+        });
         return;
       }
 
@@ -256,8 +290,8 @@ export default class Session extends Command {
     this.switching = true;
     try {
       // Drain in-flight reads on the current connection before swapping it out.
-      await new Promise<void>((r) => setImmediate(r));
-      while (this.pendingReads > 0) await new Promise<void>((r) => setImmediate(r));
+      await new Promise<void>(r => setImmediate(r));
+      while (this.pendingReads > 0) await new Promise<void>(r => setImmediate(r));
       // Open the NEW connection before closing the old, so this.database is never a
       // closed handle (a concurrent read keeps using the old, still-open one until the
       // atomic swap). Different datadir → no two-openers-of-one-datadir.
@@ -284,6 +318,12 @@ export default class Session extends Command {
     }
   }
 
+  /** Back to full speed + no throttle when idle (the governor only governs an active scan). */
+  private resetGovernor(): void {
+    this.cpuBudget = 1;
+    this.autoThrottle = false;
+  }
+
   private async runScan(req: QueryRequest): Promise<void> {
     const jobId = (req.jobId as string) || (req.runId as string) || '';
     if (this.scanning) {
@@ -291,14 +331,21 @@ export default class Session extends Command {
       return;
     }
     const rootPath = req.path as string;
-    const runId = (req.runId as string) || generateRunId();
+    // Resume an interrupted scan: continue the SAME run (keep its partial files, re-walk
+    // only the un-enumerated frontier, hash from where it stopped) instead of a fresh one.
+    // Use the explicit runId if given, else the run this session loaded on startup.
+    const resume = req.resume === true;
+    const runId = (req.runId as string) || (resume && this.runId ? this.runId : generateRunId());
     this.runId = runId; // queries during the scan target this run
+    this.currentJobId = jobId;
     this.scanning = true;
-    const startedAt = Math.floor(Date.now() / 1000);
+    this.scanPaused = false;
     const startMs = Date.now();
+    const startedAt = Math.floor(Date.now() / 1000);
 
     // Resource governor settings for this scan (default: full speed, no throttle).
-    this.cpuBudget = typeof req.cpuBudget === 'number' ? Math.max(0.1, Math.min(1, req.cpuBudget)) : 1;
+    this.cpuBudget =
+      typeof req.cpuBudget === 'number' ? Math.max(0.1, Math.min(1, req.cpuBudget)) : 1;
     this.autoThrottle = req.autoThrottle === true;
     this.batchStart = Date.now();
 
@@ -310,6 +357,15 @@ export default class Session extends Command {
       enableArchiveProcessing: req.enableArchives !== false,
       betweenBatches: () => this.betweenBatches(), // ← read priority + resource governor
       preserveConnection: true, // ← never close/delete the owned connection mid-scan
+      resume, // ← keep partial files + continue hashing from hash IS NULL
+      frontier: true, // ← owner mode: discovery is always resumable (re-walk only remainder)
+      shouldContinue: () => !this.scanPaused, // ← pause/cancel stops pulling new directories
+      // Concurrent enumeration (3b): the lever for high-latency NAS/cloud mounts. Default 16;
+      // overridable per scan. (A measured-latency auto-ramp is a planned follow-on.)
+      enumerateConcurrency:
+        typeof req.enumerateConcurrency === 'number'
+          ? Math.max(1, Math.min(64, req.enumerateConcurrency))
+          : 16,
     };
 
     try {
@@ -317,36 +373,122 @@ export default class Session extends Command {
       // get_tree returns a non-null root DURING the scan — giving each in-progress scan's
       // live tree a distinct identity (the chart keys on it, so concurrent tabs switch
       // correctly) AND making an interrupted scan recoverable on restart. cleanDatabase
-      // (inside scanDirectory) preserves this row (it clears only other run_ids).
-      await insertScanMetadata(this.database!, runId, rootPath, startedAt).toPromise();
-      const result = await lastValueFrom(
-        scanDirectory(
-          this.database!,
-          scanConfig,
-          (event: ScanProgressEvent) => {
-            const { processed, total } = scanProgressMetrics(event);
-            this.send({ event: 'job:progress', jobId, phase: event.phase, processed, total, detail: event.status });
-          }
-          // No tree callback: owner mode doesn't stream a JS-accumulated provisional
-          // tree. dir_stats is maintained in the DB per batch, so the UI reads the
-          // live tree straight from get_tree — the DB is the single source of truth.
-        )
-      );
-      await updateScanMetadata(this.database!, runId, result.filesIngested).toPromise();
-      // dir_stats is already fully materialized by the incremental rollup that ran on
-      // every ingestion batch (rollupDirStatsBatch) — no one-shot populate spike here.
-      this.scanning = false;
-      this.send({ event: 'job:complete', jobId, durationMs: Date.now() - startMs });
-      // Now idle: build the warm-start template (initdb once) so the NEXT new db is a
-      // ~125 ms copy instead of a ~3 s initdb. Fire-and-forget; no-op if already built.
-      void ensureTemplateInBackground();
+      // (inside scanDirectory) preserves this row (it clears only other run_ids). On resume
+      // the row already exists, so set status back to 'running' explicitly.
+      await firstValueFrom(insertScanMetadata(this.database!, runId, rootPath, startedAt));
+      await firstValueFrom(setScanStatus(this.database!, runId, 'running'));
     } catch (e) {
       this.scanning = false;
+      this.resetGovernor();
       this.send({ event: 'job:error', jobId, error: e instanceof Error ? e.message : String(e) });
-    } finally {
-      // Back to full speed when idle (the governor only governs an active scan).
-      this.cpuBudget = 1;
-      this.autoThrottle = false;
+      return;
     }
+
+    // Subscribe (don't await) so pause/cancel can unsubscribe mid-flight. The scan runs to
+    // completion via the callbacks below; the DB is the single source of truth so owner
+    // mode streams no JS-accumulated provisional tree (the UI reads get_tree live).
+    let lastResult: ScanResult | undefined;
+    this.scanSubscription = scanDirectory(
+      this.database!,
+      scanConfig,
+      (event: ScanProgressEvent) => {
+        const { processed, total } = scanProgressMetrics(event);
+        this.send({
+          event: 'job:progress',
+          jobId,
+          phase: event.phase,
+          processed,
+          total,
+          detail: event.status,
+        });
+      }
+    ).subscribe({
+      next: result => {
+        lastResult = result;
+      },
+      error: e => {
+        this.scanSubscription = undefined;
+        this.scanning = false;
+        this.resetGovernor();
+        this.send({ event: 'job:error', jobId, error: e instanceof Error ? e.message : String(e) });
+      },
+      complete: () => {
+        this.scanSubscription = undefined;
+        void (async () => {
+          try {
+            // dir_stats is fully materialized by the per-batch rollup (or, on a frontier
+            // resume, by the end-of-ingestion populateDirStats) — no spike here.
+            if (lastResult) {
+              await firstValueFrom(
+                updateScanMetadata(this.database!, runId, lastResult.filesIngested)
+              );
+            }
+          } catch {
+            /* best effort — metadata update must not crash the owner */
+          }
+          this.scanning = false;
+          this.resetGovernor();
+          this.send({ event: 'job:complete', jobId, durationMs: Date.now() - startMs });
+          // Now idle: build the warm-start template (initdb once) so the NEXT new db is a
+          // ~125 ms copy instead of a ~3 s initdb. Fire-and-forget; no-op if already built.
+          void ensureTemplateInBackground();
+        })();
+      },
+    });
+  }
+
+  /**
+   * Stop the running scan (pause or cancel). Both are the same mechanism: unsubscribe is
+   * an intentional "soft crash" — the pipeline tears down mid-flight, in-flight batches
+   * drain harmlessly, and all committed data stays. They differ only in persisted status,
+   * and BOTH remain resumable (never discard, always resumable). job:paused
+   * tells the UI it stopped cleanly.
+   */
+  private async stopScan(status: 'paused' | 'cancelled'): Promise<void> {
+    if (!this.scanning) return; // nothing to stop; pause is idempotent
+    this.scanPaused = true; // walker stops popping new dirs
+    this.scanSubscription?.unsubscribe(); // tear the pipeline down now
+    this.scanSubscription = undefined;
+    this.scanning = false;
+    this.resetGovernor();
+    if (this.runId) {
+      try {
+        await firstValueFrom(setScanStatus(this.database!, this.runId, status));
+      } catch {
+        /* best effort */
+      }
+    }
+    this.send({ event: 'job:paused', jobId: this.currentJobId });
+  }
+
+  /**
+   * Resume the paused/interrupted scan for this session's run: look up its root path and
+   * re-run with resume:true. The frontier makes that cheap — only the un-enumerated
+   * remainder is re-walked, and hashing continues from `hash IS NULL`.
+   */
+  private async handleResumeScan(req: QueryRequest): Promise<void> {
+    const { id } = req;
+    if (this.scanning) {
+      this.send({ id, ok: false, error: 'already scanning' });
+      return;
+    }
+    if (!this.runId) {
+      this.send({ id, ok: false, error: 'no run to resume' });
+      return;
+    }
+    const meta = await firstValueFrom(getScanMetadata(this.database!, this.runId));
+    if (!meta) {
+      this.send({ id, ok: false, error: 'no scan metadata for run' });
+      return;
+    }
+    this.send({ id, ok: true }); // ack; progress streams as events
+    void this.runScan({
+      ...req,
+      action: 'start_scan',
+      path: meta.root_path,
+      runId: this.runId,
+      resume: true,
+      jobId: (req.jobId as string) || this.currentJobId,
+    } as QueryRequest);
   }
 }
