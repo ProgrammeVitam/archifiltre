@@ -150,6 +150,18 @@
 		exportCsv({ outputPath, jobId: generateId(), dbName: scan.dbName, fullPaths: true, deletionOnly });
 	}
 
+	// Archival exports: RESIP (SEDA import CSV) and a two-sheet Excel workbook. Both walk
+	// the tree with enrichment folded in; RESIP drops items marked for deletion.
+	async function exportArchival(format: 'resip' | 'xlsx'): Promise<void> {
+		const scan = $activeScan;
+		if (!scan) return;
+		const [type, ext, filter] =
+			format === 'xlsx' ? ['excel', 'xlsx', 'Excel'] : ['resip', 'csv', 'CSV'];
+		const outputPath = await selectExportPath(type, ext, filter);
+		if (!outputPath) return;
+		exportCsv({ outputPath, jobId: generateId(), dbName: scan.dbName, format });
+	}
+
 	onMount(() => {
 		for (const ext of BUNDLED_EXTENSIONS) {
 			extensionRegistry.register(ext);
@@ -389,6 +401,18 @@
 											onSelect={() => runMenu(() => exportActiveCsv(true))}
 										>
 											<DownloadIcon /> Deletion manifest…
+										</Menubar.Item>
+										<Menubar.Item
+											disabled={!browseable}
+											onSelect={() => runMenu(() => exportArchival('resip'))}
+										>
+											<DownloadIcon /> Export RESIP (SEDA)…
+										</Menubar.Item>
+										<Menubar.Item
+											disabled={!browseable}
+											onSelect={() => runMenu(() => exportArchival('xlsx'))}
+										>
+											<DownloadIcon /> Export Excel…
 										</Menubar.Item>
 										<Menubar.Separator />
 										<Menubar.Item onSelect={() => runMenu(closeWindow)}>

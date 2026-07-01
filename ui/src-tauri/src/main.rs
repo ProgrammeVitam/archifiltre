@@ -73,6 +73,8 @@ pub struct ExportOptions {
     pub db_name: Option<String>,
     #[serde(default)]
     pub deletion_only: bool,
+    /// Export format: "csv" (default), "resip" (SEDA archival CSV), or "xlsx" (Excel).
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -507,6 +509,10 @@ async fn export_csv(
     }
     if options.deletion_only {
         args.push("--deletion-only".to_string());
+    }
+    if let Some(ref format) = options.format {
+        args.push("--format".to_string());
+        args.push(format.clone());
     }
     if let Some(ref db) = options.db_name {
         args.push("--db".to_string());

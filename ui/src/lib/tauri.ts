@@ -986,6 +986,8 @@ export interface ExportOptions {
 	fullPaths?: boolean;
 	dbName?: string;
 	deletionOnly?: boolean;
+	/** 'csv' (default), 'resip' (SEDA archival CSV), or 'xlsx' (Excel workbook). */
+	format?: 'csv' | 'resip' | 'xlsx';
 }
 
 /**
@@ -1000,12 +1002,16 @@ export async function exportCsv(options: ExportOptions): Promise<CommandResult> 
  * Open a save file dialog for CSV export.
  * Returns the selected file path or null if cancelled.
  */
-export async function selectExportPath(type: string = 'export'): Promise<string | null> {
+export async function selectExportPath(
+	type: string = 'export',
+	extension: string = 'csv',
+	filterName: string = 'CSV'
+): Promise<string | null> {
 	const { save } = await import('@tauri-apps/plugin-dialog');
 	const result = await save({
 		title: 'Export scan results',
-		defaultPath: `archifiltre-${type}-${Date.now()}.csv`,
-		filters: [{ name: 'CSV', extensions: ['csv'] }]
+		defaultPath: `archifiltre-${type}-${Date.now()}.${extension}`,
+		filters: [{ name: filterName, extensions: [extension] }]
 	});
 	return result;
 }

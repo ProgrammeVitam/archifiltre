@@ -30,6 +30,17 @@
 		exportCsv({ outputPath, jobId, dbName: scan.dbName, fullPaths: true, deletionOnly: true });
 	}
 
+	// Archival exports: RESIP (SEDA import CSV) and a two-sheet Excel workbook.
+	async function handleArchivalExport(format: 'resip' | 'xlsx'): Promise<void> {
+		const scan = $activeScan;
+		if (!scan) return;
+		const [type, ext, filter] =
+			format === 'xlsx' ? ['excel', 'xlsx', 'Excel'] : ['resip', 'csv', 'CSV'];
+		const outputPath = await selectExportPath(type, ext, filter);
+		if (!outputPath) return;
+		exportCsv({ outputPath, jobId: generateId(), dbName: scan.dbName, format });
+	}
+
 	// Whether the active scan has any deletion marks. Queried from PGlite when
 	// the export menu opens (not cached) so the manifest option reflects current
 	// state even after marks are toggled elsewhere.
@@ -55,6 +66,16 @@
 			label: 'Deletion manifest (CSV)',
 			action: handleDeletionManifestExport,
 			disabled: !hasDeletionTags
+		},
+		{
+			id: 'resip-export',
+			label: 'RESIP (SEDA) CSV',
+			action: () => handleArchivalExport('resip')
+		},
+		{
+			id: 'xlsx-export',
+			label: 'Excel workbook (.xlsx)',
+			action: () => handleArchivalExport('xlsx')
 		}
 	]);
 

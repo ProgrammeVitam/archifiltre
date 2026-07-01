@@ -40,6 +40,7 @@ import type { PipelineContext } from '@lib/pipeline-context.ts';
 import { pausable } from '@lib/pausable.ts';
 import { BaseCommand } from '@lib/base-command.ts';
 import type { JobContext } from '@lib/job-context.ts';
+import { exportToResip, exportToXlsx } from '@extensions/archival-export.ts';
 
 // === Types ===
 
@@ -119,7 +120,7 @@ function getCsvHeader(
  * Escape a value for CSV format.
  * Wraps in quotes if contains delimiter, quotes, or newlines.
  */
-function escapeCsvValue(
+export function escapeCsvValue(
   value: string | number | boolean | null | undefined,
   delimiter: string
 ): string {
@@ -280,7 +281,7 @@ async function hasDeleteTagsForRun(
  * Small, user-authored data, so loading it into maps for the duration of the
  * export is appropriate (PGlite remains the source of truth).
  */
-interface EnrichmentExportData {
+export interface EnrichmentExportData {
   /** path -> alias (exported as the `newName` column) */
   aliases: Map<string, string>;
   /** path -> comment (exported as the `description` column) */
@@ -295,7 +296,7 @@ interface EnrichmentExportData {
  * Load all enrichment for a run. The enrichment tables are ensured to exist by
  * the export command's openDatabase, so no missing-table handling is needed.
  */
-async function loadEnrichmentForExport(
+export async function loadEnrichmentForExport(
   connection: DatabaseConnection,
   runId: string
 ): Promise<EnrichmentExportData> {
@@ -675,6 +676,11 @@ class ExportCommand extends BaseCommand {
       description: 'Export only items tagged for deletion (bordereau d\'élimination)',
       default: false,
     }),
+    format: Flags.string({
+      description: 'Export format: csv (default), resip (SEDA archival CSV), or xlsx (Excel)',
+      options: ['csv', 'resip', 'xlsx'],
+      default: 'csv',
+    }),
     db: Flags.string({
       description: 'Database name to export from',
       default: 'main',
@@ -691,8 +697,17 @@ class ExportCommand extends BaseCommand {
     const { args, flags } = await this.parse(ExportCommand);
 
     const config = this.config as typeof this.config & { originalCwd: string };
-    const fileType = flags['deletion-only'] ? 'bordereau-elimination' : 'export';
-    const outputPath = args.output || generateExportFilename({ type: fileType, extension: 'csv' });
+    const format = flags.format as 'csv' | 'resip' | 'xlsx';
+    const extension = format === 'xlsx' ? 'xlsx' : 'csv';
+    const fileType =
+      format === 'resip'
+        ? 'resip'
+        : format === 'xlsx'
+          ? 'archifiltre'
+          : flags['deletion-only']
+            ? 'bordereau-elimination'
+            : 'export';
+    const outputPath = args.output || generateExportFilename({ type: fileType, extension });
     const resolvedOutput = path.resolve(config.originalCwd, outputPath);
     await ensureDirectory(path.dirname(resolvedOutput));
     this._resolvedOutput = resolvedOutput;
@@ -723,6 +738,27 @@ class ExportCommand extends BaseCommand {
     const { flags } = await this.parse(ExportCommand);
     const fullPaths = flags['full-paths'];
     const deletionOnly = flags['deletion-only'];
+    const format = flags.format as 'csv' | 'resip' | 'xlsx';
+
+    // Archival formats (RESIP SEDA CSV, Excel workbook) walk the scan as a tree with
+    // enrichment folded in; they share their own generator instead of the flat CSV path.
+    if (format === 'resip' || format === 'xlsx') {
+      ux.action.start(`Exporting (${format}) to ${this._resolvedOutput}`);
+      const total =
+        format === 'resip'
+          ? await exportToResip(context, this._resolvedOutput)
+          : await exportToXlsx(context, this._resolvedOutput);
+      ux.action.stop(`${total.toLocaleString()} elements`);
+      this.log('');
+      this.log(`Export completed: ${this._resolvedOutput}`);
+      logger.info('Archival export completed', {
+        runId: context.runId,
+        format,
+        outputPath: this._resolvedOutput,
+        total,
+      });
+      return;
+    }
 
     ux.action.start('Detecting checksum columns');
     const populatedChecksums = await getPopulatedChecksumColumns(context.database, context.runId);
