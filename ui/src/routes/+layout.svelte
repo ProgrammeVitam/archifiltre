@@ -6,14 +6,17 @@
 		detectPlatform,
 		activeScan,
 		hasActiveScans,
+		scansStore,
 		viewMode,
 		colorMode,
 		type Platform,
 		type ViewMode
 	} from '$lib/stores';
+	import { exportCsv, selectExportPath, generateId } from '$lib/tauri';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
 	import { ButtonGroup } from '$lib/components/ui/button-group';
+	import * as Menubar from '$lib/components/ui/menubar';
 	import Sidebar from '$lib/components/Sidebar.svelte';
 	import ArchifiltreLogo from '$lib/components/ArchifiltreLogo.svelte';
 	import {
@@ -25,7 +28,12 @@
 		FolderTreeIcon,
 		ListIcon,
 		Undo2Icon,
-		Redo2Icon
+		Redo2Icon,
+		MenuIcon,
+		FilePlusIcon,
+		DownloadIcon,
+		PaletteIcon,
+		LogOutIcon
 	} from '@lucide/svelte';
 	import { doUndo, doRedo, undoRedoState } from '$lib/history';
 	import ExportDropdown from '$lib/components/ExportDropdown.svelte';
@@ -112,6 +120,34 @@
 
 	function setViewMode(mode: ViewMode) {
 		viewMode.set(mode);
+	}
+
+	// ── Collapsible menubar (Zed-style) ──────────────────────────────────────────
+	// The ☰ button swaps the left "lens" group for a full File/Edit/View menubar.
+	// It stays open while the pointer is over the cluster OR a menu dropdown is open;
+	// leaving the cluster with everything closed collapses it back to the lenses.
+	let showMenu = $state(false);
+	let overMenuBar = $state(false); // pointer is over the ☰ + menubar cluster
+	let openMenu = $state<string>(''); // bind:value of the Menubar — '' when no menu is open
+	$effect(() => {
+		if (showMenu && !openMenu && !overMenuBar) showMenu = false;
+	});
+	// Run a menu action then collapse back to the lens group (acting is a natural exit).
+	function runMenu(action: () => void) {
+		action();
+		showMenu = false;
+	}
+
+	function newScan() {
+		scansStore.addScan();
+	}
+
+	async function exportActiveCsv(deletionOnly = false): Promise<void> {
+		const scan = $activeScan;
+		if (!scan) return;
+		const outputPath = await selectExportPath(deletionOnly ? 'bordereau-elimination' : undefined);
+		if (!outputPath) return;
+		exportCsv({ outputPath, jobId: generateId(), dbName: scan.dbName, fullPaths: true, deletionOnly });
 	}
 
 	onMount(() => {
@@ -310,50 +346,160 @@
 						</button>
 					{/if}
 
-					<!-- View toggle (Visual/Tree/Flat) — the LEFT "lens" group. Present from
-					     scan-start. Visual is the LIVE lens (enabled during a scan — the icicle
-					     grows in place); Tree/Flat eager-load files per directory and need a stable
-					     tree, so they wait until the scan is paused or complete (browseable). -->
-					{#if hasScan}
-						<ButtonGroup class="ml-3" data-no-drag>
-							<Button
-								variant="outline"
-								size="sm"
-								disabled={!viewable}
-								class="h-7 gap-1.5 text-xs {$viewMode === 'stalactite'
-									? 'bg-accent text-accent-foreground'
-									: 'text-muted-foreground'}"
-								onclick={() => setViewMode('stalactite')}
-								title="Visual view"
-							>
-								<LayoutGridIcon size={14} /> Visual
-							</Button>
-							<Button
-								variant="outline"
-								size="sm"
-								disabled={!browseable}
-								class="h-7 gap-1.5 text-xs {$viewMode === 'tree'
-									? 'bg-accent text-accent-foreground'
-									: 'text-muted-foreground'}"
-								onclick={() => setViewMode('tree')}
-								title="Tree view"
-							>
-								<FolderTreeIcon size={14} /> Tree
-							</Button>
-							<Button
-								variant="outline"
-								size="sm"
-								disabled={!browseable}
-								class="h-7 gap-1.5 text-xs {$viewMode === 'flat'
-									? 'bg-accent text-accent-foreground'
-									: 'text-muted-foreground'}"
-								onclick={() => setViewMode('flat')}
-								title="Flat list"
-							>
-								<ListIcon size={14} /> Flat
-							</Button>
-						</ButtonGroup>
-					{/if}
+					<!-- Left cluster. The ☰ button swaps the "lens" toggle group (Visual/Tree/Flat)
+					     for a full File/Edit/View menubar, Zed-style: click to reveal the menubar,
+					     move the pointer away (with no menu open) to collapse back to the lenses.
+					     Visual is the LIVE lens (usable mid-scan); Tree/Flat need a stable tree. -->
+					<div
+						class="ml-3 flex items-center gap-1"
+						data-no-drag
+						onpointerenter={() => (overMenuBar = true)}
+						onpointerleave={() => (overMenuBar = false)}
+					>
+						<Button
+							variant="ghost"
+							size="icon"
+							class="size-7 text-muted-foreground hover:text-accent-foreground {showMenu
+								? 'bg-accent text-accent-foreground'
+								: ''}"
+							onclick={() => (showMenu = !showMenu)}
+							title="Menu"
+						>
+							<MenuIcon size={15} />
+						</Button>
+
+						{#if showMenu}
+							<Menubar.Root bind:value={openMenu}>
+								<Menubar.Menu>
+									<Menubar.Trigger>File</Menubar.Trigger>
+									<Menubar.Content>
+										<Menubar.Item onSelect={() => runMenu(newScan)}>
+											<FilePlusIcon /> New scan
+											<Menubar.Shortcut>⌘N</Menubar.Shortcut>
+										</Menubar.Item>
+										<Menubar.Separator />
+										<Menubar.Item
+											disabled={!browseable}
+											onSelect={() => runMenu(() => exportActiveCsv(false))}
+										>
+											<DownloadIcon /> Export as CSV…
+										</Menubar.Item>
+										<Menubar.Item
+											disabled={!browseable}
+											onSelect={() => runMenu(() => exportActiveCsv(true))}
+										>
+											<DownloadIcon /> Deletion manifest…
+										</Menubar.Item>
+										<Menubar.Separator />
+										<Menubar.Item onSelect={() => runMenu(closeWindow)}>
+											<LogOutIcon /> Quit
+										</Menubar.Item>
+									</Menubar.Content>
+								</Menubar.Menu>
+
+								<Menubar.Menu>
+									<Menubar.Trigger>Edit</Menubar.Trigger>
+									<Menubar.Content>
+										<Menubar.Item
+											disabled={!$undoRedoState.canUndo}
+											onSelect={() => runMenu(doUndo)}
+										>
+											<Undo2Icon /> Undo
+											<Menubar.Shortcut>⌘Z</Menubar.Shortcut>
+										</Menubar.Item>
+										<Menubar.Item
+											disabled={!$undoRedoState.canRedo}
+											onSelect={() => runMenu(doRedo)}
+										>
+											<Redo2Icon /> Redo
+											<Menubar.Shortcut>⇧⌘Z</Menubar.Shortcut>
+										</Menubar.Item>
+									</Menubar.Content>
+								</Menubar.Menu>
+
+								<Menubar.Menu>
+									<Menubar.Trigger>View</Menubar.Trigger>
+									<Menubar.Content>
+										<Menubar.Item
+											disabled={!viewable}
+											onSelect={() => runMenu(() => setViewMode('stalactite'))}
+										>
+											<LayoutGridIcon /> Visual
+										</Menubar.Item>
+										<Menubar.Item
+											disabled={!browseable}
+											onSelect={() => runMenu(() => setViewMode('tree'))}
+										>
+											<FolderTreeIcon /> Tree
+										</Menubar.Item>
+										<Menubar.Item
+											disabled={!browseable}
+											onSelect={() => runMenu(() => setViewMode('flat'))}
+										>
+											<ListIcon /> Flat
+										</Menubar.Item>
+										<Menubar.Separator />
+										<Menubar.Item
+											disabled={!viewable}
+											onSelect={() => runMenu(() => colorMode.set('type'))}
+										>
+											<PaletteIcon /> Colour by type
+										</Menubar.Item>
+										<Menubar.Item
+											disabled={!viewable}
+											onSelect={() => runMenu(() => colorMode.set('date'))}
+										>
+											<PaletteIcon /> Colour by date
+										</Menubar.Item>
+										<Menubar.Separator />
+										<Menubar.Item onSelect={() => runMenu(() => (sidebarCollapsed = !sidebarCollapsed))}>
+											<PanelLeftIcon /> Toggle sidebar
+											<Menubar.Shortcut>⌘B</Menubar.Shortcut>
+										</Menubar.Item>
+									</Menubar.Content>
+								</Menubar.Menu>
+							</Menubar.Root>
+						{:else if hasScan}
+							<ButtonGroup data-no-drag>
+								<Button
+									variant="outline"
+									size="sm"
+									disabled={!viewable}
+									class="h-7 gap-1.5 text-xs {$viewMode === 'stalactite'
+										? 'bg-accent text-accent-foreground'
+										: 'text-muted-foreground'}"
+									onclick={() => setViewMode('stalactite')}
+									title="Visual view"
+								>
+									<LayoutGridIcon size={14} /> Visual
+								</Button>
+								<Button
+									variant="outline"
+									size="sm"
+									disabled={!browseable}
+									class="h-7 gap-1.5 text-xs {$viewMode === 'tree'
+										? 'bg-accent text-accent-foreground'
+										: 'text-muted-foreground'}"
+									onclick={() => setViewMode('tree')}
+									title="Tree view"
+								>
+									<FolderTreeIcon size={14} /> Tree
+								</Button>
+								<Button
+									variant="outline"
+									size="sm"
+									disabled={!browseable}
+									class="h-7 gap-1.5 text-xs {$viewMode === 'flat'
+										? 'bg-accent text-accent-foreground'
+										: 'text-muted-foreground'}"
+									onclick={() => setViewMode('flat')}
+									title="Flat list"
+								>
+									<ListIcon size={14} /> Flat
+								</Button>
+							</ButtonGroup>
+						{/if}
+					</div>
 
 					<!-- Spacer to push export and controls to the right -->
 					<div class="titlebar-spacer"></div>
