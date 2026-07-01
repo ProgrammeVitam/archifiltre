@@ -195,6 +195,18 @@ impl Default for AppState {
 // Helper: Sidecar Path
 // ============================================================================
 
+/// Build a `tokio::process::Command` for the sidecar with the Windows console window
+/// suppressed. The sidecar is a console-subsystem (Bun-compiled) binary, so on Windows
+/// every spawn would otherwise flash a `cmd` window. `CREATE_NO_WINDOW` hides it while
+/// keeping piped stdio intact (the JSON-lines protocol needs the pipes). No-op elsewhere.
+pub(crate) fn sidecar_command<S: AsRef<std::ffi::OsStr>>(program: S) -> tokio::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = tokio::process::Command::new(program);
+    #[cfg(windows)]
+    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    cmd
+}
+
 fn find_sidecar_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     use tauri::Manager;
 
@@ -287,7 +299,7 @@ async fn health_check(app: tauri::AppHandle) -> Result<CommandResult, String> {
     // Tauri resource dir) rather than the shell sidecar API.
     let binary_path = find_sidecar_path(&app)?;
 
-    let output = tokio::process::Command::new(&binary_path)
+    let output = sidecar_command(&binary_path)
         .args(["health", "--verbose"])
         .output()
         .await
@@ -307,7 +319,7 @@ async fn health_check(app: tauri::AppHandle) -> Result<CommandResult, String> {
 async fn get_version(app: tauri::AppHandle) -> Result<CommandResult, String> {
     let binary_path = find_sidecar_path(&app)?;
 
-    let output = tokio::process::Command::new(&binary_path)
+    let output = sidecar_command(&binary_path)
         .args(["version"])
         .output()
         .await
@@ -361,7 +373,7 @@ async fn scan_directory(
         args.push("--disable-archives".to_string());
     }
 
-    let mut child = tokio::process::Command::new(&binary_path)
+    let mut child = sidecar_command(&binary_path)
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -435,7 +447,7 @@ async fn compute_checksums(
         args.push("--each-file".to_string());
     }
 
-    let mut child = tokio::process::Command::new(&binary_path)
+    let mut child = sidecar_command(&binary_path)
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -519,7 +531,7 @@ async fn export_csv(
         args.push(db.clone());
     }
 
-    let mut child = tokio::process::Command::new(&binary_path)
+    let mut child = sidecar_command(&binary_path)
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -627,11 +639,19 @@ async fn start_query_session(
 
     let binary_path = find_sidecar_path(&app)?;
 
-    let mut process = Command::new(&binary_path)
+    let mut builder = Command::new(&binary_path);
+    builder
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    // Suppress the Windows console window for this (legacy) query session too.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        builder.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut process = builder
         .spawn()
         .map_err(|e| format!("Failed to spawn query process: {}", e))?;
 

@@ -45,7 +45,7 @@ impl Owner {
         on_event: EventSink,
         current_job_id: Arc<std::sync::Mutex<String>>,
     ) -> Result<Owner, String> {
-        let mut cmd = tokio::process::Command::new(program);
+        let mut cmd = crate::sidecar_command(program);
         cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
