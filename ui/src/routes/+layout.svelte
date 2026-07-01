@@ -9,6 +9,7 @@
 		scansStore,
 		viewMode,
 		colorMode,
+		sortMode,
 		type Platform,
 		type ViewMode
 	} from '$lib/stores';
@@ -33,7 +34,10 @@
 		FilePlusIcon,
 		DownloadIcon,
 		PaletteIcon,
-		LogOutIcon
+		LogOutIcon,
+		ArrowDownWideNarrowIcon,
+		ArrowDownAZIcon,
+		CalendarArrowDownIcon
 	} from '@lucide/svelte';
 	import { doUndo, doRedo, undoRedoState } from '$lib/history';
 	import ExportDropdown from '$lib/components/ExportDropdown.svelte';
@@ -474,6 +478,25 @@
 											onSelect={() => runMenu(() => colorMode.set('date'))}
 										>
 											<PaletteIcon /> Colour by date
+										</Menubar.Item>
+										<Menubar.Separator />
+										<Menubar.Item
+											disabled={!viewable}
+											onSelect={() => runMenu(() => sortMode.set('size'))}
+										>
+											<ArrowDownWideNarrowIcon /> Sort by size
+										</Menubar.Item>
+										<Menubar.Item
+											disabled={!viewable}
+											onSelect={() => runMenu(() => sortMode.set('name'))}
+										>
+											<ArrowDownAZIcon /> Sort by name
+										</Menubar.Item>
+										<Menubar.Item
+											disabled={!browseable}
+											onSelect={() => runMenu(() => sortMode.set('date'))}
+										>
+											<CalendarArrowDownIcon /> Sort by date
 										</Menubar.Item>
 										<Menubar.Separator />
 										<Menubar.Item onSelect={() => runMenu(() => (sidebarCollapsed = !sidebarCollapsed))}>

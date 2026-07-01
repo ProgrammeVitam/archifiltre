@@ -88,6 +88,11 @@ interface DirectoryNode extends NodeEnrichment {
   max_depth: number;
   /** Path of that deepest descendant, or null if the folder is empty. */
   deepest_path: string | null;
+  /** Descendant mtime range + representative median (epoch seconds), folded in for a
+   *  settled tree only. Absent during a live scan. */
+  min_mtime?: number;
+  max_mtime?: number;
+  median_mtime?: number;
 }
 
 interface FileNode extends NodeEnrichment {
@@ -201,6 +206,43 @@ async function handleGetTree(
       tagged_for_deletion: Boolean(row.tagged_for_deletion),
     };
   });
+
+  // For a settled tree (not the live-scan poll), fold in each folder's date range and
+  // a representative median, computed in ONE pass: explode every file into its ancestor
+  // folder paths, then aggregate. This is what lets folders colour by date and sort by
+  // date. Skipped while scanning — dates aren't needed live and this would re-run every
+  // poll. `percentile_cont` (a real median) is nearly free here since folder groups are
+  // small; min/max give the range.
+  if (!scanning && directories.length > 0) {
+    const dateRows = await db.db.execute(sql`
+      SELECT array_to_string((string_to_array(f.path, '/'))[1:g.i], '/') AS dir,
+             min(f.mtime) AS min_mtime,
+             max(f.mtime) AS max_mtime,
+             percentile_cont(0.5) WITHIN GROUP (ORDER BY f.mtime)::bigint AS median_mtime
+      FROM files f,
+           generate_series(1, cardinality(string_to_array(f.path, '/')) - 1) AS g(i)
+      WHERE f.run_id = ${runId} AND NOT f.is_directory AND f.mtime > 0
+      GROUP BY dir
+    `);
+    const byDir = new Map(
+      (
+        dateRows.rows as Array<{
+          dir: string;
+          min_mtime: number | string;
+          max_mtime: number | string;
+          median_mtime: number | string;
+        }>
+      ).map(r => [r.dir, r])
+    );
+    for (const d of directories) {
+      const dd = byDir.get(d.path);
+      if (dd) {
+        d.min_mtime = Number(dd.min_mtime);
+        d.max_mtime = Number(dd.max_mtime);
+        d.median_mtime = Number(dd.median_mtime);
+      }
+    }
+  }
 
   return { root: rootPath, directories };
 }

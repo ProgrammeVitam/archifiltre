@@ -323,6 +323,12 @@ export interface DirectoryNode extends NodeEnrichment {
 	max_depth?: number;
 	/** Path of that deepest descendant, or null when the folder is empty. */
 	deepest_path?: string | null;
+	/** Descendant mtime range + representative median (epoch seconds). Present only for a
+	 *  settled tree (complete/paused); absent during a live scan. Drives date colour + sort
+	 *  for folders. */
+	min_mtime?: number;
+	max_mtime?: number;
+	median_mtime?: number;
 }
 
 /** Tree data from get_tree query */

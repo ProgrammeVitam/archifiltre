@@ -23,7 +23,8 @@
 		invalidateEnrichment,
 		enrichmentInvalidation,
 		selectedItem,
-		colorMode
+		colorMode,
+		sortMode
 	} from '$lib/stores';
 	import { getFileType } from '$lib/file-types';
 	import { Menu, MenuItem, PredefinedMenuItem } from '@tauri-apps/api/menu';
@@ -154,10 +155,11 @@
 	// empty-click resets the selection back to it (or clears it at the root).
 	let focusPath = '';
 
-	// Colour mode lives in a shared store (the header drives the toggle); re-colour
-	// the chart whenever it flips.
+	// Colour and sort modes live in shared stores (the header/menu drive them);
+	// re-colour on a colour flip, and re-lay-out on a sort flip (order changes positions).
 	$effect(() => {
 		$colorMode;
+		$sortMode;
 		untrack(() => {
 			if (!ctx || canvasWidth === 0 || !data) return;
 			computeLayout();
@@ -352,6 +354,18 @@
 		return luminance < 140 ? 'rgba(255, 255, 255, 0.9)' : 'rgba(0, 0, 0, 0.55)';
 	}
 
+	/**
+	 * Readable label colour for text drawn on a block: near-white on dark fills,
+	 * near-black on light fills — so white-on-yellow (the folder/other hue) is no
+	 * longer illegible. Same luminance test as bandSeparatorColor, stronger opacity
+	 * for text. "Opposite colour" in the readable sense, not a literal RGB inverse.
+	 */
+	function labelTextColor(fill: string): string {
+		const [r, g, b] = parseRgb(fill);
+		const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+		return luminance < 140 ? 'rgba(255, 255, 255, 0.95)' : 'rgba(0, 0, 0, 0.82)';
+	}
+
 	function interpolateHex(t: number, from: string, to: string): string {
 		const [r1, g1, b1] = hexToRgb(from);
 		const [r2, g2, b2] = hexToRgb(to);
@@ -378,7 +392,14 @@
 		minMtime: number,
 		maxMtime: number
 	): string {
-		if (dir !== null) return palette.folder;
+		if (dir !== null) {
+			// In date mode a folder takes the gradient at its representative (median
+			// descendant) date, so folders read on the same timeline as files instead of
+			// a flat yellow. Falls back to the folder hue when no date is known (live scan).
+			if ($colorMode === 'date' && dir.median_mtime != null)
+				return getDateColor(dir.median_mtime, minMtime, maxMtime, palette);
+			return palette.folder;
+		}
 		if (file === null) return palette.other;
 		if ($colorMode === 'date') return getDateColor(file.mtime, minMtime, maxMtime, palette);
 		return getTypeColorFor(file.name, palette);
@@ -801,7 +822,24 @@
 				if (hiddenDepth > aggMaxDepth) aggMaxDepth = hiddenDepth;
 			};
 
-			// Directories first (positional order), then files.
+			// Folders first, then files; the sort mode picks the order WITHIN each group.
+			// (v4 mixes files+folders purely by size; folders stay grouped, which improves
+			// legibility for an icicle whose folders recurse downward.) Sorted copies leave the
+			// cached child arrays untouched.
+			const byName = (a: { name: string }, b: { name: string }) =>
+				a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+			if ($sortMode === 'name') {
+				dirs = [...dirs].sort(byName);
+				files = [...files].sort(byName);
+			} else if ($sortMode === 'date') {
+				// Oldest → newest: folders by their median descendant date, files by mtime.
+				// Folders with no date yet (mid-scan) sort as 0, keeping a stable order.
+				dirs = [...dirs].sort((a, b) => (a.median_mtime ?? 0) - (b.median_mtime ?? 0));
+				files = [...files].sort((a, b) => a.mtime - b.mtime);
+			} else {
+				dirs = [...dirs].sort((a, b) => b.total_size - a.total_size);
+				files = [...files].sort((a, b) => b.size - a.size);
+			}
 			for (const dir of dirs) {
 				const nodeWidth = (dir.total_size / totalSize) * width;
 				if (nodeWidth >= minContentWidth) {
@@ -1116,7 +1154,7 @@
 			// zoom in (progressive disclosure), so a block too narrow for its name
 			// at one zoom shows it once magnified.
 			if (sw > 40 && sh > 14) {
-				ctx.fillStyle = '#ffffff';
+				ctx.fillStyle = labelTextColor(isHovered ? lightenColor(rect.color, 0.15) : rect.color);
 				const fontSize = Math.min(12, sh - 4);
 				ctx.font = `${fontSize}px system-ui, sans-serif`;
 				ctx.textAlign = 'left';

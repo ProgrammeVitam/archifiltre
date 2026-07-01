@@ -444,6 +444,12 @@ export const viewMode = writable<ViewMode>('stalactite');
  *  the toggle while the chart renders from it. */
 export const colorMode = writable<'type' | 'date'>('type');
 
+/** Icicle sibling ordering — folders always come first; this picks the order WITHIN
+ *  each group: biggest→smallest, A→Z, or oldest→newest (by a folder's median descendant
+ *  date / a file's mtime). */
+export type SortMode = 'size' | 'name' | 'date';
+export const sortMode = writable<SortMode>('size');
+
 // Selected item store for details panel (shared across all views)
 export interface SelectedItem {
 	type: 'file' | 'directory';
