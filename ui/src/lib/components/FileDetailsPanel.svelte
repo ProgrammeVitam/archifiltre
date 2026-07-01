@@ -7,7 +7,9 @@
 		invalidateEnrichment,
 		enrichmentInvalidation,
 		reportSaveStatus,
-		scanResult
+		scanResult,
+		isDiscovering,
+		activeScan
 	} from '$lib/stores';
 	import { Skeleton } from '$lib/components/ui/skeleton';
 	import {
@@ -123,17 +125,20 @@
 	// chart, behind the blocks; the panel no longer renders it.)
 	let isRootSelected = $derived(($selectedItem?.path ?? '') === '');
 
-	// Size / file / folder counts are available without the DB. During a scan the
-	// whole-scan figures come live from the scan progress; a selected sub-folder
-	// uses its own streamed provisional aggregates. Outside a scan they're just the
-	// selected item's values.
-	let shownSize = $derived(loading && isRootSelected ? $scanResult.totalSize : (displayItem?.size ?? 0));
-	let shownFiles = $derived(
-		loading && isRootSelected ? $scanResult.filesDiscovered : displayItem?.fileCount
-	);
-	let shownFolders = $derived(
-		loading && isRootSelected ? $scanResult.folders : displayItem?.dirCount
-	);
+	// Size / file / folder counts are available without the DB. For the ROOT during a scan
+	// we show the live scan-progress figures (they climb every tick) rather than the DB
+	// rollup, which for the very root lands only once aggregation reaches the top — so in
+	// owner mode too, not just the legacy `loading` path. A selected sub-folder uses its own
+	// aggregates; outside a scan they're just the selected item's values.
+	let liveRoot = $derived(isRootSelected && (loading || $activeScan?.state === 'scanning'));
+	let shownSize = $derived(liveRoot ? $scanResult.totalSize : (displayItem?.size ?? 0));
+	let shownFiles = $derived(liveRoot ? $scanResult.filesDiscovered : displayItem?.fileCount);
+	let shownFolders = $derived(liveRoot ? $scanResult.folders : displayItem?.dirCount);
+	// The root's size/CO₂/folder total only settle when the scan completes (the file count
+	// is the one figure that climbs live) — so during an owner-mode scan we shimmer them as
+	// "computing" rather than show a frozen, misleading 0. `loading` is the legacy path,
+	// which computes these in JS, so this targets owner mode only.
+	let rootComputing = $derived(!loading && isRootSelected && $activeScan?.state === 'scanning');
 
 	// Per-element enrichment, read on selection (query-on-select). PGlite is the
 	// source of truth; this is not a long-lived cache — it is re-read whenever the
@@ -755,21 +760,29 @@
 							<HardDriveIcon class="h-3.5 w-3.5" />
 							<span>Size</span>
 						</div>
-						<span class="font-medium text-foreground">
-							{formatBytes(shownSize)}
-							{#if displayItem.type === 'file' && displayItem.contentSize != null && displayItem.contentSize !== displayItem.size}
-								<span class="ml-1 font-normal text-muted-foreground">
-									({formatBytes(displayItem.contentSize)} on disk)
-								</span>
-							{/if}
-						</span>
+						{#if rootComputing}
+							<Skeleton class="h-4 w-20" />
+						{:else}
+							<span class="font-medium text-foreground">
+								{formatBytes(shownSize)}
+								{#if displayItem.type === 'file' && displayItem.contentSize != null && displayItem.contentSize !== displayItem.size}
+									<span class="ml-1 font-normal text-muted-foreground">
+										({formatBytes(displayItem.contentSize)} on disk)
+									</span>
+								{/if}
+							</span>
+						{/if}
 
 						<!-- CO₂ -->
 						<div class="flex items-center gap-2 text-muted-foreground">
 							<LeafIcon class="h-3.5 w-3.5" />
 							<span>CO₂</span>
 						</div>
-						<span class="font-medium text-foreground">{formatCO2(shownSize)}</span>
+						{#if rootComputing}
+							<Skeleton class="h-4 w-24" />
+						{:else}
+							<span class="font-medium text-foreground">{formatCO2(shownSize)}</span>
+						{/if}
 
 						{#if displayItem.type === 'directory'}
 							<!-- File count -->
@@ -777,7 +790,9 @@
 								<FilesIcon class="h-3.5 w-3.5" />
 								<span>Files</span>
 							</div>
-							<span class="font-medium text-foreground">
+							<!-- The file count is the one figure that climbs live during a scan;
+							     pulse it while discovering so it reads as actively changing. -->
+							<span class="font-medium text-foreground" class:animate-pulse={$isDiscovering}>
 								{shownFiles?.toLocaleString() ?? 0}
 							</span>
 
@@ -786,9 +801,13 @@
 								<FolderOpenIcon class="h-3.5 w-3.5" />
 								<span>Folders</span>
 							</div>
-							<span class="font-medium text-foreground">
-								{shownFolders?.toLocaleString() ?? 0}
-							</span>
+							{#if rootComputing}
+								<Skeleton class="h-4 w-16" />
+							{:else}
+								<span class="font-medium text-foreground">
+									{shownFolders?.toLocaleString() ?? 0}
+								</span>
+							{/if}
 
 							<!-- Deepest descendant: how far the structure nests below this
 							     folder, and where. Surfaces the "this corner goes deep" signal

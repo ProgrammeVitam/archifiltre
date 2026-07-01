@@ -5,6 +5,7 @@
 	import {
 		activeScan,
 		enrichmentSaveStatus,
+		isDiscovering,
 		resourceStats,
 		resumeScanningScan
 	} from '$lib/stores';
@@ -76,7 +77,11 @@
 <!-- Default status content, shared by the plain and the hover-morph (button) variants. -->
 {#snippet scanningInfo()}
 	<LoaderCircleIcon class="h-3 w-3 animate-spin" />
-	<span class="whitespace-nowrap">{PHASE_LABEL[scan!.scanPhase] ?? 'Scanning'}</span>
+	<!-- Pulse the phase label (e.g. "Discovering files") while enumeration is live, so the
+	     text itself reads as actively changing — only this word, not the counts beside it. -->
+	<span class="whitespace-nowrap" class:animate-pulse={$isDiscovering}
+		>{PHASE_LABEL[scan!.scanPhase] ?? 'Scanning'}</span
+	>
 	<span class="text-[8px] opacity-40">{sep}</span>
 	<span class="whitespace-nowrap">{scan!.scanResult.filesDiscovered.toLocaleString()} files</span>
 	{#if hashing}

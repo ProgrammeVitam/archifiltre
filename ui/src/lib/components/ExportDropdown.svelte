@@ -6,6 +6,8 @@
 	import { jobsStore } from '$lib/jobs';
 	import { DownloadIcon, ChevronDownIcon } from '@lucide/svelte';
 
+	let { disabled = false }: { disabled?: boolean } = $props();
+
 	async function handleCsvExport(): Promise<void> {
 		const scan = $activeScan;
 		if (!scan) return;
@@ -69,7 +71,8 @@
 		{#snippet child({ props })}
 			<button
 				{...props}
-				class="flex h-7 cursor-pointer items-center gap-1.5 rounded-md border-none bg-transparent px-2.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+				{disabled}
+				class="flex h-7 cursor-pointer items-center gap-1.5 rounded-md border-none bg-transparent px-2.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground disabled:pointer-events-none disabled:opacity-40"
 				data-no-drag
 			>
 				<DownloadIcon size={14} />

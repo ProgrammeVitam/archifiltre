@@ -149,12 +149,17 @@
 		devPlatformOverride = p;
 	}
 
-	// Derived state for showing view toggle and export button
-	let showViewControls = $derived($activeScan?.state === 'complete');
-	// Undo/redo + enrichment apply to a browseable scan — completed OR paused (partial tree).
-	let showHistoryControls = $derived(
+	// The toolbar is PRESENT from the moment a scan starts (not only when complete), so the
+	// header is a stable structure instead of popping in — controls just enable as their
+	// data becomes available.
+	let hasScan = $derived(!!$activeScan && $activeScan.state !== 'idle');
+	// A browseable tree exists (completed, or paused mid-scan) → export becomes usable.
+	let browseable = $derived(
 		$activeScan?.state === 'complete' || $activeScan?.state === 'paused'
 	);
+	// Viewing + recolouring work on the LIVE partial tree too, so they're enabled DURING a
+	// scan — not just when complete. Only duplicate-derived affordances wait for hashing.
+	let viewable = $derived($activeScan?.state === 'scanning' || browseable);
 </script>
 
 <!-- Window container - padding and shadow only on Linux -->
@@ -305,12 +310,16 @@
 						</button>
 					{/if}
 
-					<!-- View toggle (Visual/Tree/Flat) — the LEFT "lens" group. -->
-					{#if showViewControls}
+					<!-- View toggle (Visual/Tree/Flat) — the LEFT "lens" group. Present from
+					     scan-start. Visual is the LIVE lens (enabled during a scan — the icicle
+					     grows in place); Tree/Flat eager-load files per directory and need a stable
+					     tree, so they wait until the scan is paused or complete (browseable). -->
+					{#if hasScan}
 						<ButtonGroup class="ml-3" data-no-drag>
 							<Button
 								variant="outline"
 								size="sm"
+								disabled={!viewable}
 								class="h-7 gap-1.5 text-xs {$viewMode === 'stalactite'
 									? 'bg-accent text-accent-foreground'
 									: 'text-muted-foreground'}"
@@ -322,6 +331,7 @@
 							<Button
 								variant="outline"
 								size="sm"
+								disabled={!browseable}
 								class="h-7 gap-1.5 text-xs {$viewMode === 'tree'
 									? 'bg-accent text-accent-foreground'
 									: 'text-muted-foreground'}"
@@ -333,6 +343,7 @@
 							<Button
 								variant="outline"
 								size="sm"
+								disabled={!browseable}
 								class="h-7 gap-1.5 text-xs {$viewMode === 'flat'
 									? 'bg-accent text-accent-foreground'
 									: 'text-muted-foreground'}"
@@ -347,8 +358,9 @@
 					<!-- Spacer to push export and controls to the right -->
 					<div class="titlebar-spacer"></div>
 
-					<!-- Undo / redo — head of the right actions cluster (Cmd/Ctrl+Z mirror). -->
-					{#if showHistoryControls}
+					<!-- Undo / redo — head of the right actions cluster (Cmd/Ctrl+Z mirror).
+					     Present whenever a scan exists; each button enables on can-undo/redo. -->
+					{#if hasScan}
 						<ButtonGroup class="mr-2" data-no-drag>
 							<Button
 								variant="outline"
@@ -373,12 +385,14 @@
 						</ButtonGroup>
 					{/if}
 
-					<!-- Icicle colour mode (Visual view only) -->
-					{#if showViewControls && $viewMode === 'stalactite'}
+					<!-- Icicle colour mode (Visual view only). Present whenever the Visual lens
+					     is selected; recolours the live icicle, so enabled during a scan too. -->
+					{#if hasScan && $viewMode === 'stalactite'}
 						<ButtonGroup class="mr-2" data-no-drag>
 							<Button
 								variant="outline"
 								size="sm"
+								disabled={!viewable}
 								class="h-7 text-xs {$colorMode === 'type'
 									? 'bg-accent text-accent-foreground'
 									: 'text-muted-foreground'}"
@@ -387,6 +401,7 @@
 							<Button
 								variant="outline"
 								size="sm"
+								disabled={!viewable}
 								class="h-7 text-xs {$colorMode === 'date'
 									? 'bg-accent text-accent-foreground'
 									: 'text-muted-foreground'}"
@@ -395,9 +410,9 @@
 						</ButtonGroup>
 					{/if}
 
-					<!-- Export dropdown - only shown when scan complete -->
-					{#if showViewControls}
-						<ExportDropdown />
+					<!-- Export — present from scan-start; disabled until there's data to export. -->
+					{#if hasScan}
+						<ExportDropdown disabled={!browseable} />
 					{/if}
 
 					<!-- Windows/GNOME: controls on right -->

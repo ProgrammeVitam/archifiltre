@@ -11,6 +11,7 @@
 		type FileNode
 	} from '$lib/tauri';
 	import { selectDirectory, selectFile } from '$lib/stores';
+	import SkeletonList from '$lib/components/SkeletonList.svelte';
 
 	// ================================
 	// Props
@@ -296,12 +297,7 @@
 
 <div class="flex h-full flex-col overflow-hidden rounded-lg border bg-background {className}">
 	{#if isLoading}
-		<div class="flex flex-1 items-center justify-center gap-2 p-10 text-muted-foreground">
-			<div
-				class="h-5 w-5 animate-spin rounded-full border-2 border-muted-foreground/30 border-t-primary"
-			></div>
-			<span class="text-sm">Loading files...</span>
-		</div>
+		<SkeletonList />
 	{:else if rows.length === 0}
 		<div class="flex flex-1 items-center justify-center p-10 text-sm text-muted-foreground">
 			No files to display

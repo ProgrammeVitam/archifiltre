@@ -24,7 +24,8 @@
 		activeProvisionalTree,
 		setProvisionalTree,
 		clearProvisionalTree,
-		resourceStats
+		resourceStats,
+		isDiscovering
 	} from '$lib/stores';
 	import {
 		healthCheck,
@@ -55,7 +56,7 @@
 	import TreeView from '$lib/components/TreeView.svelte';
 	import FileDetailsPanel from '$lib/components/FileDetailsPanel.svelte';
 	import StatusBar from '$lib/components/StatusBar.svelte';
-	import { LoaderCircle, CircleAlert, RefreshCw, Plus } from '@lucide/svelte';
+	import { CircleAlert, RefreshCw, Plus } from '@lucide/svelte';
 	import type { UnlistenFn } from '@tauri-apps/api/event';
 
 	// ================================
@@ -597,13 +598,10 @@
 	<!-- Content area: fills the space above the persistent status bar -->
 	<div class="flex min-h-0 flex-1 flex-col">
 	{#if !isInitialized && !initError}
-		<!-- Loading State -->
-		<div class="flex h-full items-center justify-center">
-			<div class="flex flex-col items-center gap-4">
-				<LoaderCircle size={40} class="animate-spin text-primary" />
-				<p class="text-muted-foreground">Initializing Archifiltre...</p>
-			</div>
-		</div>
+		<!-- App boot: a chart-area skeleton instead of a blocking spinner, so the first frame
+		     already shows the shape the UI is about to fill — consistent with every other
+		     loading affordance (scan start, view loads). -->
+		<SkeletonIcicle class="h-full" />
 	{:else if initError}
 		<!-- Init Error State -->
 		<div class="flex h-full items-center justify-center p-8">
@@ -628,8 +626,13 @@
 			<div class="flex h-full flex-col">
 				<div
 					class="flex min-h-0 flex-col overflow-hidden p-4 pb-0"
+					class:animate-pulse={$isDiscovering}
 					style:flex={$selectedItem || $hoveredItem ? '0 0 38.2%' : '1 1 0%'}
 				>
+					<!-- The icicle is the LIVE lens: it absorbs the partial tree growing every
+					     poll tick gracefully. The Tree/Flat lenses eager-load files per directory
+					     and aren't built for data that churns mid-scan, so they stay gated until
+					     the tree is stable (paused/complete) — see the colour/view toggles. -->
 					<StalactiteChart
 						data={scanningTree}
 						provisional={!useOwnerDb()}

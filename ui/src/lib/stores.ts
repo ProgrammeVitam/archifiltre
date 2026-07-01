@@ -405,6 +405,19 @@ export const scanProgress = derived(activeScan, ($scan) => $scan?.scanProgress ?
 /** Scan phase (from active scan) - LEGACY */
 export const scanPhase = derived(activeScan, ($scan): ScanPhase => $scan?.scanPhase ?? 'discovery');
 
+/**
+ * True while a scan is actively enumerating the filesystem — file/folder counts and the
+ * tree are still growing. Drives the "still discovering" pulse on the live graph, the
+ * status-bar label, and the root panel's live counts. Once enumeration is done (prefilter
+ * onward) the tree is stable, so the pulse stops even though the scan keeps running.
+ */
+export const isDiscovering = derived(
+	activeScan,
+	($scan): boolean =>
+		$scan?.state === 'scanning' &&
+		($scan.scanPhase === 'discovery' || $scan.scanPhase === 'ingestion')
+);
+
 /** Whether an operation is running (from active scan) - LEGACY */
 export const isRunning = derived(activeScan, ($scan) => $scan?.state === 'scanning');
 
