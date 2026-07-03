@@ -836,6 +836,8 @@ interface JobProgressEvent {
 	processed: number;
 	total: number | null;
 	detail: string;
+	/** Canonical committed-so-far counts (DB-true) — the numbers every surface shows. */
+	counts?: { files: number; folders: number; archiveEntries: number; bytes: number };
 }
 
 function tryParseJsonProgressEvent(line: string): JobProgressEvent | null {
@@ -871,7 +873,14 @@ export function parseScanOutputForScan(scanId: string, line: string): void {
 		const metrics =
 			event.phase === 'hashing'
 				? { filesHashed: event.processed, filesToHash: event.total ?? 0 }
-				: { filesDiscovered: event.processed };
+				: event.counts
+					? {
+							filesDiscovered: event.counts.files,
+							folders: event.counts.folders,
+							archiveEntries: event.counts.archiveEntries,
+							totalSize: event.counts.bytes
+						}
+					: { filesDiscovered: event.processed };
 		scansStore.updateScan(scanId, {
 			scanPhase: phase,
 			scanProgress: event.detail,

@@ -373,6 +373,7 @@ export interface TreeData {
 /** Stats data from get_stats query */
 export interface ScanStats {
 	totalFiles: number;
+	totalFolders: number;
 	totalPhysicalSize: number;
 	totalContentSize: number;
 	duplicateGroups: number;

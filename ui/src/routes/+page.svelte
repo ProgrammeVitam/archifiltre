@@ -384,8 +384,10 @@
 			path: '',
 			name: rootName,
 			total_size: stats.totalPhysicalSize,
+			// Canonical counts (== the DB, == status bar). dir_count uses the stats folder
+			// count, NOT tree.directories.length (which is only the loaded/rolled-up dirs).
 			file_count: stats.totalFiles,
-			dir_count: tree.directories.length
+			dir_count: stats.totalFolders
 		});
 	}
 
@@ -706,8 +708,11 @@
 	// actually belongs to it — otherwise the status bar would show a previously-viewed
 	// completed tab's totals over a live scan. Scanning/other tabs fall back to scanResult.
 	let activeStats = $derived(shownScanId === $activeScan?.id ? statsData : null);
+	// Canonical counts, one source: settled → DB stats; live/other → scanResult (fed by
+	// the same job:progress `counts`). files and folders resolve identically so the status
+	// bar can never disagree with the panel (which reads the same values).
 	let fileCount = $derived(activeStats?.totalFiles ?? $activeScan?.scanResult.filesDiscovered ?? 0);
-	let folderCount = $derived($activeScan?.scanResult.folders ?? 0);
+	let folderCount = $derived(activeStats?.totalFolders ?? $activeScan?.scanResult.folders ?? 0);
 	let duplicateCount = $derived(
 		activeStats?.duplicateFiles ?? $activeScan?.scanResult.duplicateFiles ?? 0
 	);
@@ -775,7 +780,7 @@
 				{#if $selectedItem || $hoveredItem}
 					<!-- Owner mode: the DB is live-readable during the scan, so the panel
 					     queries real data instead of skeletons. -->
-					<FileDetailsPanel loading={!useOwnerDb()} onGoHome={selectScanningRoot} onNavigate={navigateToPath} rootName={scanRootName} />
+					<FileDetailsPanel onGoHome={selectScanningRoot} onNavigate={navigateToPath} rootName={scanRootName} />
 				{/if}
 			</div>
 		{:else}

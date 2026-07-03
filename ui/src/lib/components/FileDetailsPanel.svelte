@@ -7,13 +7,16 @@
 		invalidateEnrichment,
 		enrichmentInvalidation,
 		reportSaveStatus,
-		scanResult,
+		scanPhase,
 		isDiscovering,
-		activeScan
+		activeScan,
+		panelTab
 	} from '$lib/stores';
+	import * as Tabs from '$lib/components/ui/tabs';
 	import { Skeleton } from '$lib/components/ui/skeleton';
+	import { _, locale } from '$lib/i18n';
+	import { fmtBytes, fmtNum, fmtDate } from '$lib/format';
 	import {
-		formatBytes,
 		queryDirectoryDescription,
 		queryDirDateStats,
 		queryComposition,
@@ -55,7 +58,6 @@
 		EyeOffIcon,
 		FilesIcon,
 		FolderOpenIcon,
-		TextIcon,
 		LoaderCircleIcon,
 		Trash2Icon,
 		LeafIcon,
@@ -67,6 +69,7 @@
 		LayersIcon
 	} from '@lucide/svelte';
 	import FilePreview from './FilePreview.svelte';
+	import RootSummary from './RootSummary.svelte';
 
 	// AI description state
 	let aiDescription: DirectoryDescription | null = $state(null);
@@ -107,14 +110,17 @@
 
 	// onGoHome (× / root crumb): return to the whole-scan home state.
 	// rootName: the scanned folder's display name, always the first breadcrumb.
-	// loading: a scan is in progress, so the database is being written and cannot be
-	// read — show the stream-known fields (size/counts) and skeleton everything that
-	// needs a query (depth, dates, composition, summary, enrichment) until completion.
 	let {
 		onGoHome,
-		rootName = '',
-		loading = false
-	}: { onGoHome?: () => void; rootName?: string; loading?: boolean } = $props();
+		onNavigate,
+		rootName = ''
+	}: {
+		onGoHome?: () => void;
+		/** Jump to an ancestor folder from the breadcrumb: selects it (updating the panel)
+		 *  and, since selection is shared, highlights it on the chart. */
+		onNavigate?: (path: string) => void;
+		rootName?: string;
+	} = $props();
 
 	// Hover-to-preview: the hovered item takes priority so moving the mouse over a
 	// block previews it; releasing the hover reverts to the committed selection.
@@ -124,21 +130,31 @@
 	// close button — it IS the close target. (The connector itself is drawn by the
 	// chart, behind the blocks; the panel no longer renders it.)
 	let isRootSelected = $derived(($selectedItem?.path ?? '') === '');
+	// The right column splits into Details/Enrichment tabs ONLY for a real item. The
+	// root / whole-scan overview has no enrichment, so it shows metadata alone — no
+	// tab bar. (Based on the DISPLAYED item, so hovering a block over the root shows
+	// tabs too.)
+	let showTabs = $derived(!!displayItem && (displayItem.path ?? '') !== '');
+	// The DISPLAYED item is the whole-scan root (path ''). The root always routes to the
+	// dedicated borderless RootSummary (which shows the live whole-scan counts, skeletoning
+	// what isn't ready). Hovering a block makes displayItem a sub-folder → the item card.
+	let isRootDisplayed = $derived(!!displayItem && (displayItem.path ?? '') === '');
+	let useRootSummary = $derived(isRootDisplayed);
 
-	// Size / file / folder counts are available without the DB. For the ROOT during a scan
-	// we show the live scan-progress figures (they climb every tick) rather than the DB
-	// rollup, which for the very root lands only once aggregation reaches the top — so in
-	// owner mode too, not just the legacy `loading` path. A selected sub-folder uses its own
-	// aggregates; outside a scan they're just the selected item's values.
-	let liveRoot = $derived(isRootSelected && (loading || $activeScan?.state === 'scanning'));
-	let shownSize = $derived(liveRoot ? $scanResult.totalSize : (displayItem?.size ?? 0));
-	let shownFiles = $derived(liveRoot ? $scanResult.filesDiscovered : displayItem?.fileCount);
-	let shownFolders = $derived(liveRoot ? $scanResult.folders : displayItem?.dirCount);
-	// The root's size/CO₂/folder total only settle when the scan completes (the file count
-	// is the one figure that climbs live) — so during an owner-mode scan we shimmer them as
-	// "computing" rather than show a frozen, misleading 0. `loading` is the legacy path,
-	// which computes these in JS, so this targets owner mode only.
-	let rootComputing = $derived(!loading && isRootSelected && $activeScan?.state === 'scanning');
+	// The item card is ONLY ever a sub-folder (the root goes to RootSummary), so its counts
+	// are always that folder's OWN aggregates — never the scan-wide figures. size/files/
+	// folders come from the folder's DB rollup (dirDateStats, exact, loads at structure-
+	// ready) or, during the discovery/ingestion window before that, the live tree node
+	// (displayItem, from dir_stats). Both are canonical per-subtree counts (see
+	// project-canonical-count-model), so a hovered sub-folder shows a subset ≤ the whole
+	// scan, never the scan total.
+	const STRUCTURE_READY_PHASES = ['prefilter', 'hashing', 'duplicate-detection', 'complete'];
+	let structureReady = $derived(
+		$activeScan?.state !== 'scanning' || STRUCTURE_READY_PHASES.includes($scanPhase)
+	);
+	let shownSize = $derived(dirDateStats?.size ?? displayItem?.size ?? 0);
+	let shownFiles = $derived(dirDateStats?.fileCount ?? displayItem?.fileCount);
+	let shownFolders = $derived(dirDateStats?.dirCount ?? displayItem?.dirCount);
 
 	// Per-element enrichment, read on selection (query-on-select). PGlite is the
 	// source of truth; this is not a long-lived cache — it is re-read whenever the
@@ -188,11 +204,6 @@
 	// Fetch enrichment when the selected element changes.
 	$effect(() => {
 		const item = $selectedItem;
-		if (loading) {
-			enrichmentPath = null;
-			elementEnrichment = null;
-			return;
-		}
 		if (item && item.path !== enrichmentPath) {
 			enrichmentPath = item.path;
 			elementEnrichment = null;
@@ -374,14 +385,6 @@
 	// Fetch AI description when a directory is selected
 	$effect(() => {
 		const item = $selectedItem;
-		if (loading) {
-			// DB is being written by the scanner — don't query; the skeleton stands in.
-			// Reset so the real fetch fires once the scan completes (loading → false).
-			lastDescribedPath = null;
-			aiDescription = null;
-			isLoadingDescription = false;
-			return;
-		}
 		if (item && item.type === 'directory' && item.path !== lastDescribedPath) {
 			lastDescribedPath = item.path;
 			isLoadingDescription = true;
@@ -399,10 +402,13 @@
 		}
 	});
 
-	// Fetch date stats for the displayed directory (hover preview included).
+	// Fetch date stats + subtree aggregate (size/counts) for the displayed directory (hover
+	// preview included). Skipped while the walk is still ingesting — the aggregate would be
+	// partial — and re-fetched the instant the structure is ready (reads `structureReady`, so
+	// resetting lastDateStatsPath below makes it fetch fresh at that transition).
 	$effect(() => {
 		const item = displayItem;
-		if (loading) {
+		if (!structureReady) {
 			lastDateStatsPath = null;
 			dirDateStats = null;
 			isLoadingDateStats = false;
@@ -425,10 +431,11 @@
 		}
 	});
 
-	// Fetch composition for the displayed directory (hover preview included).
+	// Fetch composition for the displayed directory (hover preview included). Same readiness
+	// gate as the date stats: partial mid-walk, fetched once the structure is ready.
 	$effect(() => {
 		const item = displayItem;
-		if (loading) {
+		if (!structureReady) {
 			lastCompositionPath = null;
 			composition = null;
 			return;
@@ -452,26 +459,16 @@
 		return true;
 	});
 
-	function formatCO2(bytes: number): string {
+	// CO₂ estimate, with the number localized (comma decimal in fr/de) and the "/year" suffix
+	// translated (an / year / Jahr) via root.perYear. The unit itself (kg/g/mg CO₂eq) is
+	// scientific and stays as-is.
+	function formatCO2(bytes: number, loc: string): string {
 		const grams = (bytes / 1024 ** 3) * 11.6;
-		if (grams >= 1000) return `${(grams / 1000).toFixed(2)} kg CO₂eq/year`;
-		if (grams < 0.01) return `${(grams * 1000).toFixed(2)} mg CO₂eq/year`;
-		return `${grams.toFixed(2)} g CO₂eq/year`;
-	}
-
-	// Format a unix timestamp (seconds) into a human-readable date
-	function formatDate(timestamp: number | undefined): string | null {
-		if (timestamp === undefined || timestamp === 0) return null;
-		// mtime may be in seconds
-		const ms = timestamp < 1e12 ? timestamp * 1000 : timestamp;
-		const date = new Date(ms);
-		return date.toLocaleDateString(undefined, {
-			year: 'numeric',
-			month: 'short',
-			day: 'numeric',
-			hour: '2-digit',
-			minute: '2-digit'
-		});
+		const per = $_('root.perYear');
+		const n = (v: number) => new Intl.NumberFormat(loc, { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(v);
+		if (grams >= 1000) return `${n(grams / 1000)} kg CO₂eq/${per}`;
+		if (grams < 0.01) return `${n(grams * 1000)} mg CO₂eq/${per}`;
+		return `${n(grams)} g CO₂eq/${per}`;
 	}
 
 	// Get file extension from name
@@ -575,11 +572,23 @@
 
 {#if displayItem}
 	<div class="relative flex min-h-0 flex-1 flex-col px-4" class:opacity-80={isPreview}>
+		{#if useRootSummary}
+			<!-- Whole-scan overview: an anchored sheet with a defined top edge, docked to the
+			     bottom — reads as the root overview, not an item card. -->
+			<div class="flex flex-1 flex-col overflow-hidden">
+				<RootSummary {rootName} />
+			</div>
+		{:else}
 		<!-- Drawer (the workspace card, a clean golden-ratio share of the height). The
 		     connector that ties it to the chart is drawn by the chart, behind the
 		     blocks — it's purely graphical and has no claim on this layout. -->
+		<!-- A drilled-in item (file or subfolder) gets a generous shadow so it reads as a
+		     focused card lifted off the page — clearly distinct from the flat, ambient
+		     ROOT overview panel (which keeps just its border). -->
 		<div
-			class="mb-4 flex flex-1 flex-col overflow-hidden rounded-lg border border-border bg-background"
+			class="mb-4 flex flex-1 flex-col overflow-hidden rounded-lg border border-border bg-background transition-shadow duration-200 {showTabs
+				? 'shadow-xl'
+				: ''}"
 		>
 			<!-- Breadcrumbs header -->
 			<div
@@ -618,9 +627,15 @@
 								{crumb.display}
 							</button>
 						{:else}
-							<span class="shrink-0 rounded px-1.5 py-0.5 transition-colors hover:bg-muted">
+							<!-- Intermediate ancestor folder → clickable: select it (panel + chart). -->
+							<button
+								type="button"
+								onclick={() => onNavigate?.(crumb.path)}
+								class="shrink-0 cursor-pointer rounded px-1.5 py-0.5 transition-colors hover:bg-muted hover:text-foreground"
+								title={crumb.display}
+							>
 								{crumb.display}
-							</span>
+							</button>
 						{/if}
 					{/each}
 				</div>
@@ -661,30 +676,16 @@
 				{:else if displayItem.type === 'directory'}
 					<!-- Directory: AI description -->
 					<div class="flex w-1/2 shrink-0 flex-col border-r border-border bg-muted/20 p-6">
-						<div class="mb-3 flex items-center gap-2 text-sm font-medium text-muted-foreground">
-							<TextIcon class="h-4 w-4" />
-							<span>Summary</span>
-						</div>
-
-						{#if loading}
-							<!-- The AI summary needs the DB (and the LLM), neither reachable
-							     mid-scan — shimmer until completion. -->
-							<div class="flex flex-1 flex-col gap-2">
-								<Skeleton class="h-4 w-full" />
-								<Skeleton class="h-4 w-[92%]" />
-								<Skeleton class="h-4 w-[96%]" />
-								<Skeleton class="h-4 w-3/4" />
-							</div>
-						{:else if lastDescribedPath !== displayItem.path}
+						{#if lastDescribedPath !== displayItem.path}
 							<!-- Hover preview: the AI summary stays load-on-select (no LLM call
 							     per hover), so show a hint rather than another item's summary. -->
 							<p class="flex-1 text-sm text-muted-foreground/40 italic">
-								Select this folder to load its summary.
+								{$_('details.selectFolderHint')}
 							</p>
 						{:else if isLoadingDescription}
 							<div class="flex flex-1 items-center gap-2 text-sm text-muted-foreground">
 								<LoaderCircleIcon class="h-4 w-4 animate-spin" />
-								<span>Analyzing directory contents…</span>
+								<span>{$_('details.analyzing')}</span>
 							</div>
 						{:else if aiDescription?.description}
 							<div class="flex flex-1 flex-col">
@@ -692,25 +693,26 @@
 									{aiDescription.description}
 								</p>
 								{#if aiDescription.model}
-									<p class="mt-auto pt-4 text-xs text-muted-foreground/50">
-										{aiDescription.model}{aiDescription.cached ? ' · cached' : ''}
+									<p class="mt-auto pt-4 text-xs text-muted-foreground/60">
+										{$_('root.summarizedBy')}
+										{aiDescription.model}{aiDescription.cached ? ' · ' + $_('details.cached') : ''}
 									</p>
 								{/if}
 							</div>
 						{:else if aiDescription?.error}
 							<p class="text-sm text-muted-foreground/60 italic">{aiDescription.error}</p>
 						{:else}
-							<p class="text-sm text-muted-foreground/40 italic">No description available.</p>
+							<p class="text-sm text-muted-foreground/40 italic">{$_('details.noDescription')}</p>
 						{/if}
 
 						<!-- Composition: file-type breakdown of this subtree (same colours as
 						     the chart). Shown at every level — the whole scan and any folder.
-						     DB-derived → shimmer a placeholder bar during a scan. -->
-						{#if loading}
+						     DB-derived → shimmer only while the walk ingests; ready once hashing starts. -->
+						{#if !structureReady}
 							<div class="mt-5 flex shrink-0 flex-col gap-2 border-t border-border pt-4">
 								<div class="flex items-center gap-2 text-sm font-medium text-muted-foreground">
 									<FilesIcon class="h-4 w-4" />
-									<span>Composition</span>
+									<span>{$_('details.composition')}</span>
 								</div>
 								<Skeleton class="h-3 w-full rounded-full" />
 								<div class="flex flex-wrap gap-x-3 gap-y-1">
@@ -723,15 +725,15 @@
 							<div class="mt-5 flex shrink-0 flex-col gap-2 border-t border-border pt-4">
 								<div class="flex items-center gap-2 text-sm font-medium text-muted-foreground">
 									<FilesIcon class="h-4 w-4" />
-									<span>Composition</span>
+									<span>{$_('details.composition')}</span>
 								</div>
 								<div class="flex h-3 w-full overflow-hidden rounded-full">
 									{#each typeBreakdown.segments as seg (seg.type)}
 										<div
 											style="width: {seg.pct}%; background: var(--color-type-{seg.type});"
-											title="{seg.type}: {formatBytes(seg.size)} · {seg.count} file{seg.count === 1
-												? ''
-												: 's'}"
+											title="{$_('fileType.' + seg.type)}: {$fmtBytes(seg.size)} · {$fmtNum(
+												seg.count
+											)}"
 										></div>
 									{/each}
 								</div>
@@ -742,7 +744,7 @@
 												class="h-2.5 w-2.5 shrink-0 rounded-sm"
 												style="background: var(--color-type-{seg.type});"
 											></span>
-											<span class="capitalize text-foreground">{seg.type}</span>
+											<span class="text-foreground">{$_('fileType.' + seg.type)}</span>
 											<span class="text-muted-foreground">{Math.round(seg.pct)}%</span>
 										</span>
 									{/each}
@@ -752,311 +754,324 @@
 					</div>
 				{/if}
 
-				<!-- Right column: Metadata -->
-				<div class="flex min-w-0 flex-1 flex-col overflow-y-auto p-6">
-					<div class="grid grid-cols-[auto_1fr] items-baseline gap-x-6 gap-y-3 text-sm">
-						<!-- Size -->
-						<div class="flex items-center gap-2 text-muted-foreground">
-							<HardDriveIcon class="h-3.5 w-3.5" />
-							<span>Size</span>
-						</div>
-						{#if rootComputing}
-							<Skeleton class="h-4 w-20" />
-						{:else}
+				<!-- Right column: Details / Enrichment tabs. The left column is untouched;
+				     only the metadata/enrichment split gets tabs so you needn't scroll the
+				     whole panel. The active tab lives in the panelTab store, so it survives
+				     re-selection — pick "Enrichment" once and enrich file after file. -->
+				<div class="flex min-w-0 flex-1 flex-col overflow-hidden p-6">
+					<!-- Details grid, shared by the tabbed (real item) and bare (root) layouts. -->
+					{#snippet detailsGrid()}
+						<div class="grid grid-cols-[auto_1fr] items-baseline gap-x-6 gap-y-3 text-sm">
+							<!-- Size -->
+							<div class="flex items-center gap-2 text-muted-foreground">
+								<HardDriveIcon class="h-3.5 w-3.5" />
+								<span>{$_('details.size')}</span>
+							</div>
 							<span class="font-medium text-foreground">
-								{formatBytes(shownSize)}
+								{$fmtBytes(shownSize)}
 								{#if displayItem.type === 'file' && displayItem.contentSize != null && displayItem.contentSize !== displayItem.size}
 									<span class="ml-1 font-normal text-muted-foreground">
-										({formatBytes(displayItem.contentSize)} on disk)
+										({$fmtBytes(displayItem.contentSize)} {$_('details.onDisk')})
 									</span>
 								{/if}
 							</span>
-						{/if}
 
-						<!-- CO₂ -->
-						<div class="flex items-center gap-2 text-muted-foreground">
-							<LeafIcon class="h-3.5 w-3.5" />
-							<span>CO₂</span>
-						</div>
-						{#if rootComputing}
-							<Skeleton class="h-4 w-24" />
-						{:else}
-							<span class="font-medium text-foreground">{formatCO2(shownSize)}</span>
-						{/if}
-
-						{#if displayItem.type === 'directory'}
-							<!-- File count -->
+							<!-- CO₂ -->
 							<div class="flex items-center gap-2 text-muted-foreground">
-								<FilesIcon class="h-3.5 w-3.5" />
-								<span>Files</span>
+								<LeafIcon class="h-3.5 w-3.5" />
+								<span>{$_('details.co2')}</span>
 							</div>
-							<!-- The file count is the one figure that climbs live during a scan;
-							     pulse it while discovering so it reads as actively changing. -->
-							<span class="font-medium text-foreground" class:animate-pulse={$isDiscovering}>
-								{shownFiles?.toLocaleString() ?? 0}
-							</span>
+							<span class="font-medium text-foreground">{formatCO2(shownSize, $locale ?? 'en')}</span>
 
-							<!-- Folder count -->
-							<div class="flex items-center gap-2 text-muted-foreground">
-								<FolderOpenIcon class="h-3.5 w-3.5" />
-								<span>Folders</span>
-							</div>
-							{#if rootComputing}
-								<Skeleton class="h-4 w-16" />
-							{:else}
+							{#if displayItem.type === 'directory'}
+								<!-- File count -->
+								<div class="flex items-center gap-2 text-muted-foreground">
+									<FilesIcon class="h-3.5 w-3.5" />
+									<span>{$_('details.files')}</span>
+								</div>
+								<!-- The file count is the one figure that climbs live during a scan;
+								     pulse it while discovering so it reads as actively changing. -->
+								<span class="font-medium text-foreground" class:animate-pulse={$isDiscovering}>
+									{$fmtNum(shownFiles ?? 0)}
+								</span>
+
+								<!-- Folder count -->
+								<div class="flex items-center gap-2 text-muted-foreground">
+									<FolderOpenIcon class="h-3.5 w-3.5" />
+									<span>{$_('details.folders')}</span>
+								</div>
 								<span class="font-medium text-foreground">
-									{shownFolders?.toLocaleString() ?? 0}
+									{$fmtNum(shownFolders ?? 0)}
 								</span>
-							{/if}
 
-							<!-- Deepest descendant: how far the structure nests below this
-							     folder, and where. Surfaces the "this corner goes deep" signal
-							     the icicle can only hint at when zoomed out. Needs the DB, so it
-							     shimmers until the scan completes. -->
-							{#if loading}
-								<div class="flex items-center gap-2 text-muted-foreground">
-									<LayersIcon class="h-3.5 w-3.5" />
-									<span>Deepest</span>
-								</div>
-								<Skeleton class="h-4 w-28" />
-							{:else if (displayItem.maxDepth ?? 0) > 0}
-								<div class="flex items-center gap-2 text-muted-foreground">
-									<LayersIcon class="h-3.5 w-3.5" />
-									<span>Deepest</span>
-								</div>
-								<span class="font-medium text-foreground" title={displayItem.deepestPath ?? undefined}>
-									{displayItem.maxDepth}
-									{displayItem.maxDepth === 1 ? 'level' : 'levels'}
-									{#if displayItem.deepestPath}
-										<span class="font-normal text-muted-foreground"
-											>· {displayItem.deepestPath.split('/').pop()}</span
-										>
-									{/if}
-								</span>
-							{/if}
+								<!-- Deepest descendant: how far the structure nests below this
+								     folder, and where. Surfaces the "this corner goes deep" signal
+								     the icicle can only hint at when zoomed out. From the folder's
+								     own tree node (live during a scan). -->
+								{#if (displayItem.maxDepth ?? 0) > 0}
+									<div class="flex items-center gap-2 text-muted-foreground">
+										<LayersIcon class="h-3.5 w-3.5" />
+										<span>{$_('details.deepest')}</span>
+									</div>
+									<span class="font-medium text-foreground" title={displayItem.deepestPath ?? undefined}>
+										{displayItem.maxDepth}
+										{displayItem.maxDepth === 1 ? $_('details.level') : $_('details.levels')}
+										{#if displayItem.deepestPath}
+											<span class="font-normal text-muted-foreground"
+												>· {displayItem.deepestPath.split('/').pop()}</span
+											>
+										{/if}
+									</span>
+								{/if}
 
-							<!-- Date stats. DB-derived → shimmer the three rows during a scan. -->
-							{#if loading}
-								{#each ['Oldest file', 'Newest file', 'Median date'] as label (label)}
+								<!-- Date stats. DB-derived → shimmer only while the walk ingests; ready at hashing. -->
+								{#if !structureReady}
+									{#each ['details.oldestFile', 'details.newestFile', 'details.medianDate'] as label (label)}
+										<div class="flex items-center gap-2 text-muted-foreground">
+											<CalendarIcon class="h-3.5 w-3.5" />
+											<span>{$_(label)}</span>
+										</div>
+										<Skeleton class="h-4 w-36" />
+									{/each}
+								{:else if isLoadingDateStats}
+									<div class="col-span-2 flex items-center gap-2 text-sm text-muted-foreground">
+										<LoaderCircleIcon class="h-3.5 w-3.5 animate-spin" />
+										<span>{$_('details.computingDates')}</span>
+									</div>
+								{:else if dirDateStats && dirDateStats.count > 0}
 									<div class="flex items-center gap-2 text-muted-foreground">
 										<CalendarIcon class="h-3.5 w-3.5" />
-										<span>{label}</span>
+										<span>{$_('details.oldestFile')}</span>
 									</div>
-									<Skeleton class="h-4 w-36" />
-								{/each}
-							{:else if isLoadingDateStats}
-								<div class="col-span-2 flex items-center gap-2 text-sm text-muted-foreground">
-									<LoaderCircleIcon class="h-3.5 w-3.5 animate-spin" />
-									<span>Computing date statistics…</span>
-								</div>
-							{:else if dirDateStats && dirDateStats.count > 0}
-								<div class="flex items-center gap-2 text-muted-foreground">
-									<CalendarIcon class="h-3.5 w-3.5" />
-									<span>Oldest file</span>
-								</div>
-								<span class="font-medium text-foreground">{formatDate(dirDateStats.min ?? undefined) ?? '—'}</span>
+									<span class="font-medium text-foreground">{$fmtDate(dirDateStats.min) ?? '—'}</span>
 
-								<div class="flex items-center gap-2 text-muted-foreground">
-									<CalendarIcon class="h-3.5 w-3.5" />
-									<span>Newest file</span>
-								</div>
-								<span class="font-medium text-foreground">{formatDate(dirDateStats.max ?? undefined) ?? '—'}</span>
-
-								<div class="flex items-center gap-2 text-muted-foreground">
-									<CalendarIcon class="h-3.5 w-3.5" />
-									<span>Median date</span>
-								</div>
-								<span class="font-medium text-foreground">{formatDate(dirDateStats.median ?? undefined) ?? '—'}</span>
-							{/if}
-						{/if}
-
-						{#if displayItem.type === 'file'}
-							<!-- Extension -->
-							{@const ext = getExtension(displayItem.name)}
-							{#if ext}
-								<div class="flex items-center gap-2 text-muted-foreground">
-									<FileIcon class="h-3.5 w-3.5" />
-									<span>Type</span>
-								</div>
-								<span class="font-medium text-foreground uppercase">{ext}</span>
-							{/if}
-
-							<!-- Modified date -->
-							{@const formattedDate = formatDate(displayItem.mtime)}
-							{#if formattedDate}
-								<div class="flex items-center gap-2 text-muted-foreground">
-									<ClockIcon class="h-3.5 w-3.5" />
-									<span>Modified</span>
-								</div>
-								<span class="font-medium text-foreground">{formattedDate}</span>
-							{/if}
-
-							<!-- Hidden -->
-							{#if displayItem.isHidden}
-								<div class="flex items-center gap-2 text-muted-foreground">
-									<EyeOffIcon class="h-3.5 w-3.5" />
-									<span>Visibility</span>
-								</div>
-								<span class="font-medium text-foreground">Hidden</span>
-							{/if}
-
-							<!-- Archive format -->
-							{#if displayItem.isArchive && displayItem.archiveFormat}
-								<div class="flex items-center gap-2 text-muted-foreground">
-									<ArchiveIcon class="h-3.5 w-3.5" />
-									<span>Archive</span>
-								</div>
-								<span class="font-medium text-foreground">{displayItem.archiveFormat}</span>
-							{/if}
-
-							<!-- Hash -->
-							{#if displayItem.hash}
-								<div class="flex items-center gap-2 text-muted-foreground">
-									<HashIcon class="h-3.5 w-3.5" />
-									<span>Hash</span>
-								</div>
-								<span
-									class="truncate font-mono text-xs font-medium text-foreground"
-									title={displayItem.hash}
-								>
-									{displayItem.hash}
-								</span>
-							{/if}
-						{/if}
-
-						<!-- Enrichment (editable for a selected element — never the whole scan
-						     nor a transient hover preview, which has no committed selection).
-						     Hidden during a scan: writes go to the DB the scanner owns. -->
-						{#if $selectedItem && !isRootSelected && !isPreview && !loading}
-							<div class="col-span-2 mt-3 flex flex-col gap-4 border-t border-border pt-4">
-								<!-- Alias -->
-								<label class="flex flex-col gap-1.5">
-									<span class="flex items-center gap-2 text-xs text-muted-foreground">
-										<PencilIcon class="h-3.5 w-3.5" />
-										Alias
-									</span>
-									<Input
-										type="text"
-										bind:value={aliasInput}
-										onblur={commitAlias}
-										oninput={() => aliasFieldState === 'error' && (aliasFieldState = 'idle')}
-										onkeydown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
-										placeholder={originalName}
-										class={aliasFieldState === 'saved'
-											? 'border-[var(--color-success)]'
-											: aliasFieldState === 'error'
-												? 'border-destructive'
-												: 'transition-colors duration-700'}
-									/>
-									{#if aliasFieldState === 'error'}
-										<span class="text-xs text-destructive">Couldn't save alias — try again</span>
-									{/if}
-								</label>
-
-								<!-- Comment -->
-								<label class="flex flex-col gap-1.5">
-									<span class="flex items-center gap-2 text-xs text-muted-foreground">
-										<MessageSquareTextIcon class="h-3.5 w-3.5" />
-										Comment
-									</span>
-									<Textarea
-										bind:value={commentInput}
-										onblur={commitComment}
-										oninput={() => commentFieldState === 'error' && (commentFieldState = 'idle')}
-										rows={2}
-										placeholder="Add a comment…"
-										class={commentFieldState === 'saved'
-											? 'border-[var(--color-success)]'
-											: commentFieldState === 'error'
-												? 'border-destructive'
-												: 'transition-colors duration-700'}
-									/>
-									{#if commentFieldState === 'error'}
-										<span class="text-xs text-destructive">Couldn't save comment — try again</span>
-									{/if}
-								</label>
-
-								<!-- Tags -->
-								<div class="flex flex-col gap-1.5">
-									<span class="flex items-center gap-2 text-xs text-muted-foreground">
-										<TagIcon class="h-3.5 w-3.5" />
-										Tags
-									</span>
-									{#if assignedTags.length > 0}
-										<div class="flex flex-wrap gap-1.5">
-											{#each assignedTags as tag (tag.tag_id)}
-												<Badge variant="secondary" class="gap-1 pr-1">
-													{tag.name}
-													<button
-														type="button"
-														onclick={() => removeTagAssignment(tag.tag_id)}
-														class="rounded-full text-muted-foreground hover:text-foreground"
-														aria-label={`Remove tag ${tag.name}`}
-													>
-														<XIcon class="h-3 w-3" />
-													</button>
-												</Badge>
-											{/each}
-										</div>
-									{/if}
-									<div class="flex items-center gap-1.5">
-										<Input
-											type="text"
-											bind:value={tagInput}
-											oninput={() => tagError && (tagError = false)}
-											onkeydown={(e) => e.key === 'Enter' && (e.preventDefault(), submitTag())}
-											list="tag-suggestions"
-											placeholder="Add a tag…"
-											class={'flex-1 transition-colors duration-300 ' +
-												(tagError ? 'border-destructive' : '')}
-										/>
-										<datalist id="tag-suggestions">
-											{#each [...$tagDictionary.values()] as name}
-												<option value={name}></option>
-											{/each}
-										</datalist>
-										<Button
-											variant="outline"
-											size="sm"
-											onclick={submitTag}
-											disabled={tagInput.trim() === ''}
-											class="shrink-0 gap-1"
-										>
-											<PlusIcon class="h-3.5 w-3.5" />
-											Add
-										</Button>
+									<div class="flex items-center gap-2 text-muted-foreground">
+										<CalendarIcon class="h-3.5 w-3.5" />
+										<span>{$_('details.newestFile')}</span>
 									</div>
-									{#if tagError}
-										<span class="text-xs text-destructive">Couldn't save tag — try again</span>
-									{/if}
-								</div>
+									<span class="font-medium text-foreground">{$fmtDate(dirDateStats.max) ?? '—'}</span>
 
-								<!-- Mark for deletion -->
-								<div class="border-t border-border pt-3">
-									<Button
-										variant={isDirectlyTagged ? 'destructive' : 'outline'}
-										size="sm"
-										onclick={toggleDeleteTag}
-										class="w-full gap-2"
+									<div class="flex items-center gap-2 text-muted-foreground">
+										<CalendarIcon class="h-3.5 w-3.5" />
+										<span>{$_('details.medianDate')}</span>
+									</div>
+									<span class="font-medium text-foreground">{$fmtDate(dirDateStats.median) ?? '—'}</span>
+								{/if}
+							{/if}
+
+							{#if displayItem.type === 'file'}
+								<!-- Extension -->
+								{@const ext = getExtension(displayItem.name)}
+								{#if ext}
+									<div class="flex items-center gap-2 text-muted-foreground">
+										<FileIcon class="h-3.5 w-3.5" />
+										<span>{$_('details.type')}</span>
+									</div>
+									<span class="font-medium text-foreground uppercase">{ext}</span>
+								{/if}
+
+								<!-- Modified date -->
+								{@const formattedDate = $fmtDate(displayItem.mtime)}
+								{#if formattedDate}
+									<div class="flex items-center gap-2 text-muted-foreground">
+										<ClockIcon class="h-3.5 w-3.5" />
+										<span>{$_('details.modified')}</span>
+									</div>
+									<span class="font-medium text-foreground">{formattedDate}</span>
+								{/if}
+
+								<!-- Hidden -->
+								{#if displayItem.isHidden}
+									<div class="flex items-center gap-2 text-muted-foreground">
+										<EyeOffIcon class="h-3.5 w-3.5" />
+										<span>Visibility</span>
+									</div>
+									<span class="font-medium text-foreground">Hidden</span>
+								{/if}
+
+								<!-- Archive format -->
+								{#if displayItem.isArchive && displayItem.archiveFormat}
+									<div class="flex items-center gap-2 text-muted-foreground">
+										<ArchiveIcon class="h-3.5 w-3.5" />
+										<span>Archive</span>
+									</div>
+									<span class="font-medium text-foreground">{displayItem.archiveFormat}</span>
+								{/if}
+
+								<!-- Hash -->
+								{#if displayItem.hash}
+									<div class="flex items-center gap-2 text-muted-foreground">
+										<HashIcon class="h-3.5 w-3.5" />
+										<span>{$_('details.hash')}</span>
+									</div>
+									<span
+										class="truncate font-mono text-xs font-medium text-foreground"
+										title={displayItem.hash}
 									>
-										<Trash2Icon class="h-4 w-4" />
-										{#if isDirectlyTagged}
-											Unmark for deletion
-										{:else}
-											Mark for deletion
-										{/if}
-									</Button>
-									{#if isItemTagged && !isDirectlyTagged}
-										<p class="mt-2 text-xs text-red-500">
-											A parent directory is marked for deletion
-										</p>
-									{/if}
-								</div>
-							</div>
-						{/if}
-					</div>
+										{displayItem.hash}
+									</span>
+								{/if}
+							{/if}
+						</div>
+					{/snippet}
+
+					{#if showTabs}
+						<!-- A real item: its own metadata (Details) + user enrichment (Enrichment). -->
+						<Tabs.Root bind:value={$panelTab} class="flex min-h-0 flex-1 flex-col gap-3">
+							<Tabs.List class="w-full">
+								<Tabs.Trigger value="details" class="flex-1">{$_('details.details')}</Tabs.Trigger>
+								<Tabs.Trigger value="enrichment" class="flex-1">{$_('details.enrichment')}</Tabs.Trigger>
+							</Tabs.List>
+							<Tabs.Content value="details" class="mt-0 min-h-0 flex-1 overflow-y-auto">
+								{@render detailsGrid()}
+							</Tabs.Content>
+
+							<!-- Enrichment: user-authored alias / comment / tags / mark-for-deletion.
+							     Editable for a committed selection (not a hover preview). The DB is
+							     live-writable mid-scan, so enrichment works during a scan too. -->
+							<Tabs.Content value="enrichment" class="mt-0 min-h-0 flex-1 overflow-y-auto">
+								{#if $selectedItem && !isRootSelected && !isPreview}
+									<div class="flex flex-col gap-4">
+										<!-- Alias -->
+										<label class="flex flex-col gap-1.5">
+											<span class="flex items-center gap-2 text-xs text-muted-foreground">
+												<PencilIcon class="h-3.5 w-3.5" />
+												Alias
+											</span>
+											<Input
+												type="text"
+												bind:value={aliasInput}
+												onblur={commitAlias}
+												oninput={() => aliasFieldState === 'error' && (aliasFieldState = 'idle')}
+												onkeydown={(e) => e.key === 'Enter' && e.currentTarget.blur()}
+												placeholder={originalName}
+												class={aliasFieldState === 'saved'
+													? 'border-[var(--color-success)]'
+													: aliasFieldState === 'error'
+														? 'border-destructive'
+														: 'transition-colors duration-700'}
+											/>
+											{#if aliasFieldState === 'error'}
+												<span class="text-xs text-destructive">Couldn't save alias — try again</span>
+											{/if}
+										</label>
+
+										<!-- Comment -->
+										<label class="flex flex-col gap-1.5">
+											<span class="flex items-center gap-2 text-xs text-muted-foreground">
+												<MessageSquareTextIcon class="h-3.5 w-3.5" />
+												Comment
+											</span>
+											<Textarea
+												bind:value={commentInput}
+												onblur={commitComment}
+												oninput={() => commentFieldState === 'error' && (commentFieldState = 'idle')}
+												rows={2}
+												placeholder="Add a comment…"
+												class={commentFieldState === 'saved'
+													? 'border-[var(--color-success)]'
+													: commentFieldState === 'error'
+														? 'border-destructive'
+														: 'transition-colors duration-700'}
+											/>
+											{#if commentFieldState === 'error'}
+												<span class="text-xs text-destructive">Couldn't save comment — try again</span>
+											{/if}
+										</label>
+
+										<!-- Tags -->
+										<div class="flex flex-col gap-1.5">
+											<span class="flex items-center gap-2 text-xs text-muted-foreground">
+												<TagIcon class="h-3.5 w-3.5" />
+												Tags
+											</span>
+											{#if assignedTags.length > 0}
+												<div class="flex flex-wrap gap-1.5">
+													{#each assignedTags as tag (tag.tag_id)}
+														<Badge variant="secondary" class="gap-1 pr-1">
+															{tag.name}
+															<button
+																type="button"
+																onclick={() => removeTagAssignment(tag.tag_id)}
+																class="rounded-full text-muted-foreground hover:text-foreground"
+																aria-label={`Remove tag ${tag.name}`}
+															>
+																<XIcon class="h-3 w-3" />
+															</button>
+														</Badge>
+													{/each}
+												</div>
+											{/if}
+											<div class="flex items-center gap-1.5">
+												<Input
+													type="text"
+													bind:value={tagInput}
+													oninput={() => tagError && (tagError = false)}
+													onkeydown={(e) => e.key === 'Enter' && (e.preventDefault(), submitTag())}
+													list="tag-suggestions"
+													placeholder="Add a tag…"
+													class={'flex-1 transition-colors duration-300 ' +
+														(tagError ? 'border-destructive' : '')}
+												/>
+												<datalist id="tag-suggestions">
+													{#each [...$tagDictionary.values()] as name}
+														<option value={name}></option>
+													{/each}
+												</datalist>
+												<Button
+													variant="outline"
+													size="sm"
+													onclick={submitTag}
+													disabled={tagInput.trim() === ''}
+													class="shrink-0 gap-1"
+												>
+													<PlusIcon class="h-3.5 w-3.5" />
+													Add
+												</Button>
+											</div>
+											{#if tagError}
+												<span class="text-xs text-destructive">Couldn't save tag — try again</span>
+											{/if}
+										</div>
+
+										<!-- Mark for deletion -->
+										<div class="border-t border-border pt-3">
+											<Button
+												variant={isDirectlyTagged ? 'destructive' : 'outline'}
+												size="sm"
+												onclick={toggleDeleteTag}
+												class="w-full gap-2"
+											>
+												<Trash2Icon class="h-4 w-4" />
+												{#if isDirectlyTagged}
+													Unmark for deletion
+												{:else}
+													Mark for deletion
+												{/if}
+											</Button>
+											{#if isItemTagged && !isDirectlyTagged}
+												<p class="mt-2 text-xs text-red-500">
+													A parent directory is marked for deletion
+												</p>
+											{/if}
+										</div>
+									</div>
+								{:else}
+									<p class="text-sm text-muted-foreground">
+										Select a file or folder to add enrichment.
+									</p>
+								{/if}
+							</Tabs.Content>
+						</Tabs.Root>
+					{:else}
+						<!-- Root / whole-scan overview: metadata only, so no tab bar. -->
+						<div class="min-h-0 flex-1 overflow-y-auto">
+							{@render detailsGrid()}
+						</div>
+					{/if}
 				</div>
 			</div>
 		</div>
+		{/if}
 	</div>
 {/if}
