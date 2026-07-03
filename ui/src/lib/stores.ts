@@ -82,10 +82,14 @@ export interface Scan {
 	/** Pause clicked, session ack (job:paused) not yet arrived — renders "Pausing…".
 	 *  Transient UI state: cleared on pause/resume and on restore. */
 	pauseRequested?: boolean;
-	/** Set by startup reconciliation when this scan's datadir is gone or won't open:
-	 *  'missing' = no datadir on disk; 'damaged' = present but PGlite couldn't recover it.
-	 *  The status bar/panel offers Re-scan (and annotation restore if a snapshot exists). */
-	datadirState?: 'missing' | 'damaged';
+	/** Set when this scan's datadir can't be opened. 'missing' = no datadir on disk;
+	 *  'damaged' = present but PGlite couldn't open it. Both auto-trigger a rebuild (the
+	 *  scan is deterministic) when the folder is reachable; 'unavailable' means the folder
+	 *  itself isn't reachable, so the UI offers Retry / Remove instead. */
+	datadirState?: 'missing' | 'damaged' | 'unavailable';
+	/** True while a damaged/missing scan is being rebuilt (auto re-scan) — the scanning UI
+	 *  shows a "Rebuilding…" note. Cleared on completion/cancel. Transient. */
+	rebuilding?: boolean;
 	/** True when a durable annotation snapshot exists for this scan's root, so the
 	 *  re-scan flow can offer to restore the user's work. Set during reconciliation. */
 	hasAnnotationBackup?: boolean;

@@ -154,10 +154,12 @@
 		"scanning": "Scanning"
 	},
 	"recovery": {
-		"damagedTitle": "This scan's data was damaged",
-		"damagedHint": "An unclean shutdown (power loss) corrupted its database. Re-scan the folder — your annotations will be restored if a backup exists.",
-		"rescan": "Re-scan",
-		"delete": "Delete",
+		"rebuilding": "Rebuilding this scan…",
+		"cancel": "Cancel",
+		"unopenableTitle": "This scan's data couldn't be opened",
+		"unavailableHint": "Its folder isn't available to rebuild it. Reconnect it and retry, or remove the scan.",
+		"retry": "Retry",
+		"remove": "Remove",
 		"restoreTitle": "Annotations found for this folder",
 		"restoreHint": "{count} saved annotation(s) from a previous scan can be restored.",
 		"restore": "Restore",

@@ -154,10 +154,12 @@
 		"scanning": "Scan"
 	},
 	"recovery": {
-		"damagedTitle": "Die Daten dieser Analyse wurden beschädigt",
-		"damagedHint": "Ein unsauberes Herunterfahren (Stromausfall) hat die Datenbank beschädigt. Analysieren Sie den Ordner erneut — Ihre Anmerkungen werden wiederhergestellt, falls eine Sicherung vorhanden ist.",
-		"rescan": "Erneut analysieren",
-		"delete": "Löschen",
+		"rebuilding": "Diese Analyse wird neu aufgebaut…",
+		"cancel": "Abbrechen",
+		"unopenableTitle": "Die Daten dieser Analyse konnten nicht geöffnet werden",
+		"unavailableHint": "Ihr Ordner ist nicht verfügbar, um sie neu aufzubauen. Verbinden Sie ihn erneut und versuchen Sie es noch einmal, oder entfernen Sie die Analyse.",
+		"retry": "Erneut versuchen",
+		"remove": "Entfernen",
 		"restoreTitle": "Anmerkungen für diesen Ordner gefunden",
 		"restoreHint": "{count} gespeicherte Anmerkung(en) aus einer früheren Analyse können wiederhergestellt werden.",
 		"restore": "Wiederherstellen",

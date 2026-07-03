@@ -42,6 +42,7 @@
 		setActiveQueryDb,
 		formatBytes,
 		useOwnerDb,
+		validatePath,
 		type TreeData,
 		type ScanStats
 	} from '$lib/tauri';
@@ -129,6 +130,7 @@
 							addTerminalLineToScan(scan.id, '✓ Scan completed successfully', 'success');
 							clearProvisionalTree(scan.id); // real DB-backed tree takes over
 							finishScanningScan(scan.id, true);
+							scansStore.updateScan(scan.id, { rebuilding: false }); // rebuild (if any) done
 							if (scan.id === $activeScan?.id) {
 								loadVisualizationData(scan.dbName, scan.id);
 							}
@@ -527,26 +529,76 @@
 	// Actions
 	// ================================
 
-	/** Re-scan a damaged/missing scan's folder: clear the recovery flag and re-run the
-	 *  scan into a FRESH datadir (new dbName), so a corrupted one is never reopened. The
-	 *  restore prompt fires on completion if a snapshot survived. */
-	async function handleRescanDamaged(): Promise<void> {
-		const scan = $activeScan;
+	// A scan whose datadir can't be opened is REBUILT automatically — the scan is
+	// deterministic, so re-walking the folder reproduces it. We don't ask (rebuilding is
+	// the obvious answer), but we do it visibly and cancelably, and only when the folder
+	// is actually reachable. Annotations, being the user's own work, are still restored
+	// via the (ask-first) prompt once the rebuild completes.
+	const recovering = new Set<string>(); // scanIds mid-recovery, so the watcher fires once
+
+	/** Rebuild a damaged/missing scan into a FRESH datadir (the old one is never reopened),
+	 *  or fall back to 'unavailable' when its folder isn't reachable. */
+	async function recoverScan(scanId: string): Promise<void> {
+		if (recovering.has(scanId)) return;
+		const scan = scansStore.getScan(scanId);
 		if (!scan?.path) return;
-		// Fresh datadir for the re-scan (the old one is damaged/gone).
-		scansStore.updateScan(scan.id, {
-			datadirState: undefined,
-			dbName: `archifiltre-scan-${scan.id}-${Date.now().toString(36)}`,
-			scanId: null
-		});
-		await handleStartAnalysis(scan.path);
+		recovering.add(scanId);
+		try {
+			// Guard: the folder may be an unplugged drive / unmounted share / deleted path.
+			const check = await validatePath(scan.path);
+			if (!check.exists || !check.isDirectory || !check.readable) {
+				scansStore.updateScan(scanId, { datadirState: 'unavailable', rebuilding: false });
+				return;
+			}
+			// Reachable → rebuild into a fresh datadir, shown as a normal (live-icicle) scan
+			// with a "Rebuilding…" note. handleStartAnalysis runs against the active scan.
+			scansStore.updateScan(scanId, {
+				datadirState: undefined,
+				rebuilding: true,
+				dbName: `archifiltre-scan-${scanId}-${Date.now().toString(36)}`,
+				scanId: null
+			});
+			if ($activeScan?.id !== scanId) scansStore.setActiveScan(scanId);
+			await handleStartAnalysis(scan.path);
+		} finally {
+			recovering.delete(scanId);
+		}
 	}
 
-	/** Discard a damaged/missing scan entirely. */
-	function handleDeleteDamaged(): void {
+	/** Retry after an 'unavailable' folder (e.g. the drive was plugged back in). */
+	function handleRetryRecover(): void {
+		const scan = $activeScan;
+		if (!scan) return;
+		scansStore.updateScan(scan.id, { datadirState: 'missing' }); // re-arm the watcher
+	}
+
+	/** Remove a scan whose folder is gone for good. */
+	function handleRemoveScan(): void {
 		const scan = $activeScan;
 		if (scan) scansStore.closeScan(scan.id);
 	}
+
+	/** Cancel an in-progress rebuild (stops the re-scan; leaves the partial as any scan). */
+	async function handleCancelRebuild(): Promise<void> {
+		const scan = $activeScan;
+		if (!scan?.dbName) return;
+		scansStore.updateScan(scan.id, { rebuilding: false });
+		try {
+			await sendQuery({ id: `cancel_${Date.now()}`, action: 'cancel_scan' }, scan.dbName);
+		} catch {
+			/* the scan will settle via job:paused regardless */
+		}
+	}
+
+	// Auto-recover watcher: when a tab whose datadir can't be opened becomes active, rebuild
+	// it (deterministic re-scan) or fall back to 'unavailable' — lazily, on activation, so
+	// several broken tabs never kick off heavy re-scans at once on launch.
+	$effect(() => {
+		const scan = $activeScan;
+		if (scan && (scan.datadirState === 'damaged' || scan.datadirState === 'missing')) {
+			void recoverScan(scan.id);
+		}
+	});
 
 	async function handleStartAnalysis(path: string): Promise<void> {
 		const scan = $activeScan;
@@ -667,9 +719,14 @@
 
 <!-- Main Container -->
 <div class="flex h-full flex-col">
-	<!-- Unclean-shutdown recovery: damaged/missing datadir → Re-scan/Delete; or restore
-	     the user's annotations after re-scanning a previously-annotated folder. -->
-	<ScanRecoveryBanner onRescan={handleRescanDamaged} onDelete={handleDeleteDamaged} />
+	<!-- Unclean-shutdown recovery: a damaged/missing datadir auto-rebuilds (Rebuilding…
+	     note + Cancel); an unreachable folder → Retry/Remove; and the annotation restore
+	     prompt after a rebuild completes. -->
+	<ScanRecoveryBanner
+		onCancelRebuild={handleCancelRebuild}
+		onRetry={handleRetryRecover}
+		onRemove={handleRemoveScan}
+	/>
 	<!-- Content area: fills the space above the persistent status bar -->
 	<div class="flex min-h-0 flex-1 flex-col">
 	{#if !isInitialized && !initError}
