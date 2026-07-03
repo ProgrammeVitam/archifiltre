@@ -148,6 +148,9 @@
 	// (displayItem, from dir_stats). Both are canonical per-subtree counts (see
 	// project-canonical-count-model), so a hovered sub-folder shows a subset ≤ the whole
 	// scan, never the scan total.
+	// Hover-sweep debounce for the per-folder DB queries (dates + composition), matching the
+	// thumbnail preview: no IPC work until the hovered folder is stable.
+	const HOVER_QUERY_DEBOUNCE_MS = 180;
 	const STRUCTURE_READY_PHASES = ['prefilter', 'hashing', 'duplicate-detection', 'complete'];
 	let structureReady = $derived(
 		$activeScan?.state !== 'scanning' || STRUCTURE_READY_PHASES.includes($scanPhase)
@@ -415,15 +418,23 @@
 			return;
 		}
 		if (item && item.type === 'directory' && item.path !== lastDateStatsPath) {
-			lastDateStatsPath = item.path;
-			isLoadingDateStats = true;
-			dirDateStats = null;
-			queryDirDateStats(item.path).then((result) => {
-				if (lastDateStatsPath === item.path) {
-					dirDateStats = result;
-					isLoadingDateStats = false;
-				}
-			});
+			// Debounce like the thumbnail preview: a rapid hover sweep over folders would
+			// otherwise fire one IPC query per boundary crossing (same channel as the
+			// thumbnail cache). Keep the previous stats on screen until the hovered folder is
+			// stable ~180 ms, then query.
+			const p = item.path;
+			const timer = setTimeout(() => {
+				lastDateStatsPath = p;
+				isLoadingDateStats = true;
+				dirDateStats = null;
+				queryDirDateStats(p).then((result) => {
+					if (lastDateStatsPath === p) {
+						dirDateStats = result;
+						isLoadingDateStats = false;
+					}
+				});
+			}, HOVER_QUERY_DEBOUNCE_MS);
+			return () => clearTimeout(timer);
 		} else if (!item || item.type !== 'directory') {
 			dirDateStats = null;
 			isLoadingDateStats = false;
@@ -441,11 +452,15 @@
 			return;
 		}
 		if (item && item.type === 'directory' && item.path !== lastCompositionPath) {
-			lastCompositionPath = item.path;
-			composition = null;
-			queryComposition(item.path).then((result) => {
-				if (lastCompositionPath === item.path) composition = result;
-			});
+			const p = item.path;
+			const timer = setTimeout(() => {
+				lastCompositionPath = p;
+				composition = null;
+				queryComposition(p).then((result) => {
+					if (lastCompositionPath === p) composition = result;
+				});
+			}, HOVER_QUERY_DEBOUNCE_MS);
+			return () => clearTimeout(timer);
 		} else if (!item || item.type !== 'directory') {
 			composition = null;
 			lastCompositionPath = null;

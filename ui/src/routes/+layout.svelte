@@ -23,6 +23,8 @@
 	import { applyNativeMenu, usesNativeMenu } from '$lib/menu/native';
 	import { exportCsv, selectExportPath, generateId, useOwnerDb } from '$lib/tauri';
 	import { installLogCapture } from '$lib/log-buffer';
+	import { thumbnail } from '@thumbnailjs/core';
+	import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 	import { exportLogsFlow } from '$lib/log-export';
 	import { exportAnnotationsFlow, importAnnotationsFlow } from '$lib/annotations-io';
 	import { Badge } from '$lib/components/ui/badge';
@@ -263,6 +265,11 @@
 		// First thing: start capturing console/window errors into the in-memory ring
 		// buffer, so the "Export logs" bundle carries the session's UI-side story.
 		installLogCapture();
+
+		// Point the thumbnail library's pdf.js at the BUNDLED worker (its default is a CDN
+		// URL, which is broken in an offline desktop app). Vite `?url` gives a hashed asset
+		// URL served by the app itself. Client-only (onMount).
+		thumbnail.configure({ pdfWorkerSrc: pdfWorkerUrl });
 
 		for (const ext of BUNDLED_EXTENSIONS) {
 			extensionRegistry.register(ext);
