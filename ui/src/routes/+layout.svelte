@@ -24,6 +24,7 @@
 	import { exportCsv, selectExportPath, generateId, useOwnerDb } from '$lib/tauri';
 	import { installLogCapture } from '$lib/log-buffer';
 	import { exportLogsFlow } from '$lib/log-export';
+	import { exportAnnotationsFlow, importAnnotationsFlow } from '$lib/annotations-io';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
 	import { ButtonGroup } from '$lib/components/ui/button-group';
@@ -194,6 +195,8 @@
 		exportResip: () => exportArchival('resip'),
 		exportXlsx: () => exportArchival('xlsx'),
 		exportAudit: () => exportArchival('docx'),
+		exportAnnotations: () => void exportAnnotationsFlow(),
+		importAnnotations: () => void importAnnotationsFlow(),
 		exportLogs: () => void exportLogsFlow(),
 		closeWindow,
 		undo: doUndo,
@@ -227,6 +230,8 @@
 		exportResip: DownloadIcon,
 		exportXlsx: DownloadIcon,
 		exportAudit: DownloadIcon,
+		exportAnnotations: DownloadIcon,
+		importAnnotations: DownloadIcon,
 		exportLogs: DownloadIcon,
 		undo: Undo2Icon,
 		redo: Redo2Icon,

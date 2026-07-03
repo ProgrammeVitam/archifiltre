@@ -51,6 +51,8 @@ import {
   handleUndoState,
   handleRestoreAnnotations,
   handleHasAnnotationBackup,
+  handleExportAnnotations,
+  handleImportAnnotations,
   ensureEnrichmentTables,
 } from '@extensions/enrichment/index.ts';
 
@@ -901,6 +903,10 @@ export async function dispatchQuery(
       return await handleRestoreAnnotations(database, runId);
     case 'has_annotation_backup':
       return await handleHasAnnotationBackup(database, runId);
+    case 'export_annotations':
+      return await handleExportAnnotations(database, runId, (request.outputPath as string) ?? '');
+    case 'import_annotations':
+      return await handleImportAnnotations(database, runId, (request.inputPath as string) ?? '');
     default:
       throw new Error(`Unknown action: ${request.action}`);
   }

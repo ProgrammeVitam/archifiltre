@@ -37,6 +37,8 @@
 		"sortBySize": "Nach Größe sortieren",
 		"sortByName": "Nach Name sortieren",
 		"sortByDate": "Nach Datum sortieren",
+		"exportAnnotations": "Anmerkungen exportieren…",
+		"importAnnotations": "Anmerkungen importieren…",
 		"exportLogs": "Protokolle exportieren…",
 		"closeWindow": "Fenster schließen"
 	},

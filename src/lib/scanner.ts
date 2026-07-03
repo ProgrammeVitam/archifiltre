@@ -40,6 +40,7 @@ import {
   getFrontierDirs,
   getEnumeratedDirs,
   getFrontierArchives,
+  getResumeSeedCount,
   findDuplicateSizes,
   countRealDuplicateGroups,
   type DatabaseConnection,
@@ -684,11 +685,19 @@ export function scanDirectory(
     if (!config.frontier || !config.resume) {
       return { seedDirs: [], enumeratedDirs: new Set(), archiveEntries: [] };
     }
-    const [seedDirs, enumDirs, archiveRows] = await Promise.all([
+    const [seedDirs, enumDirs, archiveRows, seedCount] = await Promise.all([
       firstValueFrom(getFrontierDirs(connection, config.runId)),
       firstValueFrom(getEnumeratedDirs(connection, config.runId)),
       firstValueFrom(getFrontierArchives(connection, config.runId)),
+      firstValueFrom(getResumeSeedCount(connection, config.runId)),
     ]);
+    // Continue the progress counters where the paused run left off: seed with the
+    // committed rows the resumed walk will NOT re-emit, so seed + re-walked remainder
+    // equals what an uninterrupted run would have counted. Both counters get the same
+    // seed, keeping the enumerate backpressure delta (discovered − ingested) at zero.
+    filesDiscovered = seedCount;
+    filesIngested = seedCount;
+    emitProgress('discovery', `resumed at ${seedCount.toLocaleString()} files`);
     // Re-expand only top-level archives; a nested archive can't be re-read standalone and
     // is already stamped (0 children) at creation, so it shouldn't appear here anyway.
     const archiveEntries = archiveRows.filter(r => !r.archive_parent_path).map(archiveRowToEntry);
@@ -697,6 +706,7 @@ export function scanDirectory(
       frontierDirs: seedDirs.length,
       enumeratedDirs: enumDirs.length,
       frontierArchives: archiveEntries.length,
+      counterSeed: seedCount,
     });
     return { seedDirs, enumeratedDirs: new Set(enumDirs), archiveEntries };
   };

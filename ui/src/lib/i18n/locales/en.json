@@ -37,6 +37,8 @@
 		"sortBySize": "Sort by size",
 		"sortByName": "Sort by name",
 		"sortByDate": "Sort by date",
+		"exportAnnotations": "Export annotations…",
+		"importAnnotations": "Import annotations…",
 		"exportLogs": "Export logs…",
 		"closeWindow": "Close window"
 	},

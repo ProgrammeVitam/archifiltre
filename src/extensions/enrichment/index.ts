@@ -28,6 +28,7 @@ import { promises as fs } from 'node:fs';
 import {
   snapshotFileFor,
   snapshotSize,
+  buildSnapshot,
   type AnnotationSnapshot,
 } from '@extensions/enrichment/snapshot.ts';
 import { restoreSnapshot, type RestoreResult } from '@extensions/enrichment/restore.ts';
@@ -674,6 +675,46 @@ export async function handleHasAnnotationBackup(
   } catch {
     return { hasBackup: false, count: 0 };
   }
+}
+
+/**
+ * Export this run's annotations to a user-chosen JSON file (File → Export annotations).
+ * Same schema as the durable snapshot, so an exported file re-imports cleanly and doubles
+ * as a portable backup / a way to carry annotations between machines.
+ */
+export async function handleExportAnnotations(
+  db: DatabaseConnection,
+  runId: string,
+  outputPath: string
+): Promise<{ count: number; path: string }> {
+  await ensureEnrichmentTables(db);
+  const snapshot = await buildSnapshot(db, runId);
+  if (!snapshot) return { count: 0, path: outputPath };
+  await fs.writeFile(outputPath, JSON.stringify(snapshot, null, 2), 'utf-8');
+  return { count: snapshotSize(snapshot), path: outputPath };
+}
+
+/**
+ * Import annotations from a JSON file (File → Import annotations) onto this run, keyed by
+ * path — same restore semantics as post-rescan restore (existing paths restored, missing
+ * paths reported orphaned, one undo op).
+ */
+export async function handleImportAnnotations(
+  db: DatabaseConnection,
+  runId: string,
+  inputPath: string
+): Promise<RestoreResult> {
+  await ensureEnrichmentTables(db);
+  let snapshot: AnnotationSnapshot;
+  try {
+    snapshot = JSON.parse(await fs.readFile(inputPath, 'utf-8')) as AnnotationSnapshot;
+  } catch (error) {
+    throw new Error(`Could not read annotations file: ${(error as Error).message}`);
+  }
+  if (!snapshot || !Array.isArray(snapshot.aliases)) {
+    throw new Error('Not a valid annotations file');
+  }
+  return await restoreSnapshot(db, runId, snapshot);
 }
 
 export const MANIFEST = {

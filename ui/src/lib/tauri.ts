@@ -563,6 +563,32 @@ export async function restoreAnnotations(
 	return res.ok ? (res.data as { restored: number; orphaned: string[] }) : { restored: 0, orphaned: [] };
 }
 
+/** Export this scan's annotations to a JSON file (portable backup / move between machines). */
+export async function exportAnnotations(
+	outputPath: string,
+	dbName?: string
+): Promise<{ count: number; path: string }> {
+	const res = await sendQuery(
+		{ id: `expann_${Date.now()}`, action: 'export_annotations', outputPath },
+		dbName
+	);
+	if (!res.ok) throw new Error(res.error ?? 'Export failed');
+	return res.data as { count: number; path: string };
+}
+
+/** Import annotations from a JSON file onto this scan (path-keyed restore). */
+export async function importAnnotations(
+	inputPath: string,
+	dbName?: string
+): Promise<{ restored: number; orphaned: string[] }> {
+	const res = await sendQuery(
+		{ id: `impann_${Date.now()}`, action: 'import_annotations', inputPath },
+		dbName
+	);
+	if (!res.ok) throw new Error(res.error ?? 'Import failed');
+	return res.data as { restored: number; orphaned: string[] };
+}
+
 /**
  * Check if a query session is currently active.
  */

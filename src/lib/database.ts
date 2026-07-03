@@ -527,6 +527,73 @@ export function getFrontierArchives(
   );
 }
 
+/**
+ * Resume seed for the progress counters: how many already-committed rows the resumed
+ * walk will NOT re-emit, so `filesDiscovered` continues exactly where the paused run
+ * left off (seed + re-walked remainder = what an uninterrupted run would have counted).
+ *
+ * On resume the walker re-lists the root and every un-stamped directory, so their
+ * committed children ARE re-emitted (and re-counted). Excluded from the seed:
+ *   - top-level rows (the root is always re-listed),
+ *   - rows whose parent directory is un-stamped (that dir will be re-listed),
+ *   - un-stamped archive containers (re-counted via their synthetic re-expansion).
+ * Archive-inner entries never pass through the walker counter, so only filesystem
+ * rows (archive_parent_path IS NULL) participate.
+ */
+export function getResumeSeedCount(
+  connection: DatabaseConnection,
+  runId: string
+): Observable<number> {
+  return defer(() =>
+    from(
+      connection.db.execute(sql`
+        SELECT count(*)::int AS n
+        FROM files f
+        WHERE f.run_id = ${runId}
+          AND f.archive_parent_path IS NULL
+          AND position('/' in f.path) > 0
+          AND NOT EXISTS (
+            SELECT 1 FROM files u
+            WHERE u.run_id = ${runId}
+              AND u.is_directory = true
+              AND u.archive_parent_path IS NULL
+              AND u.enumerated_at IS NULL
+              AND u.path = left(f.path, length(f.path) - position('/' in reverse(f.path)))
+          )
+          AND NOT (f.is_archive_container = true AND f.enumerated_at IS NULL)
+      `)
+    ).pipe(
+      map(result => Number((result.rows[0] as { n: number | string } | undefined)?.n ?? 0)),
+      catchError(error => {
+        logger.error('Failed to compute resume seed count', error as Error, { runId });
+        return of(0); // degrade to the old restart-from-zero behavior, never block resume
+      })
+    )
+  );
+}
+
+/** Total rows committed for a run (files + directories + archive entries) — the exact
+ *  figure for scan_metadata.file_count at completion, correct for resumed runs too
+ *  (the in-memory session counter only sees the resumed remainder). */
+export function countRunRows(
+  connection: DatabaseConnection,
+  runId: string
+): Observable<number> {
+  return defer(() =>
+    from(
+      connection.db.execute(
+        sql`SELECT count(*)::int AS n FROM files WHERE run_id = ${runId}`
+      )
+    ).pipe(
+      map(result => Number((result.rows[0] as { n: number | string } | undefined)?.n ?? 0)),
+      catchError(error => {
+        logger.error('Failed to count run rows', error as Error, { runId });
+        return of(-1); // sentinel: caller falls back to its session counter
+      })
+    )
+  );
+}
+
 // ── Warm-start template ──────────────────────────────────────────────────────
 // Opening a fresh datadir runs PGlite's initdb (~2.5–3 s — the bulk of the DB cold
 // start). Instead we keep ONE pre-initialized template PGDATA (clean: schema only,

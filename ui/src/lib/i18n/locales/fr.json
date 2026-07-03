@@ -37,6 +37,8 @@
 		"sortBySize": "Trier par taille",
 		"sortByName": "Trier par nom",
 		"sortByDate": "Trier par date",
+		"exportAnnotations": "Exporter les annotations…",
+		"importAnnotations": "Importer les annotations…",
 		"exportLogs": "Exporter les journaux…",
 		"closeWindow": "Fermer la fenêtre"
 	},
