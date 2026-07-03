@@ -508,6 +508,13 @@ export async function cancelScan(dbName: string): Promise<void> {
 export async function deleteDatabase(dbName: string): Promise<void> {
 	if (!useOwnerDb()) return;
 	try {
+		// Ensure an owner exists for this db BEFORE asking it to delete itself. Without this,
+		// deleting a scan we never opened this session (its owner was never spawned) hits
+		// session_request's "No active session for this db" — which the catch below swallows,
+		// leaving the datadir on disk for startup reconciliation to resurrect ("removed but
+		// comes back"). start_session get-or-spawns the owner (reusing the warm spare), so the
+		// delete always reaches a live process that closes PGlite and removes the datadir.
+		await invoke('start_session', { dbName });
 		await sendQuery({ id: `delete_${Date.now()}`, action: 'delete_db' }, dbName);
 	} catch {
 		/* owner exiting after its ack */
