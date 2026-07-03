@@ -16,7 +16,7 @@ import { map, catchError, tap, switchMap } from 'rxjs/operators';
 import { gt } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/pglite';
 import { PGlite } from '@electric-sql/pglite';
-import { pgTable, text, integer, index, primaryKey, boolean } from 'drizzle-orm/pg-core';
+import { pgTable, text, integer, bigint, index, primaryKey, boolean } from 'drizzle-orm/pg-core';
 import { eq, and, count, sum, inArray, isNull, isNotNull, sql } from 'drizzle-orm';
 import { logger } from '@lib/logging.ts';
 import { isStandalone } from './platform-paths.ts';
@@ -52,9 +52,9 @@ export const files = pgTable(
   {
     run_id: text('run_id').notNull(),
     path: text('path').notNull(),
-    physical_size: integer('physical_size').notNull(), // Actual bytes on disk
-    content_size: integer('content_size'), // Logical content size for comparison
-    mtime: integer('mtime').notNull(),
+    physical_size: bigint('physical_size', { mode: 'number' }).notNull(), // Actual bytes on disk
+    content_size: bigint('content_size', { mode: 'number' }), // Logical content size for comparison
+    mtime: bigint('mtime', { mode: 'number' }).notNull(),
     is_directory: boolean('is_directory').notNull(),
     is_hidden: boolean('is_hidden').notNull(),
     is_system: boolean('is_system').notNull(),
@@ -148,9 +148,9 @@ async function initializeSchema(db: ReturnType<typeof drizzle>): Promise<void> {
       CREATE TABLE IF NOT EXISTS files (
         run_id TEXT NOT NULL,
         path TEXT NOT NULL,
-        physical_size INTEGER NOT NULL,
-        content_size INTEGER,
-        mtime INTEGER NOT NULL,
+        physical_size BIGINT NOT NULL,
+        content_size BIGINT,
+        mtime BIGINT NOT NULL,
         is_directory BOOLEAN NOT NULL,
         is_hidden BOOLEAN NOT NULL,
         is_system BOOLEAN NOT NULL,

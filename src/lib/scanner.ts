@@ -205,7 +205,11 @@ interface ArchiveProcessingConfig {
 
 const DEFAULT_ARCHIVE_CONFIG: ArchiveProcessingConfig = {
   maxDepth: 3,
-  maxArchiveSize: 100 * 1024 * 1024, // 100MB
+  // With streaming archive reading this cap is a TIME guard, not a memory one
+  // (listing a seekable zip reads only its central directory; non-seekable formats
+  // stream through a fixed buffer). The old 100MB default protected the
+  // memory-based reader that loaded whole archives into RAM.
+  maxArchiveSize: 10 * 1024 * 1024 * 1024, // 10 GiB
   timeoutMs: 30000, // 30 seconds
   enableNesting: true,
 };
