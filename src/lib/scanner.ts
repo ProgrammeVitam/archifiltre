@@ -48,10 +48,10 @@ import {
   files as _files,
 } from '@lib/database.ts';
 import { Frontier } from '@lib/frontier.ts';
-import { ArchiveReader } from 'libarchive-wasm';
-import { initializeLibarchiveWasm } from '@lib/libarchive-init.ts';
+import { listArchive } from 'streamarchive';
+import { ensureStreamArchive } from '@lib/streamarchive-init.ts';
 import { performHashing } from '@lib/hash-calculator.ts';
-import { toLongPath } from '@lib/path-utils.ts';
+import { toLongPath, normalizePath } from '@lib/path-utils.ts';
 
 // Archive Detection Constants
 // prettier-ignore
@@ -269,75 +269,70 @@ async function processArchiveEntries(
 
   try {
     const absolutePath = path.resolve(rootPath, archivePath);
-    const archiveBuffer = await fsp.readFile(toLongPath(absolutePath));
 
-    // Initialize libarchive WASM
-    const mod = await initializeLibarchiveWasm();
-    const reader = new ArchiveReader(mod, new Int8Array(archiveBuffer));
+    // Streaming metadata listing: no data reads, constant memory. On a seekable zip
+    // this is the central directory — fast and exact-sized even for multi-GB archives
+    // (the previous memory-based port loaded the ENTIRE archive into RAM here).
+    await ensureStreamArchive();
+    const archiveEntries = await listArchive(toLongPath(absolutePath));
 
     let entryCount = 0;
-    const maxEntries = 10000; // Prevent memory exhaustion
+    const maxEntries = 10000; // Bound the per-archive row count (DB pressure, not memory)
 
-    try {
-      for (const archiveEntry of reader.entries()) {
-        if (entryCount >= maxEntries) {
-          logger.warn('Archive has too many entries, stopping processing', {
-            path: archivePath,
-            processedEntries: entryCount,
-            limit: maxEntries,
-          });
-          break;
-        }
+    for (const archiveEntry of archiveEntries) {
+      if (entryCount >= maxEntries) {
+        logger.warn('Archive has too many entries, stopping processing', {
+          path: archivePath,
+          processedEntries: entryCount,
+          limit: maxEntries,
+        });
+        break;
+      }
 
-        if (archiveEntry && typeof archiveEntry.getPathname === 'function') {
-          const entryPath = archiveEntry.getPathname();
-          const size = archiveEntry.getSize() || 0;
-          const filetype = archiveEntry.getFiletype?.() || 'File';
-          const isDirectory = filetype === 'Directory' || entryPath.endsWith('/');
-          const modTime = archiveEntry.getModificationTime?.() || 0;
+      // Stored names may carry a leading './' or backslashes depending on the
+      // archiver; normalize to match the paths the rest of the pipeline uses.
+      const entryPath = normalizePath(archiveEntry.path).replace(/^\.\//, '');
+      const size = archiveEntry.size ?? 0;
+      const isDirectory = archiveEntry.isDirectory || entryPath.endsWith('/');
+      const modTime = archiveEntry.mtime || 0; // Unix seconds
 
-          // Create relative path: archive.zip/path/to/file.txt
-          const relativePath = `${entry.path}/${entryPath}`;
+      // Create relative path: archive.zip/path/to/file.txt
+      const relativePath = `${entry.path}/${entryPath}`;
 
-          const archiveFileEntry: FileEntry = {
+      const archiveFileEntry: FileEntry = {
+        path: relativePath,
+        physical_size: 0, // Files within archives have no physical footprint
+        content_size: isDirectory ? null : size, // Decompressed size for files, null for directories
+        mtime: modTime > 0 ? modTime : entry.mtime,
+        isDirectory,
+        isHidden: false, // Archive entries are not considered hidden
+        isSystem: false, // Archive entries are not considered system files
+        isArchiveContainer: false,
+        archiveParentPath: entry.path,
+        archiveDepth: entry.archiveDepth + 1,
+        archiveFormat: entry.archiveFormat,
+        extractionError: null,
+      };
+
+      results.push(archiveFileEntry);
+      entryCount++;
+
+      // If this entry is also an archive and nesting is enabled, mark it (nested
+      // archives are flagged as containers but their contents are not expanded).
+      if (!isDirectory && config.enableNesting && entry.archiveDepth + 1 < config.maxDepth) {
+        const archiveCheck = isArchiveByExtensionOnly(entryPath);
+        if (archiveCheck.isArchive) {
+          archiveFileEntry.isArchiveContainer = true;
+          archiveFileEntry.content_size = null;
+          archiveFileEntry.archiveFormat = archiveCheck.format || 'unknown';
+
+          logger.debug('Found nested archive (marked but not processed)', {
             path: relativePath,
-            physical_size: 0, // Files within archives have no physical footprint
-            content_size: isDirectory ? null : size, // Decompressed size for files, null for directories
-            mtime: modTime > 0 ? Math.floor(modTime / 1000) : entry.mtime,
-            isDirectory,
-            isHidden: false, // Archive entries are not considered hidden
-            isSystem: false, // Archive entries are not considered system files
-            isArchiveContainer: false,
-            archiveParentPath: entry.path,
-            archiveDepth: entry.archiveDepth + 1,
-            archiveFormat: entry.archiveFormat,
-            extractionError: null,
-          };
-
-          results.push(archiveFileEntry);
-          entryCount++;
-
-          // If this entry is also an archive and nesting is enabled, process it recursively
-          if (!isDirectory && config.enableNesting && entry.archiveDepth + 1 < config.maxDepth) {
-            const archiveCheck = isArchiveByExtensionOnly(entryPath);
-            if (archiveCheck.isArchive) {
-              // Note: We can't process nested archives from memory easily with libarchive-wasm
-              // So we'll just mark them as archive containers but not process their contents
-              archiveFileEntry.isArchiveContainer = true;
-              archiveFileEntry.content_size = null;
-              archiveFileEntry.archiveFormat = archiveCheck.format || 'unknown';
-
-              logger.debug('Found nested archive (marked but not processed)', {
-                path: relativePath,
-                format: archiveCheck.format,
-                depth: entry.archiveDepth + 1,
-              });
-            }
-          }
+            format: archiveCheck.format,
+            depth: entry.archiveDepth + 1,
+          });
         }
       }
-    } finally {
-      reader.free();
     }
 
     logger.debug('Archive processing completed', {

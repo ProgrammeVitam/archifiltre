@@ -23,8 +23,8 @@ import { promises as fs } from 'node:fs';
 import { Readable } from 'node:stream';
 import type { Observable } from 'rxjs';
 import { defer, from } from 'rxjs';
-import { ArchiveReader } from 'libarchive-wasm';
-import { initializeLibarchiveWasm } from '@lib/libarchive-init.ts';
+import { listArchive, readArchiveEntry } from 'streamarchive';
+import { ensureStreamArchive } from '@lib/streamarchive-init.ts';
 import { logger } from '@lib/logging.ts';
 import {
   normalizePath,
@@ -65,7 +65,7 @@ export interface FileContentResult {
 
 /**
  * Extract file content from an archive as a Buffer.
- * Uses libarchive-wasm for cross-platform archive support.
+ * Uses streamarchive (libarchive via WASM, streaming I/O) for cross-platform support.
  *
  * @param rootPath - Root path of the scan
  * @param archiveParentPath - Path to the archive file (relative to root)
@@ -84,50 +84,42 @@ export async function extractFromArchive(
     relativePath,
   });
 
-  const archiveBuffer = await fs.readFile(toLongPath(archivePath));
+  await ensureStreamArchive();
 
-  // Initialize libarchive WASM
-  const mod = await initializeLibarchiveWasm();
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const reader = new ArchiveReader(mod as any, new Int8Array(archiveBuffer));
+  // Get the path within the archive using proper normalization
+  const targetPath = getArchiveRelativePath(relativePath, archiveParentPath);
+  const normalizedTarget = normalizePath(targetPath);
+  const longArchivePath = toLongPath(archivePath);
 
-  try {
-    // Get the path within the archive using proper normalization
-    const targetPath = getArchiveRelativePath(relativePath, archiveParentPath);
+  // Random access by stored name: on a seekable zip this seeks straight to the entry
+  // via the central directory — the rest of the archive is never read (the previous
+  // memory-based port loaded the WHOLE archive into RAM, then scanned linearly).
+  // Note: extraction always reads the actual data, so the historical "hybrid approach"
+  // (never trust 0-byte metadata, always extract to verify) is inherently preserved.
+  let result = await readArchiveEntry(longArchivePath, normalizedTarget);
 
-    for (const entry of reader.entries()) {
-      if (entry && typeof entry.getPathname === 'function') {
-        const entryPath = normalizePath(entry.getPathname());
-        const normalizedTarget = normalizePath(targetPath);
-
-        if (pathEquals(entryPath, normalizedTarget)) {
-          const filetype = entry.getFiletype?.() || 'File';
-          if (filetype !== 'Directory' && !entryPath.endsWith('/')) {
-            // Hybrid approach: trust non-zero metadata, always verify 0-byte files
-            const reportedSize = entry.getSize() || 0;
-
-            if (reportedSize === 0) {
-              // Don't trust 0-byte metadata - always extract to verify
-              const content = entry.readData();
-              return Buffer.from(content || []);
-            } else {
-              // Trust non-zero metadata, extract normally
-              const content = entry.readData();
-              if (content) {
-                return Buffer.from(content);
-              }
-              throw new Error(`Could not extract content for ${targetPath}`);
-            }
-          }
-          throw new Error(`Entry ${targetPath} is not a file`);
-        }
-      }
+  if (!result) {
+    // Stored names can differ superficially from ours (leading './', backslashes).
+    // Resolve the real stored name via a metadata-only listing, then random-access it.
+    const entries = await listArchive(longArchivePath);
+    const match = entries.find(e =>
+      pathEquals(normalizePath(e.path).replace(/^\.\//, ''), normalizedTarget)
+    );
+    if (match) {
+      result = await readArchiveEntry(longArchivePath, match.path);
     }
-
-    throw new Error(`File ${targetPath} not found in archive ${archiveParentPath}`);
-  } finally {
-    reader.free();
   }
+
+  if (!result) {
+    throw new Error(`File ${targetPath} not found in archive ${archiveParentPath}`);
+  }
+  if (result.entry.isDirectory || normalizedTarget.endsWith('/')) {
+    throw new Error(`Entry ${targetPath} is not a file`);
+  }
+
+  // Wrap (not copy) the extracted bytes: result.data is freshly allocated per call,
+  // so aliasing is safe, and this halves transient memory on large entries.
+  return Buffer.from(result.data.buffer, result.data.byteOffset, result.data.byteLength);
 }
 
 // === Stream Creation ===

@@ -5,13 +5,13 @@
  * Pins the OBSERVED end-to-end behavior of archive scanning + extraction against a
  * real zip fixture (bsdtar: nested dirs, a UTF-8 name, a 0-byte file, a binary blob):
  * the exact entry set a scan reports (paths, sizes, directory flags) and byte-identical
- * single-entry extraction. Written against the libarchive-wasm implementation BEFORE the
- * streamarchive migration, and must stay green across it.
+ * single-entry extraction. Written against the previous (memory-based libarchive WASM
+ * port) implementation BEFORE the streamarchive migration, and must stay green across it.
  *
- * UTF8_NAMES_CORRECT documents one known divergence: libarchive-wasm's getPathname()
- * mangles non-ASCII names (`données.txt` came back as `donn�es.txt`, making that entry
+ * UTF8_NAMES_CORRECT documents one known divergence: the previous port's getPathname()
+ * mangled non-ASCII names (`données.txt` came back as `donn�es.txt`, making that entry
  * unextractable — a real pre-existing bug). streamarchive decodes names correctly, so
- * the flag flips to true with the migration; the mangled behavior is pinned while false.
+ * the flag flipped to true with the migration; the mangled behavior was pinned while false.
  */
 
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test';
@@ -25,8 +25,8 @@ import { scanDirectory, type ScanConfig } from '@lib/scanner.ts';
 import { readFileContent } from '@lib/file-reader.ts';
 
 // Flip with the streamarchive migration (see header). While false, the test asserts the
-// libarchive-wasm behavior: a mangled UTF-8 name and failing extraction for that entry.
-const UTF8_NAMES_CORRECT = false;
+// previous port's behavior: a mangled UTF-8 name and failing extraction for that entry.
+const UTF8_NAMES_CORRECT = true;
 
 const DB = 'archmigtest';
 const RUN_ID = 'run-archmig';
@@ -108,7 +108,7 @@ describe('archive scan (entry metadata)', () => {
     expect(paths).toContain('test.zip/nested/dir/');
     expect(paths).toContain('test.zip/nested/dir/deep.txt');
     // The UTF-8 entry is present either correctly decoded (streamarchive) or mangled
-    // (libarchive-wasm) — exactly one row, same size either way.
+    // (previous port) — exactly one row, same size either way.
     const utf8Row = rows.find((r) => /^test\.zip\/donn.+es\.txt$/.test(r.path));
     expect(utf8Row).toBeDefined();
     if (UTF8_NAMES_CORRECT) {
@@ -167,7 +167,7 @@ describe('archive extraction (single entry)', () => {
   it(
     UTF8_NAMES_CORRECT
       ? 'extracts the UTF-8-named entry byte-identical to the source'
-      : 'FAILS to extract the UTF-8-named entry (pinned libarchive-wasm bug)',
+      : 'FAILS to extract the UTF-8-named entry (pinned pre-migration bug)',
     async () => {
       const attempt = readFileContent(rootDir, {
         path: 'test.zip/données.txt',
@@ -177,7 +177,7 @@ describe('archive extraction (single entry)', () => {
         const buf = await attempt;
         expect(Buffer.compare(buf, utf8Bytes)).toBe(0);
       } else {
-        // libarchive-wasm mangles the stored name, so the lookup cannot match.
+        // The previous port mangled the stored name, so the lookup cannot match.
         await expect(attempt).rejects.toThrow(/not found/);
       }
     }

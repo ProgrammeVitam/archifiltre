@@ -18,8 +18,8 @@ const WASM_FILES = [
     dest: 'wasm_binaries/initdb.wasm',
   },
   {
-    source: 'node_modules/libarchive-wasm/dist/libarchive.wasm',
-    dest: 'wasm_binaries/libarchive.wasm',
+    source: 'node_modules/streamarchive/lib/wasm/streamarchive.wasm',
+    dest: 'wasm_binaries/streamarchive.wasm',
   },
 ];
 
