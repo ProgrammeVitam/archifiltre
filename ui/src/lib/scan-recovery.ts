@@ -18,9 +18,9 @@
  * safely) — they get a sidecar on next open and reconcile from then on.
  */
 
-import { get } from 'svelte/store';
+import { get, writable } from 'svelte/store';
 import { scansStore, createScan, getFolderName, type Scan, type ScanState } from '$lib/stores';
-import { listDatadirs, type DatadirEntry } from '$lib/tauri';
+import { listDatadirs, hasAnnotationBackup, restoreAnnotations, type DatadirEntry } from '$lib/tauri';
 
 /** Sanitize a dbName the same way the sidecar does for its datadir folder, so a UI
  *  dbName can be matched against an on-disk `dbdata-<safeName>`. */
@@ -99,4 +99,47 @@ export async function reconcileScans(): Promise<ReconcileResult> {
 	}
 
 	return { adopted: adopted.length, missing };
+}
+
+// ── Restore-on-rescan prompt ─────────────────────────────────────────────────
+// A durable annotation snapshot exists for a just-completed scan's folder → offer to
+// restore the user's work. Always ask (the folder may have changed underneath).
+
+export interface RestorePrompt {
+	scanId: string;
+	dbName: string;
+	count: number; // annotations available in the snapshot
+	status: 'ask' | 'restoring' | 'done';
+	restored?: number;
+	orphaned?: string[];
+}
+
+export const restorePrompt = writable<RestorePrompt | null>(null);
+
+/**
+ * After a scan completes, if a snapshot exists for its root, raise the restore prompt.
+ * Called from the job:complete handler. No-op when there's no backup.
+ */
+export async function maybeOfferRestore(scanId: string, dbName: string): Promise<void> {
+	try {
+		const { hasBackup, count } = await hasAnnotationBackup(dbName);
+		if (hasBackup && count > 0) {
+			restorePrompt.set({ scanId, dbName, count, status: 'ask' });
+		}
+	} catch {
+		/* best effort — a failed check just means no prompt */
+	}
+}
+
+/** User accepted the restore. Runs it, then shows the result (restored / orphaned). */
+export async function acceptRestore(): Promise<void> {
+	const p = get(restorePrompt);
+	if (!p || p.status !== 'ask') return;
+	restorePrompt.set({ ...p, status: 'restoring' });
+	const { restored, orphaned } = await restoreAnnotations(p.dbName);
+	restorePrompt.set({ ...p, status: 'done', restored, orphaned });
+}
+
+export function dismissRestore(): void {
+	restorePrompt.set(null);
 }

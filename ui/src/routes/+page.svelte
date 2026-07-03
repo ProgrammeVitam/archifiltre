@@ -52,10 +52,11 @@
 	import DropZone from '$lib/components/DropZone.svelte';
 	import SkeletonIcicle from '$lib/components/SkeletonIcicle.svelte';
 	import StalactiteChart from '$lib/components/StalactiteChart.svelte';
-	import FileTable from '$lib/components/FileTable.svelte';
-	import TreeView from '$lib/components/TreeView.svelte';
+	import ListView from '$lib/components/ListView.svelte';
 	import FileDetailsPanel from '$lib/components/FileDetailsPanel.svelte';
 	import StatusBar from '$lib/components/StatusBar.svelte';
+	import ScanRecoveryBanner from '$lib/components/ScanRecoveryBanner.svelte';
+	import { maybeOfferRestore } from '$lib/scan-recovery';
 	import { CircleAlert, RefreshCw, Plus } from '@lucide/svelte';
 	import type { UnlistenFn } from '@tauri-apps/api/event';
 
@@ -131,6 +132,9 @@
 							if (scan.id === $activeScan?.id) {
 								loadVisualizationData(scan.dbName, scan.id);
 							}
+							// If the user previously annotated this folder and its scan was later
+							// lost/re-run, a durable snapshot survives — offer to restore it.
+							void maybeOfferRestore(scan.id, scan.dbName);
 						}
 
 						// Handle scan error via job:error
@@ -262,7 +266,25 @@
 	// Visualization Loading
 	// ================================
 
-	async function loadVisualizationData(dbName: string, scanId: string) {
+	// Completion fires this from TWO places (the job:complete handler AND the activeScan
+	// subscription, since finishScanningScan flips state → the subscription re-runs). De-dupe
+	// to one load, and auto-retry the transient owner-handoff errors that a manual Retry
+	// clears — belt-and-suspenders behind the real fix (unique request ids in sendQuery).
+	let vizLoadInFlight: string | null = null;
+	const TRANSIENT_VIZ_ERROR =
+		/session closed before responding|session not alive|No active session|request timed out/i;
+
+	async function loadVisualizationData(dbName: string, scanId: string): Promise<void> {
+		if (vizLoadInFlight === scanId) return; // a load for this scan is already running
+		vizLoadInFlight = scanId;
+		try {
+			await loadVisualizationAttempt(dbName, scanId, 0);
+		} finally {
+			if (vizLoadInFlight === scanId) vizLoadInFlight = null;
+		}
+	}
+
+	async function loadVisualizationAttempt(dbName: string, scanId: string, attempt: number) {
 		// Mark this scan as the one we're loading for
 		loadedForScanId = scanId;
 		visualizationError = null;
@@ -323,6 +345,20 @@
 				if (!cached) selectRoot();
 			}
 		} catch (error) {
+			// Datadir that Postgres can't recover (power-cut corruption) → the owner returns
+			// a typed 'datadir_damaged'. Flag the tab so the recovery banner offers Re-scan /
+			// Delete instead of a raw error.
+			if (String(error).includes('datadir_damaged')) {
+				scansStore.updateScan(scanId, { datadirState: 'damaged' });
+				return;
+			}
+			// Transient owner-handoff errors self-heal on retry (exactly what the manual Retry
+			// does). Retry a few times with a short backoff before surfacing the error banner.
+			if (TRANSIENT_VIZ_ERROR.test(String(error)) && attempt < 3 && loadedForScanId === scanId) {
+				await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
+				if (loadedForScanId === scanId)
+					return await loadVisualizationAttempt(dbName, scanId, attempt + 1);
+			}
 			if (loadedForScanId === scanId && !cached) {
 				visualizationError = `Failed to load visualization: ${error}`;
 				console.error('Visualization loading error:', error);
@@ -363,6 +399,21 @@
 			file_count: sr?.filesDiscovered ?? 0,
 			dir_count: sr?.folders ?? 0
 		});
+	}
+
+	// Breadcrumb navigation: jump to an ancestor folder by path. Resolves it to the real
+	// node from the on-screen tree (settled or live) so the panel shows true aggregates,
+	// and — since `selectedItem` is shared — the chart highlights it automatically. Empty
+	// path is home, routed to the state-appropriate root selector.
+	function navigateToPath(path: string) {
+		if (path === '') {
+			if ($activeScan?.state === 'scanning') selectScanningRoot();
+			else selectRoot();
+			return;
+		}
+		const tree = treeData ?? scanningTree;
+		const dir = tree?.directories.find((d) => d.path === path);
+		if (dir) selectDirectory(dir);
 	}
 
 	// Owner mode runs one owner PROCESS per db (concurrent scans/tabs), so queries must
@@ -475,6 +526,27 @@
 	// ================================
 	// Actions
 	// ================================
+
+	/** Re-scan a damaged/missing scan's folder: clear the recovery flag and re-run the
+	 *  scan into a FRESH datadir (new dbName), so a corrupted one is never reopened. The
+	 *  restore prompt fires on completion if a snapshot survived. */
+	async function handleRescanDamaged(): Promise<void> {
+		const scan = $activeScan;
+		if (!scan?.path) return;
+		// Fresh datadir for the re-scan (the old one is damaged/gone).
+		scansStore.updateScan(scan.id, {
+			datadirState: undefined,
+			dbName: `archifiltre-scan-${scan.id}-${Date.now().toString(36)}`,
+			scanId: null
+		});
+		await handleStartAnalysis(scan.path);
+	}
+
+	/** Discard a damaged/missing scan entirely. */
+	function handleDeleteDamaged(): void {
+		const scan = $activeScan;
+		if (scan) scansStore.closeScan(scan.id);
+	}
 
 	async function handleStartAnalysis(path: string): Promise<void> {
 		const scan = $activeScan;
@@ -595,6 +667,9 @@
 
 <!-- Main Container -->
 <div class="flex h-full flex-col">
+	<!-- Unclean-shutdown recovery: damaged/missing datadir → Re-scan/Delete; or restore
+	     the user's annotations after re-scanning a previously-annotated folder. -->
+	<ScanRecoveryBanner onRescan={handleRescanDamaged} onDelete={handleDeleteDamaged} />
 	<!-- Content area: fills the space above the persistent status bar -->
 	<div class="flex min-h-0 flex-1 flex-col">
 	{#if !isInitialized && !initError}
@@ -643,7 +718,7 @@
 				{#if $selectedItem || $hoveredItem}
 					<!-- Owner mode: the DB is live-readable during the scan, so the panel
 					     queries real data instead of skeletons. -->
-					<FileDetailsPanel loading={!useOwnerDb()} onGoHome={selectScanningRoot} rootName={scanRootName} />
+					<FileDetailsPanel loading={!useOwnerDb()} onGoHome={selectScanningRoot} onNavigate={navigateToPath} rootName={scanRootName} />
 				{/if}
 			</div>
 		{:else}
@@ -692,21 +767,23 @@
 				     golden ratio: chart ~38.2% (top), panel ~61.8% (bottom). With no selection
 				     the chart fills the height. -->
 				<div
-					class="flex min-h-0 flex-col overflow-hidden p-4 pb-0"
+					class="flex min-h-0 flex-col overflow-hidden pb-0 {$viewMode === 'stalactite'
+						? 'p-4'
+						: 'px-4 pt-0'}"
 					style:flex={$selectedItem || $hoveredItem ? '0 0 38.2%' : '1 1 0%'}
 				>
 					{#if $viewMode === 'stalactite'}
 						<StalactiteChart data={treeData} onGoHome={selectRoot} class="h-full w-full" />
 					{:else if $viewMode === 'tree'}
-						<TreeView data={treeData} class="h-full w-full" />
+						<ListView data={treeData} class="h-full w-full" />
 					{:else}
-						<FileTable data={treeData} class="h-full w-full" />
+						<ListView data={treeData} class="h-full w-full" />
 					{/if}
 				</div>
 
 				<!-- File/Folder Details Panel with Picker -->
 				{#if $selectedItem || $hoveredItem}
-					<FileDetailsPanel onGoHome={selectRoot} rootName={rootDisplayName} />
+					<FileDetailsPanel onGoHome={selectRoot} onNavigate={navigateToPath} rootName={rootDisplayName} />
 				{/if}
 			{/if}
 		</div>

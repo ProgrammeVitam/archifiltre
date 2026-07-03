@@ -540,6 +540,29 @@ export async function getUndoState(dbName?: string): Promise<{ canUndo: boolean;
 	return res.ok ? (res.data as { canUndo: boolean; canRedo: boolean }) : null;
 }
 
+/** Does a durable annotation snapshot exist for this scan's root (offer restore)? */
+export async function hasAnnotationBackup(
+	dbName?: string
+): Promise<{ hasBackup: boolean; count: number }> {
+	const res = await sendQuery(
+		{ id: `hasbackup_${Date.now()}`, action: 'has_annotation_backup' },
+		dbName
+	);
+	return res.ok ? (res.data as { hasBackup: boolean; count: number }) : { hasBackup: false, count: 0 };
+}
+
+/** Restore the durable annotation snapshot onto this (re-scanned) run. Returns how many
+ *  annotations were re-applied and which paths no longer exist (orphaned). */
+export async function restoreAnnotations(
+	dbName?: string
+): Promise<{ restored: number; orphaned: string[] }> {
+	const res = await sendQuery(
+		{ id: `restore_${Date.now()}`, action: 'restore_annotations' },
+		dbName
+	);
+	return res.ok ? (res.data as { restored: number; orphaned: string[] }) : { restored: 0, orphaned: [] };
+}
+
 /**
  * Check if a query session is currently active.
  */
