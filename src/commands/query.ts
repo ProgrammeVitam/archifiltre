@@ -49,6 +49,8 @@ import {
   handleUndo,
   handleRedo,
   handleUndoState,
+  handleRestoreAnnotations,
+  handleHasAnnotationBackup,
   ensureEnrichmentTables,
 } from '@extensions/enrichment/index.ts';
 
@@ -387,6 +389,106 @@ async function handleGetFiles(
   };
 }
 
+/**
+ * Get ALL files in the scan (recursively, not per-directory), server-sorted and
+ * paginated. This backs the Flat list view: one windowed query instead of walking
+ * every directory in JS, so it scales to huge trees and paints the first page fast.
+ */
+async function handleGetAllFiles(
+  db: DatabaseConnection,
+  runId: string,
+  sortBy: 'name' | 'size' | 'mtime' = 'size',
+  sortDir: 'asc' | 'desc' = 'desc',
+  limit: number = 500,
+  offset: number = 0,
+  duplicatesOnly: boolean = false
+): Promise<{ files: FileNode[]; total: number; has_more: boolean }> {
+  const notDir = sql`is_directory = false`;
+
+  // "Group by duplicates" mode: restrict to files whose content hash is shared by
+  // at least one other file (i.e. real duplicates), so the list shows ONLY duplicates.
+  const dupFilter = duplicatesOnly
+    ? sql`hash IS NOT NULL AND hash IN (
+        SELECT hash FROM files
+        WHERE run_id = ${runId} AND is_directory = false AND hash IS NOT NULL
+        GROUP BY hash HAVING count(*) > 1
+      )`
+    : sql`true`;
+
+  const countResult = await db.db
+    .select({ count: sql<number>`count(*)` })
+    .from(files)
+    .where(and(eq(files.run_id, runId), notDir, dupFilter));
+  const total = Number(countResult[0]?.count) || 0;
+
+  const sortCol =
+    sortBy === 'size' ? files.physical_size : sortBy === 'mtime' ? files.mtime : files.path;
+  const primary = sortDir === 'asc' ? asc(sortCol) : desc(sortCol);
+
+  // In duplicates mode, keep each duplicate group contiguous: order by size desc
+  // (biggest wasted space first — dupes of a hash all share one size), then hash to
+  // cluster the group, then path. Otherwise use the user's chosen sort.
+  const ordering = duplicatesOnly
+    ? [desc(files.physical_size), asc(files.hash), asc(files.path)]
+    : [primary, asc(files.path)];
+
+  const results = await db.db
+    .select({
+      path: files.path,
+      physical_size: files.physical_size,
+      content_size: files.content_size,
+      mtime: files.mtime,
+      is_directory: files.is_directory,
+      is_hidden: files.is_hidden,
+      hash: files.hash,
+      is_archive_container: files.is_archive_container,
+      archive_format: files.archive_format,
+      alias: sql<
+        string | null
+      >`(SELECT a.alias FROM aliases a WHERE a.run_id = ${runId} AND a.path = "files"."path")`,
+      has_comment: sql<boolean>`EXISTS (SELECT 1 FROM comments c WHERE c.run_id = ${runId} AND c.path = "files"."path")`,
+      has_tag: sql<boolean>`EXISTS (SELECT 1 FROM tag_assignments tg WHERE tg.run_id = ${runId} AND tg.path = "files"."path")`,
+      tagged_for_deletion: sql<boolean>`EXISTS (SELECT 1 FROM delete_tags dt WHERE dt.run_id = ${runId} AND (dt.path = "files"."path" OR starts_with("files"."path", dt.path || '/')))`,
+      // True group size: how many copies share this hash across the WHOLE result (window
+      // function → computed before LIMIT/OFFSET). Lets the UI show the real "N×" even when a
+      // page boundary splits a group across pages. Only meaningful (and only computed) in
+      // duplicates mode; a constant 0 otherwise avoids a needless per-row window scan.
+      dup_count: duplicatesOnly
+        ? sql<number>`count(*) OVER (PARTITION BY hash)`
+        : sql<number>`0`,
+    })
+    .from(files)
+    .where(and(eq(files.run_id, runId), notDir, dupFilter))
+    // Tiebreak on path so the order is stable across pages (offset pagination).
+    .orderBy(...ordering)
+    .limit(limit)
+    .offset(offset);
+
+  const fileNodes: FileNode[] = results.map(row => {
+    const parts = row.path.split('/');
+    const name = parts[parts.length - 1] || row.path;
+    return {
+      path: row.path,
+      name,
+      size: row.physical_size,
+      content_size: row.content_size,
+      mtime: row.mtime,
+      is_directory: row.is_directory,
+      is_hidden: row.is_hidden,
+      hash: row.hash,
+      is_archive: row.is_archive_container || false,
+      archive_format: row.archive_format,
+      alias: row.alias ?? null,
+      has_comment: Boolean(row.has_comment),
+      has_tag: Boolean(row.has_tag),
+      tagged_for_deletion: Boolean(row.tagged_for_deletion),
+      dup_count: duplicatesOnly ? Number(row.dup_count) : undefined,
+    };
+  });
+
+  return { files: fileNodes, total, has_more: offset + fileNodes.length < total };
+}
+
 async function handleGetDuplicates(
   db: DatabaseConnection,
   runId: string,
@@ -551,9 +653,40 @@ async function handleGetDirDateStats(
   db: DatabaseConnection,
   runId: string,
   dirPath: string
-): Promise<{ min: number | null; max: number | null; median: number | null; count: number }> {
+): Promise<{
+  min: number | null;
+  max: number | null;
+  median: number | null;
+  count: number;
+  buckets: { cold: number; warm: number; active: number };
+  // Subtree aggregates (bytes on disk, file + directory counts). Sourced from the files
+  // table so they're available AS SOON AS ingestion completes — i.e. the whole time the
+  // hashing (duplicates) phase runs — not only once the scan fully finishes. total physical
+  // size matches dir_stats.total_size (both SUM(physical_size) over descendant files).
+  size: number;
+  fileCount: number;
+  dirCount: number;
+}> {
   // Root ('') aggregates the whole scan; any other directory matches its subtree.
   const pattern = dirPath === '' ? '%' : dirPath + '/%';
+
+  // Subtree size + file/dir counts — one pass, independent of the date scan below so it
+  // still returns real figures for a directory that holds only dirs or mtime-0 files.
+  const aggResult = await db.db.execute(sql`
+    SELECT
+      COALESCE(SUM(physical_size) FILTER (WHERE is_directory = false), 0)::bigint AS size,
+      COUNT(*) FILTER (WHERE is_directory = false)::int AS file_count,
+      COUNT(*) FILTER (WHERE is_directory = true)::int AS dir_count
+    FROM files
+    WHERE run_id = ${runId} AND path LIKE ${pattern}
+  `);
+  const aggRow = aggResult.rows[0] as
+    | { size: number | string; file_count: number | string; dir_count: number | string }
+    | undefined;
+  const size = Number(aggRow?.size ?? 0);
+  const fileCount = Number(aggRow?.file_count ?? 0);
+  const dirCount = Number(aggRow?.dir_count ?? 0);
+
   const result = await db.db.execute(sql`
     SELECT mtime FROM files
     WHERE run_id = ${runId}
@@ -567,7 +700,9 @@ async function handleGetDirDateStats(
     .map(r => Number(r.mtime))
     .filter(m => m > 0);
 
-  if (mtimes.length === 0) return { min: null, max: null, median: null, count: 0 };
+  const empty = { cold: 0, warm: 0, active: 0 };
+  if (mtimes.length === 0)
+    return { min: null, max: null, median: null, count: 0, buckets: empty, size, fileCount, dirCount };
 
   const min = mtimes[0];
   const max = mtimes[mtimes.length - 1];
@@ -577,7 +712,20 @@ async function handleGetDirDateStats(
       ? Math.round((mtimes[mid - 1] + mtimes[mid]) / 2)
       : mtimes[mid];
 
-  return { min, max, median, count: mtimes.length };
+  // Age buckets relative to now (mtime is unix seconds): cold > 5 yrs, warm 1–5 yrs,
+  // active < 1 yr. Feeds the "Répartition par âge" of the root summary.
+  const now = Date.now() / 1000;
+  const oneYear = 365 * 24 * 3600;
+  const y1 = now - oneYear;
+  const y5 = now - 5 * oneYear;
+  const buckets = { cold: 0, warm: 0, active: 0 };
+  for (const m of mtimes) {
+    if (m < y5) buckets.cold++;
+    else if (m < y1) buckets.warm++;
+    else buckets.active++;
+  }
+
+  return { min, max, median, count: mtimes.length, buckets, size, fileCount, dirCount };
 }
 
 /**
@@ -641,6 +789,16 @@ export async function dispatchQuery(
         (request.limit as number) || 1000,
         request.cursor as string | undefined
       );
+    case 'get_all_files':
+      return await handleGetAllFiles(
+        database,
+        runId,
+        (request.sort_by as 'name' | 'size' | 'mtime') || 'size',
+        (request.sort_dir as 'asc' | 'desc') || 'desc',
+        (request.limit as number) || 500,
+        (request.offset as number) || 0,
+        Boolean(request.duplicates_only)
+      );
     case 'get_duplicates':
       return await handleGetDuplicates(
         database,
@@ -665,7 +823,13 @@ export async function dispatchQuery(
     case 'ping':
       return { pong: true, timestamp: Date.now() };
     case 'describe_directory':
-      return await handleDescribeDirectory(database, runId, (request.path as string) ?? '');
+      return await handleDescribeDirectory(
+        database,
+        runId,
+        (request.path as string) ?? '',
+        request.llm as { baseUrl?: string; apiKey?: string; model?: string } | undefined,
+        scanning
+      );
     case 'get_thumbnail':
       return await handleGetThumbnail(database, runId, (request.path as string) ?? '');
     case 'store_thumbnail':
@@ -733,6 +897,10 @@ export async function dispatchQuery(
       return await handleRedo(database, runId);
     case 'undo_state':
       return await handleUndoState(database, runId);
+    case 'restore_annotations':
+      return await handleRestoreAnnotations(database, runId);
+    case 'has_annotation_backup':
+      return await handleHasAnnotationBackup(database, runId);
     default:
       throw new Error(`Unknown action: ${request.action}`);
   }

@@ -93,3 +93,26 @@ export function getLogsDir(): string {
     return path.join(process.cwd(), 'logs');
   }
 }
+
+/**
+ * Directory holding all per-scan datadirs — the parent of every `dbdata-*`.
+ * Startup reconciliation lists this to find datadirs (and their `.meta.json`
+ * sidecars) the UI may not know about.
+ */
+export function getDatabasesDir(): string {
+  return path.dirname(getDatabasePath('_'));
+}
+
+/**
+ * Directory holding durable annotation snapshots — the user's irreplaceable
+ * enrichment work (aliases/comments/tags/deletion marks), kept OUTSIDE the
+ * per-scan datadirs so a corrupted datadir never takes the annotations with it.
+ * One JSON file per scanned root (keyed by a hash of its path).
+ */
+export function getAnnotationsDir(): string {
+  if (isStandalone()) {
+    return path.join(getAppDataDir(), 'annotations');
+  } else {
+    return path.join(process.cwd(), 'annotations');
+  }
+}

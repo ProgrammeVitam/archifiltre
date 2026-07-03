@@ -153,6 +153,39 @@ export async function getVersion(): Promise<CommandResult> {
 	return await invoke<CommandResult>('get_version');
 }
 
+/** Durable status of a scan's datadir, read from its meta sidecar (no PGlite open). */
+export interface DatadirMeta {
+	version: number;
+	dbName: string;
+	runId: string | null;
+	rootPath: string | null;
+	status: 'running' | 'paused' | 'complete' | 'cancelled';
+	fileCount: number | null;
+	updatedAt: number;
+}
+
+export interface DatadirEntry {
+	dbName: string;
+	meta: DatadirMeta | null;
+	hasSnapshot: boolean;
+}
+
+/**
+ * List the scan datadirs on disk with their durable meta — the on-disk truth the app
+ * reconciles against its localStorage scan list at startup. Empty array on any failure
+ * (reconciliation is best-effort; it must never block app launch).
+ */
+export async function listDatadirs(): Promise<DatadirEntry[]> {
+	try {
+		const res = await invoke<CommandResult>('list_datadirs');
+		if (!res.success || !res.output) return [];
+		const parsed = JSON.parse(res.output) as { datadirs?: DatadirEntry[] };
+		return parsed.datadirs ?? [];
+	} catch {
+		return [];
+	}
+}
+
 // ================================
 // Command Functions - Scan
 // ================================
@@ -361,6 +394,10 @@ export interface FileNode extends NodeEnrichment {
 	hash: string | null;
 	is_archive: boolean;
 	archive_format: string | null;
+	/** Duplicates mode only: total copies sharing this file's hash across the whole result
+	 *  (independent of pagination), so the UI can show the real "N×" for a group even when a
+	 *  page boundary splits it. Undefined outside duplicates mode. */
+	dup_count?: number;
 }
 
 /** Files data from get_files query */
@@ -418,12 +455,21 @@ export async function stopQuerySession(): Promise<void> {
  * mid-scan → empty tree). Omitting it falls back to the active tab's pointer.
  */
 export async function sendQuery(request: QueryRequest, dbName?: string): Promise<QueryResponse> {
+	// Guarantee a UNIQUE wire id. Callers build ids as `${action}_${Date.now()}`, which
+	// collides when two of the same request fire in the same millisecond — e.g. get_tree is
+	// double-fired at scan completion (once from the job:complete handler, once from the
+	// activeScan subscription). A duplicate id makes the owner's pending-map insert overwrite
+	// and DROP the first request's response channel, surfacing as "session closed before
+	// responding" (owner.rs). A process-monotonic suffix makes every id collision-proof while
+	// keeping the readable action prefix. Correlation is internal (callers await the response,
+	// not the id), so rewriting the id here is safe.
+	const uniqueRequest = { ...request, id: `${request.id}_${_ownerReqCounter++}` };
 	if (useOwnerDb())
 		return await invoke<QueryResponse>('session_request', {
 			dbName: dbName ?? activeQueryDb,
-			request
+			request: uniqueRequest
 		});
-	return await invoke<QueryResponse>('send_query', { request });
+	return await invoke<QueryResponse>('send_query', { request: uniqueRequest });
 }
 
 // ── Scan control (owner mode) ──────────────────────────────────────────────
@@ -589,6 +635,33 @@ export async function queryFiles(
 	return response.data as FilesData;
 }
 
+/** All files in the scan (recursive), server-sorted + paginated — backs the Flat list.
+ *  One windowed query instead of walking every directory in JS. */
+export async function queryAllFiles(
+	sortBy: 'name' | 'size' | 'mtime' = 'size',
+	sortDir: 'asc' | 'desc' = 'desc',
+	limit: number = 500,
+	offset: number = 0,
+	duplicatesOnly: boolean = false
+): Promise<{ files: FileNode[]; total: number; has_more: boolean } | null> {
+	const response = await sendQuery({
+		id: `get_all_files_${Date.now()}`,
+		action: 'get_all_files',
+		sort_by: sortBy,
+		sort_dir: sortDir,
+		limit,
+		offset,
+		duplicates_only: duplicatesOnly
+	});
+
+	if (!response.ok) {
+		console.error('Failed to get all files:', response.error);
+		return null;
+	}
+
+	return response.data as { files: FileNode[]; total: number; has_more: boolean };
+}
+
 /** AI-generated directory description */
 export interface DirectoryDescription {
 	description: string | null;
@@ -607,10 +680,31 @@ export async function queryDirectoryDescription(
 	dirPath: string = ''
 ): Promise<DirectoryDescription | null> {
 	try {
+		// AI can be turned off in Settings › AI. Only the `external` provider is wired for
+		// now (webllm is planned), so anything other than external means "don't call".
+		try {
+			const mode = localStorage.getItem('archifiltre-ai-mode');
+			if (mode && mode !== 'external') return { description: null, error: 'AI disabled' };
+		} catch {
+			/* no localStorage → default (external) */
+		}
+		// LLM credentials from Settings › AI (localStorage). Sent with the request; the
+		// sidecar falls back to its LLM_* env vars when these are empty.
+		let llm: { baseUrl: string; apiKey: string; model: string } | undefined;
+		try {
+			const raw = localStorage.getItem('archifiltre-llm-config');
+			if (raw) {
+				const c = JSON.parse(raw);
+				if (c && (c.baseUrl || c.apiKey || c.model)) llm = c;
+			}
+		} catch {
+			/* no/bad config → undefined → env fallback */
+		}
 		const response = await sendQuery({
 			id: `describe_directory_${Date.now()}`,
 			action: 'describe_directory',
-			path: dirPath
+			path: dirPath,
+			...(llm ? { llm } : {})
 		});
 
 		if (!response.ok) {
@@ -631,6 +725,14 @@ export interface DirDateStats {
 	max: number | null;
 	median: number | null;
 	count: number;
+	/** Age distribution relative to now: cold > 5 yrs, warm 1–5 yrs, active < 1 yr. */
+	buckets?: { cold: number; warm: number; active: number };
+	/** Subtree size (bytes on disk) + file/dir counts. Available once ingestion completes —
+	 *  i.e. throughout the hashing phase — so the panel can fill these before the whole scan
+	 *  finishes. `size` matches the settled tree's total_size (both SUM(physical_size)). */
+	size?: number;
+	fileCount?: number;
+	dirCount?: number;
 }
 
 /**
@@ -992,8 +1094,9 @@ export interface ExportOptions {
 	fullPaths?: boolean;
 	dbName?: string;
 	deletionOnly?: boolean;
-	/** 'csv' (default), 'resip' (SEDA archival CSV), or 'xlsx' (Excel workbook). */
-	format?: 'csv' | 'resip' | 'xlsx';
+	/** 'csv' (default), 'resip' (SEDA archival CSV), 'xlsx' (Excel workbook),
+	 *  or 'docx' (French audit report). */
+	format?: 'csv' | 'resip' | 'xlsx' | 'docx';
 }
 
 /**

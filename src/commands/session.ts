@@ -26,6 +26,7 @@ import {
   getLatestRunId,
   insertScanMetadata,
   updateScanMetadata,
+  countRunRows,
   setScanStatus,
   getScanMetadata,
   ensureTemplateInBackground,
@@ -40,6 +41,32 @@ import {
   type ScanResult,
 } from '@lib/scanner.ts';
 import { ensureEnrichmentTables } from '@extensions/enrichment/index.ts';
+import {
+  scheduleSnapshot,
+  cancelSnapshot,
+  flushSnapshot,
+  flushSnapshotSync,
+  deleteSnapshot,
+} from '@extensions/enrichment/snapshot.ts';
+import { writeDatadirMeta, datadirMetaPath, type DatadirStatus } from '@lib/datadir-meta.ts';
+import { settleDatadir } from '@lib/settle-datadir.ts';
+
+// Enrichment actions that change the user's annotations → trigger a durable snapshot.
+// (undo/redo are included: they mutate the same tables.)
+const ENRICHMENT_MUTATIONS = new Set([
+  'set_alias',
+  'set_comment',
+  'set_delete_tag',
+  'remove_delete_tag',
+  'create_tag',
+  'rename_tag',
+  'delete_tag',
+  'assign_tag',
+  'unassign_tag',
+  'undo',
+  'redo',
+  'restore_annotations',
+]);
 import { getDatabasePath } from '@lib/platform-paths.ts';
 import { dispatchQuery, type QueryRequest } from './query.ts';
 
@@ -64,6 +91,9 @@ export default class Session extends Command {
   private scanPaused = false;
   /** jobId of the running scan, so a pause triggered out-of-band can address job:paused. */
   private currentJobId = '';
+  /** Root path of the running scan — kept on the instance so stopScan (which runs outside
+   *  runScan's scope) can write it into the datadir meta sidecar. */
+  private scanRootPath: string | null = null;
   /** True while switch_db swaps the connection, so a second switch can't race it. */
   private switching = false;
   /** In-flight read queries. The scan's betweenBatches hook waits on this so reads
@@ -194,7 +224,28 @@ export default class Session extends Command {
       const trimmed = line.trim();
       if (trimmed) void this.handle(trimmed);
     });
-    rl.on('close', () => process.exit(0));
+    // Flush a pending annotation snapshot before exit: a mutation followed within the
+    // debounce window (500ms) by app-close would otherwise lose that last edit. Covers
+    // stdin-close (normal shutdown) and SIGTERM/SIGINT (supervisor kill / Ctrl-C).
+    rl.on('close', () => void this.shutdown());
+    process.on('SIGTERM', () => void this.shutdown());
+    process.on('SIGINT', () => void this.shutdown());
+  }
+
+  private shuttingDown = false;
+
+  /** Flush the pending annotation snapshot, then exit. Idempotent. */
+  private shutdown(code = 0): void {
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
+    // Synchronous write of the cached snapshot — a Bun signal handler can't complete an
+    // async PGlite read, so we must not build a fresh one here. The cache is kept current
+    // by the debounced writes; the datadir itself remains the source of truth regardless.
+    if (this.database) {
+      cancelSnapshot(this.database);
+      flushSnapshotSync(this.database);
+    }
+    process.exit(code);
   }
 
   private async handle(line: string): Promise<void> {
@@ -277,6 +328,9 @@ export default class Session extends Command {
       try {
         const data = await dispatchQuery(this.database, this.runId, req, this.scanning);
         this.send({ id, ok: true, data });
+        // Mirror the user's irreplaceable work to the durable snapshot after any
+        // enrichment mutation (debounced; fire-and-forget — never affects the response).
+        if (ENRICHMENT_MUTATIONS.has(action)) scheduleSnapshot(this.database, this.runId);
       } finally {
         this.pendingReads--;
       }
@@ -320,7 +374,20 @@ export default class Session extends Command {
       // closed handle (a concurrent read keeps using the old, still-open one until the
       // atomic swap). Different datadir → no two-openers-of-one-datadir.
       const old = this.database;
-      const next = await createScanDatabase(db);
+      const oldRunId = this.runId;
+      // Opening an EXISTING datadir that Postgres can't recover (power-cut corruption)
+      // throws here. Surface it as a typed 'datadir_damaged' so the UI offers Re-scan /
+      // Delete instead of a raw error — the old connection is untouched (never swapped).
+      let next: DatabaseConnection;
+      try {
+        next = await createScanDatabase(db);
+      } catch (openErr) {
+        logger.error('Datadir failed to open (likely corrupted by unclean shutdown)', openErr as Error, {
+          db,
+        });
+        this.send({ id, ok: false, error: 'datadir_damaged' });
+        return;
+      }
       await ensureEnrichmentTables(next);
       const rid = await new Promise<string | null>((resolve, reject) => {
         getLatestRunId(next).subscribe({ next: resolve, error: reject });
@@ -328,6 +395,10 @@ export default class Session extends Command {
       this.database = next;
       this.runId = rid ?? undefined;
       if (old) {
+        // Flush any pending annotation snapshot for the datadir we're leaving before its
+        // connection closes (the debounce timer would otherwise fire on a closed handle).
+        cancelSnapshot(old);
+        if (oldRunId) await flushSnapshot(old, oldRunId);
         try {
           await old.pg.close();
         } catch {
@@ -348,6 +419,20 @@ export default class Session extends Command {
     this.autoThrottle = false;
   }
 
+  /** Refresh the datadir meta sidecar so startup reconciliation sees this scan's durable
+   *  status without opening its PGlite. Best-effort; never blocks the transition. */
+  private writeMeta(status: DatadirStatus, rootPath: string | null, fileCount: number | null): void {
+    const dbName = this.database?.name;
+    if (!dbName) return;
+    void writeDatadirMeta({
+      dbName,
+      runId: this.runId ?? null,
+      rootPath,
+      status,
+      fileCount,
+    });
+  }
+
   private async runScan(req: QueryRequest): Promise<void> {
     const jobId = (req.jobId as string) || (req.runId as string) || '';
     if (this.scanning) {
@@ -362,6 +447,7 @@ export default class Session extends Command {
     const runId = (req.runId as string) || (resume && this.runId ? this.runId : generateRunId());
     this.runId = runId; // queries during the scan target this run
     this.currentJobId = jobId;
+    this.scanRootPath = rootPath;
     this.scanning = true;
     this.scanPaused = false;
     const startMs = Date.now();
@@ -403,6 +489,7 @@ export default class Session extends Command {
       // the row already exists, so set status back to 'running' explicitly.
       await firstValueFrom(insertScanMetadata(this.database!, runId, rootPath, startedAt));
       await firstValueFrom(setScanStatus(this.database!, runId, 'running'));
+      this.writeMeta('running', rootPath, null);
     } catch (e) {
       this.scanning = false;
       this.resetGovernor();
@@ -441,19 +528,26 @@ export default class Session extends Command {
       complete: () => {
         this.scanSubscription = undefined;
         void (async () => {
+          let finalCount: number | null = null;
           try {
             // dir_stats is fully materialized by the per-batch rollup (or, on a frontier
             // resume, by the end-of-ingestion populateDirStats) — no spike here.
             if (lastResult) {
-              await firstValueFrom(
-                updateScanMetadata(this.database!, runId, lastResult.filesIngested)
-              );
+              // file_count from the DB, not the session counter — on a resumed run the
+              // in-memory counter only saw the remainder. -1 sentinel → fall back.
+              const exact = await firstValueFrom(countRunRows(this.database!, runId));
+              finalCount = exact >= 0 ? exact : lastResult.filesIngested;
+              await firstValueFrom(updateScanMetadata(this.database!, runId, finalCount));
             }
           } catch {
             /* best effort — metadata update must not crash the owner */
           }
           this.scanning = false;
           this.resetGovernor();
+          this.writeMeta('complete', rootPath, finalCount);
+          // A settled scan must survive power loss: force the datadir's dirty pages to
+          // disk now (PGlite's NODEFS never fsyncs on its own). Cheap at this boundary.
+          void settleDatadir(this.database);
           this.send({ event: 'job:complete', jobId, durationMs: Date.now() - startMs });
           // Now idle: build the warm-start template (initdb once) so the NEXT new db is a
           // ~125 ms copy instead of a ~3 s initdb. Fire-and-forget; no-op if already built.
@@ -477,14 +571,24 @@ export default class Session extends Command {
     this.scanSubscription = undefined;
     this.scanning = false;
     this.resetGovernor();
+    // Tell the UI FIRST: during the hashing phase PGlite can be busy with batched
+    // hash updates for seconds, and the status write below queues behind them — the
+    // button must not wait on that. Crash-safe ordering: if the process died before
+    // the write, the run stays 'running' in the DB, which the interrupted-scan path
+    // already treats as resumable.
+    this.send({ event: 'job:paused', jobId: this.currentJobId });
     if (this.runId) {
       try {
         await firstValueFrom(setScanStatus(this.database!, this.runId, status));
+        this.writeMeta(status, this.scanRootPath, null);
+        // A paused scan is a settled state the user can leave for days — make it survive
+        // power loss too (the frontier already makes it resumable, but only if its bytes
+        // reached disk).
+        if (status === 'paused') void settleDatadir(this.database);
       } catch {
         /* best effort */
       }
     }
-    this.send({ event: 'job:paused', jobId: this.currentJobId });
   }
 
   /**
@@ -499,8 +603,27 @@ export default class Session extends Command {
       this.scanSubscription?.unsubscribe();
       this.scanSubscription = undefined;
       this.scanning = false;
+      // Explicit discard of this scan → discard its annotations snapshot too (the user
+      // chose to throw this scan away; the File-menu export is the "keep a copy" path).
+      // Read the root path before closing the connection, then cancel any pending write.
+      let discardRoot: string | null = null;
+      if (this.database && this.runId) {
+        try {
+          const r = await this.database.pg.query<{ root_path: string }>(
+            `SELECT root_path FROM scan_metadata WHERE run_id = $1`,
+            [this.runId]
+          );
+          discardRoot = r.rows[0]?.root_path ?? null;
+        } catch {
+          /* metadata unreadable → skip snapshot cleanup, leave the file */
+        }
+        cancelSnapshot(this.database);
+      }
       if (this.database) await this.database.pg.close();
       if (db) await rm(getDatabasePath(db), { recursive: true, force: true });
+      if (discardRoot) await deleteSnapshot(discardRoot);
+      // Also drop the meta sidecar (Phase 2) so reconciliation doesn't resurrect it.
+      if (db) await rm(datadirMetaPath(db), { force: true });
       this.send({ id, ok: true });
     } catch (e) {
       this.send({ id, ok: false, error: e instanceof Error ? e.message : String(e) });

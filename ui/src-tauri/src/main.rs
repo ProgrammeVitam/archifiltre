@@ -335,6 +335,83 @@ async fn get_version(app: tauri::AppHandle) -> Result<CommandResult, String> {
     })
 }
 
+/// List on-disk scan datadirs + their durable meta (JSON), for startup reconciliation.
+/// Pure filesystem read in the sidecar — opens no database, so it also reports datadirs
+/// that no longer open.
+#[tauri::command]
+async fn list_datadirs(app: tauri::AppHandle) -> Result<CommandResult, String> {
+    let binary_path = find_sidecar_path(&app)?;
+
+    let output = sidecar_command(&binary_path)
+        .args(["datadirs"])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to list datadirs: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    Ok(CommandResult {
+        success: output.status.success(),
+        output: stdout,
+        error: if stderr.is_empty() { None } else { Some(stderr) },
+    })
+}
+
+/// Export a support bundle (.zip) of the application logs. Spawns the sidecar's
+/// `logs --export` and pipes the webview's snapshot (error ring buffer + UI-state
+/// summary, JSON) over stdin so it lands in the bundle alongside the sidecar logs.
+/// Fast and DB-free — must work precisely when everything else is broken.
+#[tauri::command]
+async fn export_logs(
+    app: tauri::AppHandle,
+    output_path: String,
+    snapshot: Option<String>,
+) -> Result<CommandResult, String> {
+    use tokio::io::AsyncWriteExt;
+
+    let binary_path = find_sidecar_path(&app)?;
+
+    let mut child = sidecar_command(&binary_path)
+        .args([
+            "logs",
+            "--export",
+            "--export-path",
+            &output_path,
+            "--snapshot-stdin",
+            "--no-color",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn log export: {}", e))?;
+
+    // Write the snapshot (may be absent → empty stdin) and CLOSE the pipe, so the
+    // sidecar's stdin read terminates.
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Some(snap) = snapshot {
+            let _ = stdin.write_all(snap.as_bytes()).await;
+        }
+        let _ = stdin.shutdown().await;
+        drop(stdin);
+    }
+
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("Log export failed: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    Ok(CommandResult {
+        success: output.status.success(),
+        output: stdout,
+        error: if stderr.is_empty() { None } else { Some(stderr) },
+    })
+}
+
 // ============================================================================
 // Commands - Scan
 // ============================================================================
@@ -966,7 +1043,7 @@ async fn create_window(app: tauri::AppHandle) -> Result<String, String> {
 
     let window_id = format!("main-{}", uuid::Uuid::new_v4());
 
-    let _window =
+    let window =
         WebviewWindowBuilder::new(&app, &window_id, WebviewUrl::App("index.html".into()))
             .title("Archifiltre")
             .inner_size(1200.0, 800.0)
@@ -979,7 +1056,25 @@ async fn create_window(app: tauri::AppHandle) -> Result<String, String> {
             .build()
             .map_err(|e| format!("Failed to create window: {}", e))?;
 
+    apply_window_effect(&window);
     Ok(window_id)
+}
+
+/// Native window effect: vibrancy on macOS, acrylic on Windows. No-op on Linux, where
+/// window-vibrancy has no backend — the translucent CSS look (and the Settings "solid"
+/// fallback) covers it.
+#[allow(unused_variables)]
+fn apply_window_effect(window: &tauri::WebviewWindow) {
+    #[cfg(target_os = "macos")]
+    {
+        use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
+        let _ = apply_vibrancy(window, NSVisualEffectMaterial::HudWindow, None, Some(10.0));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use window_vibrancy::apply_acrylic;
+        let _ = apply_acrylic(window, Some((18, 18, 18, 125)));
+    }
 }
 
 // ============================================================================
@@ -996,16 +1091,23 @@ fn main() {
         .plugin(tauri_plugin_os::init())
         .manage(app_state)
         .setup(move |app| {
+            use tauri::Manager;
             // Pre-warm a spare owner during launch so its ~1 s WASM compile overlaps
             // startup and the first scan can claim it (no-op if owner mode is unused —
             // the spare just sits idle and is reaped on teardown).
             ensure_warm_spare(app.handle().clone(), state_for_setup);
+            // Native window effect (vibrancy/acrylic) on the primary window.
+            if let Some(window) = app.get_webview_window("main") {
+                apply_window_effect(&window);
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             // Health & Version
             health_check,
             get_version,
+            list_datadirs,
+            export_logs,
             // Scan
             scan_directory,
             // Checksum

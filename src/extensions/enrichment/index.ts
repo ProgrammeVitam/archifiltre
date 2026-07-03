@@ -24,6 +24,13 @@ import {
 } from '@extensions/enrichment/schema.ts';
 import { recordOp, isNoOp, captureRow, type Change } from '@extensions/enrichment/undo.ts';
 export { handleUndo, handleRedo, handleUndoState } from '@extensions/enrichment/undo.ts';
+import { promises as fs } from 'node:fs';
+import {
+  snapshotFileFor,
+  snapshotSize,
+  type AnnotationSnapshot,
+} from '@extensions/enrichment/snapshot.ts';
+import { restoreSnapshot, type RestoreResult } from '@extensions/enrichment/restore.ts';
 
 // Re-export schema types for consumers
 export type {
@@ -616,6 +623,57 @@ export async function handleGetElementEnrichment(
     ancestorTaggedForDeletion,
     pathAliases,
   };
+}
+
+/**
+ * Restore the durable annotation snapshot for this run's scanned root onto the run,
+ * keyed by path (see restore.ts). Used after re-scanning a folder whose datadir was
+ * lost/damaged. No snapshot for the root → { restored: 0, orphaned: [] }.
+ */
+export async function handleRestoreAnnotations(
+  db: DatabaseConnection,
+  runId: string
+): Promise<RestoreResult> {
+  await ensureEnrichmentTables(db);
+  const root = (
+    await db.pg.query<{ root_path: string }>(
+      `SELECT root_path FROM scan_metadata WHERE run_id = $1`,
+      [runId]
+    )
+  ).rows[0]?.root_path;
+  if (!root) return { restored: 0, orphaned: [] };
+
+  const file = snapshotFileFor(root);
+  let snapshot: AnnotationSnapshot;
+  try {
+    snapshot = JSON.parse(await fs.readFile(file, 'utf-8')) as AnnotationSnapshot;
+  } catch {
+    return { restored: 0, orphaned: [] }; // no snapshot / unreadable → nothing to restore
+  }
+  return await restoreSnapshot(db, runId, snapshot);
+}
+
+/**
+ * Whether a durable annotation snapshot exists for this run's scanned root (so the UI can
+ * offer "restore your annotations" after a re-scan). Cheap: reads scan_metadata + statfs.
+ */
+export async function handleHasAnnotationBackup(
+  db: DatabaseConnection,
+  runId: string
+): Promise<{ hasBackup: boolean; count: number }> {
+  const root = (
+    await db.pg.query<{ root_path: string }>(
+      `SELECT root_path FROM scan_metadata WHERE run_id = $1`,
+      [runId]
+    )
+  ).rows[0]?.root_path;
+  if (!root) return { hasBackup: false, count: 0 };
+  try {
+    const snapshot = JSON.parse(await fs.readFile(snapshotFileFor(root), 'utf-8')) as AnnotationSnapshot;
+    return { hasBackup: true, count: snapshotSize(snapshot) };
+  } catch {
+    return { hasBackup: false, count: 0 };
+  }
 }
 
 export const MANIFEST = {

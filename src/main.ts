@@ -24,6 +24,7 @@ import ExposeDb from './commands/expose-db.ts';
 import Logs from './commands/logs.ts';
 import Query from './commands/query.ts';
 import Session from './commands/session.ts';
+import Datadirs from './commands/datadirs.ts';
 import { getAppDataDir } from '@lib/platform-paths.ts';
 
 // Import extension-declared commands
@@ -39,6 +40,7 @@ const CORE_COMMANDS: Record<string, typeof Command> = {
   logs: Logs,
   query: Query,
   session: Session,
+  datadirs: Datadirs,
 };
 
 // Merged command registry: core + extension-declared commands

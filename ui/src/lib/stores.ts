@@ -79,6 +79,19 @@ export interface Scan {
 	scanProgress: string;
 	/** Current scan phase */
 	scanPhase: ScanPhase;
+	/** Pause clicked, session ack (job:paused) not yet arrived — renders "Pausing…".
+	 *  Transient UI state: cleared on pause/resume and on restore. */
+	pauseRequested?: boolean;
+	/** Set by startup reconciliation when this scan's datadir is gone or won't open:
+	 *  'missing' = no datadir on disk; 'damaged' = present but PGlite couldn't recover it.
+	 *  The status bar/panel offers Re-scan (and annotation restore if a snapshot exists). */
+	datadirState?: 'missing' | 'damaged';
+	/** True when a durable annotation snapshot exists for this scan's root, so the
+	 *  re-scan flow can offer to restore the user's work. Set during reconciliation. */
+	hasAnnotationBackup?: boolean;
+	/** Marks a scan adopted from disk by reconciliation (not from localStorage), so the
+	 *  UI can note "recovered" briefly. Transient. */
+	recovered?: boolean;
 	/** Error message if state is 'error' */
 	errorMessage: string | null;
 	/** Timestamp when scan was created */
@@ -171,6 +184,7 @@ function saveToStorage(state: ScansState): void {
 				// 'paused', KEEPING scanId/dbName, so on relaunch the tab offers Continue
 				// (resume the frontier remainder) instead of dropping to the Drop-zone.
 				state: scan.state === 'scanning' ? 'paused' : scan.state,
+				pauseRequested: false,
 				scanId: scan.scanId
 			}))
 		};
@@ -255,6 +269,27 @@ function createScansStore() {
 				activeScanId: newScan.id
 			}));
 			return newScan;
+		},
+
+		/** Adopt scans discovered on disk that the UI didn't know about (startup
+		 *  reconciliation). Skips any whose dbName already matches a known scan; drops a
+		 *  leading empty "New Scan" placeholder if real scans are being adopted. Does NOT
+		 *  change the active scan (the user's current tab stays put). */
+		adoptScans: (incoming: Scan[]) => {
+			if (incoming.length === 0) return;
+			update((state) => {
+				const known = new Set(state.scans.map((s) => s.dbName));
+				const fresh = incoming.filter((s) => !known.has(s.dbName));
+				if (fresh.length === 0) return state;
+				// Drop a lone idle placeholder so recovered scans don't sit behind an empty tab.
+				const base =
+					state.scans.length === 1 && state.scans[0].state === 'idle' && !state.scans[0].path
+						? []
+						: state.scans;
+				const scans = [...base, ...fresh];
+				const activeScanId = state.activeScanId ?? scans[0]?.id ?? null;
+				return { scans, activeScanId };
+			});
 		},
 
 		/** Close/delete a scan by ID */
@@ -444,11 +479,25 @@ export const viewMode = writable<ViewMode>('stalactite');
  *  the toggle while the chart renders from it. */
 export const colorMode = writable<'type' | 'date'>('type');
 
+/** Which tab the details panel's right column shows — the item's own metadata
+ *  ('details') or the user-authored enrichment ('enrichment'). Kept here (not per
+ *  panel instance) so it PERSISTS across selections: pick "Enrichment" once and
+ *  enrich file after file without the tab snapping back on every new selection. */
+export type PanelTab = 'details' | 'enrichment';
+export const panelTab = writable<PanelTab>('details');
+
 /** Icicle sibling ordering — folders always come first; this picks the order WITHIN
  *  each group: biggest→smallest, A→Z, or oldest→newest (by a folder's median descendant
  *  date / a file's mtime). */
 export type SortMode = 'size' | 'name' | 'date';
 export const sortMode = writable<SortMode>('size');
+
+/** List-view controls, lifted out of ListView so the shared header toolbar can drive
+ *  them (arrangement, quick filters, search). */
+export type ListMode = 'flat' | 'folders' | 'dupes';
+export const listMode = writable<ListMode>('flat');
+export const listFilters = writable({ marked: false, tagged: false, big: false });
+export const listSearch = writable('');
 
 // Selected item store for details panel (shared across all views)
 export interface SelectedItem {
@@ -641,6 +690,96 @@ export const healthStatus = writable<'unknown' | 'healthy' | 'unhealthy'>('unkno
 
 /** Detected platform for window controls */
 export const platform = writable<Platform | undefined>(undefined);
+
+/** Open-state for the Settings / About dialogs, shared so both the sidebar gear and
+ *  the "Archifiltre" app menu can drive them. */
+export const settingsOpen = writable(false);
+export const aboutOpen = writable(false);
+
+/** A boolean writable persisted to localStorage. */
+function persistedBool(key: string, def: boolean) {
+	let initial = def;
+	try {
+		const v = localStorage.getItem(key);
+		if (v !== null) initial = v === '1';
+	} catch {
+		/* no localStorage (prerender) */
+	}
+	const store = writable(initial);
+	store.subscribe((v) => {
+		try {
+			localStorage.setItem(key, v ? '1' : '0');
+		} catch {
+			/* ignore */
+		}
+	});
+	return store;
+}
+
+/** Window effect (macOS vibrancy / Windows acrylic / Linux translucency) vs. a solid
+ *  surface. On by default; turning it off shows a light-gray (dark: near-black) frame. */
+export const windowEffect = persistedBool('archifiltre-window-effect', true);
+
+/** A JSON-serialisable value persisted to localStorage (merged over `def` so new fields
+ *  added later still get defaults). */
+function persistedJson<T extends object>(key: string, def: T) {
+	let initial = def;
+	try {
+		const v = localStorage.getItem(key);
+		if (v !== null) initial = { ...def, ...JSON.parse(v) };
+	} catch {
+		/* no localStorage / bad JSON → defaults */
+	}
+	const store = writable<T>(initial);
+	store.subscribe((v) => {
+		try {
+			localStorage.setItem(key, JSON.stringify(v));
+		} catch {
+			/* ignore */
+		}
+	});
+	return store;
+}
+
+/** Credentials + model for the AI directory-summary LLM, set from Settings › AI.
+ *  Persisted locally and sent with each describe request; empty fields fall back to the
+ *  sidecar's LLM_BASE_URL / LLM_API_KEY / LLM_MODEL environment variables. The API key
+ *  never leaves this machine (it travels only over the local sidecar stdio pipe). */
+export interface LlmConfig {
+	baseUrl: string;
+	apiKey: string;
+	model: string;
+}
+export const llmConfig = persistedJson<LlmConfig>('archifiltre-llm-config', {
+	baseUrl: '',
+	apiKey: '',
+	model: ''
+});
+
+/** How AI (directory summaries) is provided. `off` disables it entirely; `external` uses
+ *  the credentials in {@link llmConfig} (or the LLM_* env fallback); `webllm` (in-browser,
+ *  no server) is planned but disabled for now. Defaults to `external` to preserve the
+ *  existing env-configured behaviour. */
+export type AiMode = 'off' | 'webllm' | 'external';
+function persistedStr<T extends string>(key: string, def: T) {
+	let initial = def;
+	try {
+		const v = localStorage.getItem(key);
+		if (v !== null) initial = v as T;
+	} catch {
+		/* no localStorage */
+	}
+	const store = writable<T>(initial);
+	store.subscribe((v) => {
+		try {
+			localStorage.setItem(key, v);
+		} catch {
+			/* ignore */
+		}
+	});
+	return store;
+}
+export const aiMode = persistedStr<AiMode>('archifiltre-ai-mode', 'external');
 
 // ================================
 // Scan Actions
@@ -861,12 +1000,18 @@ export function finishScanning(success: boolean): void {
 /** Mark a scan paused (keeps scanId/dbName + the partial data so the frozen tree shows
  *  and Continue can resume). State only — the caller issues the owner pause_scan. */
 export function pauseScanningScan(scanId: string): void {
-	scansStore.updateScan(scanId, { state: 'paused' });
+	scansStore.updateScan(scanId, { state: 'paused', pauseRequested: false });
 }
 
 /** Mark a paused scan scanning again (the caller issues the owner resume_scan). */
 export function resumeScanningScan(scanId: string): void {
-	scansStore.updateScan(scanId, { state: 'scanning', errorMessage: null });
+	scansStore.updateScan(scanId, { state: 'scanning', pauseRequested: false, errorMessage: null });
+}
+
+/** Pause clicked: flip the button to "Pausing…" instantly; the session's job:paused
+ *  reconciles to 'paused'. `on=false` reverts (the pause request failed). */
+export function requestPauseScanningScan(scanId: string, on = true): void {
+	scansStore.updateScan(scanId, { pauseRequested: on });
 }
 
 // Legacy alias
