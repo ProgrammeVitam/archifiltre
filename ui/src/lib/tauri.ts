@@ -356,6 +356,10 @@ export interface DirectoryNode extends NodeEnrichment {
 	max_depth?: number;
 	/** Path of that deepest descendant, or null when the folder is empty. */
 	deepest_path?: string | null;
+	/** This directory node is really an archive container (foo.zip): it drills in like a
+	 *  folder, but renders like a compressed file (dark tint + archive icon). */
+	is_archive?: boolean;
+	archive_format?: string | null;
 	/** Descendant mtime range + representative median (epoch seconds). Present only for a
 	 *  settled tree (complete/paused); absent during a live scan. Drives date colour + sort
 	 *  for folders. */

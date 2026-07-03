@@ -7,6 +7,8 @@
  */
 
 import { type DatabaseConnection } from '@lib/database.ts';
+import { readdir } from 'node:fs/promises';
+import path from 'node:path';
 
 // === Constants ===
 
@@ -48,7 +50,7 @@ function formatBytes(bytes: number): string {
  * Query direct children of a directory from the files table.
  * Returns rows with path, is_directory, and physical_size.
  */
-async function queryDirectChildren(
+export async function queryDirectChildren(
   db: DatabaseConnection,
   runId: string,
   dirPath: string
@@ -447,4 +449,135 @@ function formatDate(timestamp: number): string {
  */
 export function buildPrompt(treeString: string, statsBlock: string): string {
   return `What is this directory about?\n\n${treeString}\n\n${statsBlock}`;
+}
+
+// === Filesystem fallback (mid-scan, DB not ready) ===
+//
+// During a scan the walker may not have inserted a folder's children into the DB yet, so
+// the DB-based prompt above would describe it as "empty" (and that wrong answer gets
+// cached). A direct `readdir` is cheap and always accurate for the immediate structure —
+// enough for a good summary — so we build the prompt straight from disk instead. Names
+// only (no `stat`), capped, and symlinked dirs are treated as leaves so we never loop.
+
+/** Absolute on-disk path for a scan-relative dirPath ('' = the scanned root). Splits on
+ *  '/' (relative paths are stored POSIX-style) so it's correct on every platform. */
+function absPathOf(rootPath: string, dirPath: string): string {
+  return dirPath === '' ? rootPath : path.join(rootPath, ...dirPath.split('/'));
+}
+
+/** Immediate children of an absolute dir: dirs first, then files, name-sorted. Cheap —
+ *  `withFileTypes` avoids a `stat` per entry. */
+async function fsChildren(
+  absDir: string
+): Promise<Array<{ name: string; isDir: boolean; isLink: boolean }>> {
+  const ents = await readdir(absDir, { withFileTypes: true });
+  const out = ents.map(e => ({
+    name: e.name,
+    isDir: e.isDirectory(),
+    isLink: e.isSymbolicLink(),
+  }));
+  out.sort((a, b) =>
+    a.isDir === b.isDir ? a.name.localeCompare(b.name) : a.isDir ? -1 : 1
+  );
+  return out;
+}
+
+/** Tree string built from the live filesystem (mirrors buildTreeString's shape). */
+export async function buildTreeStringFromFs(
+  rootPath: string,
+  dirPath: string,
+  options?: TreeBuildOptions & { maxEntriesPerDir?: number }
+): Promise<string> {
+  const maxDepth = options?.maxDepth ?? 2;
+  const maxFilesPerDir = options?.maxEntriesPerDir ?? options?.maxFilesPerDir ?? 15;
+  const maxTotalLines = options?.maxTotalLines ?? 80;
+  const abs = absPathOf(rootPath, dirPath);
+
+  const state = { total: 0 };
+  const walk = async (dir: string, prefix: string, depth: number): Promise<string[]> => {
+    if (state.total >= maxTotalLines || depth > maxDepth) return [];
+    let kids: Array<{ name: string; isDir: boolean; isLink: boolean }>;
+    try {
+      kids = await fsChildren(dir);
+    } catch {
+      return []; // unreadable (permissions / vanished mid-scan) — skip quietly
+    }
+    const lines: string[] = [];
+    const fileTotal = kids.filter(k => !k.isDir).length;
+    let shownFiles = 0;
+    for (let i = 0; i < kids.length; i++) {
+      if (state.total >= maxTotalLines) break;
+      const k = kids[i];
+      const last = i === kids.length - 1;
+      const connector = last ? '└── ' : '├── ';
+      const childPrefix = last ? `${prefix}    ` : `${prefix}│   `;
+      if (k.isDir) {
+        lines.push(`${prefix}${connector}${k.name}/`);
+        state.total++;
+        if (!k.isLink && depth < maxDepth) {
+          lines.push(...(await walk(path.join(dir, k.name), childPrefix, depth + 1)));
+        }
+      } else {
+        shownFiles++;
+        if (shownFiles <= maxFilesPerDir) {
+          lines.push(`${prefix}${connector}${k.name}`);
+          state.total++;
+        } else if (shownFiles === maxFilesPerDir + 1) {
+          const remaining = fileTotal - maxFilesPerDir;
+          lines.push(`${prefix}└── ... (${remaining} more file${remaining !== 1 ? 's' : ''})`);
+          state.total++;
+          break;
+        }
+      }
+    }
+    return lines;
+  };
+
+  let top: Array<{ name: string; isDir: boolean; isLink: boolean }> = [];
+  try {
+    top = await fsChildren(abs);
+  } catch {
+    /* unreadable → empty listing */
+  }
+  const dirCount = top.filter(k => k.isDir).length;
+  const fileCount = top.length - dirCount;
+  const dirName = dirPath === '' ? '.' : basename(dirPath);
+  const rootLine = `${dirName} (${dirCount} director${dirCount !== 1 ? 'ies' : 'y'}, ${fileCount} file${fileCount !== 1 ? 's' : ''}) [listed live from disk — scan in progress]`;
+  state.total++;
+  const childLines = await walk(abs, '', 1);
+  return [rootLine, ...childLines].join('\n');
+}
+
+/** Stats block from the live filesystem: file-type mix of the immediate children (name-
+ *  based, no `stat`). Size/date ranges need the completed scan, so they read "still
+ *  scanning" here rather than showing partial numbers. */
+export async function buildStatsBlockFromFs(rootPath: string, dirPath: string): Promise<string> {
+  let kids: Array<{ name: string; isDir: boolean; isLink: boolean }> = [];
+  try {
+    kids = await fsChildren(absPathOf(rootPath, dirPath));
+  } catch {
+    /* unreadable → empty */
+  }
+  const files = kids.filter(k => !k.isDir);
+  const byExt = new Map<string, number>();
+  for (const f of files) {
+    const dot = f.name.lastIndexOf('.');
+    const ext = dot > 0 ? '.' + f.name.slice(dot + 1).toLowerCase() : '(no extension)';
+    byExt.set(ext, (byExt.get(ext) ?? 0) + 1);
+  }
+
+  const lines: string[] = [];
+  if (byExt.size > 0) {
+    const total = [...byExt.values()].reduce((a, b) => a + b, 0);
+    const top = [...byExt.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 6)
+      .map(([ext, cnt]) => `${Math.round((cnt / total) * 100)}% ${ext}`);
+    lines.push(`File types (top level): ${top.join(', ')}`);
+  } else {
+    lines.push('File types: (folders only at this level, or not yet enumerated)');
+  }
+  lines.push('Size range: (still scanning)');
+  lines.push('Date range: (still scanning)');
+  return lines.join('\n');
 }

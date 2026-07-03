@@ -92,6 +92,10 @@ interface DirectoryNode extends NodeEnrichment {
   max_depth: number;
   /** Path of that deepest descendant, or null if the folder is empty. */
   deepest_path: string | null;
+  /** This directory node is really an archive container (foo.zip): drills in like a
+   *  folder, but should render like a compressed file. */
+  is_archive?: boolean;
+  archive_format?: string | null;
   /** Descendant mtime range + representative median (epoch seconds), folded in for a
    *  settled tree only. Absent during a live scan. */
   min_mtime?: number;
@@ -160,6 +164,11 @@ async function handleGetTree(
       ds.max_depth,
       ds.deepest_path,
       al.alias as alias,
+      -- An archive container (foo.zip) is a directory node in the tree (its entries are
+      -- path-prefixed by it) but a plain file row in the files table; surface that so the
+      -- icicle can render it dark like a compressed file while it still drills in as a folder.
+      (fa.path IS NOT NULL) as is_archive,
+      fa.archive_format as archive_format,
       EXISTS (SELECT 1 FROM comments cm WHERE cm.run_id = ${runId} AND cm.path = ds.path) as has_comment,
       EXISTS (SELECT 1 FROM tag_assignments tg WHERE tg.run_id = ${runId} AND tg.path = ds.path) as has_tag,
       EXISTS (
@@ -169,6 +178,7 @@ async function handleGetTree(
       ) as tagged_for_deletion
     FROM dir_stats ds
     LEFT JOIN aliases al ON al.run_id = ${runId} AND al.path = ds.path
+    LEFT JOIN files fa ON fa.run_id = ${runId} AND fa.path = ds.path AND fa.is_archive_container = true
     WHERE ds.run_id = ${runId}
     ORDER BY ds.path
   `);
@@ -182,6 +192,8 @@ async function handleGetTree(
       max_depth: string | number;
       deepest_path: string | null;
       alias: string | null;
+      is_archive: boolean;
+      archive_format: string | null;
       has_comment: boolean;
       has_tag: boolean;
       tagged_for_deletion: boolean;
@@ -205,6 +217,8 @@ async function handleGetTree(
       max_depth: Number(row.max_depth) || 0,
       deepest_path: row.deepest_path ?? null,
       alias: row.alias ?? null,
+      is_archive: Boolean(row.is_archive),
+      archive_format: row.archive_format ?? null,
       has_comment: Boolean(row.has_comment),
       has_tag: Boolean(row.has_tag),
       tagged_for_deletion: Boolean(row.tagged_for_deletion),

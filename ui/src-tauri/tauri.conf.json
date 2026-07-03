@@ -47,7 +47,17 @@
 		],
 		"externalBin": ["../../dist/archifiltre"],
 		"category": "Utility",
-		"shortDescription": "Privacy-first file scanning tool"
+		"shortDescription": "Privacy-first file scanning tool",
+		"windows": {
+			"nsis": {
+				"installerHooks": "./installer-hooks.nsh",
+				"installerIcon": "./icons/icon.ico",
+				"headerImage": "./installer-header.bmp",
+				"sidebarImage": "./installer-sidebar.bmp",
+				"languages": ["English", "French", "German"],
+				"displayLanguageSelector": true
+			}
+		}
 	},
 	"plugins": {
 		"shell": {

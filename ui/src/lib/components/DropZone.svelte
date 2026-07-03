@@ -5,6 +5,7 @@
 	import { Button } from '$lib/components/ui/button';
 	import { Alert, AlertDescription } from '$lib/components/ui/alert';
 	import { FolderDown, LoaderCircle } from '@lucide/svelte';
+	import { _ } from '$lib/i18n';
 
 	// ================================
 	// Props
@@ -141,20 +142,20 @@
 		<div class="text-center">
 			<h2 class="mb-2 text-2xl font-bold text-foreground">
 				{#if isValidating}
-					Validating folder...
+					{$_('welcome.validating')}
 				{:else if isDragOver}
-					Drop your folder here
+					{$_('welcome.dropHere')}
 				{:else}
-					Drop a folder to analyze
+					{$_('welcome.dropToAnalyze')}
 				{/if}
 			</h2>
 			<p class="mb-6 max-w-md text-muted-foreground">
 				{#if isValidating}
-					Checking folder accessibility
+					{$_('welcome.checkingAccess')}
 				{:else if isDragOver}
-					Release to start the analysis
+					{$_('welcome.releaseToStart')}
 				{:else}
-					Drag and drop a folder from your file explorer
+					{$_('welcome.dragHint')}
 				{/if}
 			</p>
 		</div>
@@ -169,7 +170,7 @@
 		<!-- Browse button -->
 		{#if !isDragOver && !isValidating}
 			<div class="flex items-center gap-3">
-				<span class="text-sm text-muted-foreground">Or</span>
+				<span class="text-sm text-muted-foreground">{$_('welcome.or')}</span>
 				<Button
 					variant="outline"
 					size="lg"
@@ -177,14 +178,14 @@
 					disabled={disabled || isValidating}
 					onclick={handleChooseFolder}
 				>
-					Choose a folder
+					{$_('welcome.chooseFolder')}
 				</Button>
 			</div>
 		{/if}
 
 		<!-- Hint -->
 		<p class="mt-8 text-xs text-muted-foreground/60">
-			Your files stay on your computer • 100% offline analysis
+			{$_('welcome.privacyHint')}
 		</p>
 	</div>
 

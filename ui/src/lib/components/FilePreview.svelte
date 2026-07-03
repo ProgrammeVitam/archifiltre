@@ -47,7 +47,16 @@
 		return Math.min(1024, Math.round(512 * (window.devicePixelRatio || 1)));
 	}
 
-	const DEBOUNCE_MS = 180;
+	// Settle delay before the pipeline runs for a preview that ISN'T already in memory.
+	// Everything past the in-memory LRU is async work on the main thread — the PGlite cache
+	// lookup (IPC + base64→blob decode) and, on a true miss, thumbnail generation — which
+	// competes with the icicle's per-hover relayout (heavier now the magnification lens
+	// re-folds every pointermove). Gating it behind a settle means a cursor SWEEPING across
+	// the graph fires none of that work; only the file you actually land on pays the cost,
+	// so the graph stays reactive. In-memory hits (below) still render instantly. 250ms sits
+	// in the "hover intent" range: long enough to skip transient passes, short enough that a
+	// deliberate hover doesn't feel like it's thinking.
+	const DEBOUNCE_MS = 250;
 
 	// Native base64 (no per-byte JS loops on the main thread).
 	function blobToBase64(blob: Blob): Promise<string> {
@@ -178,7 +187,7 @@
 		}
 
 		// Miss → keep the previous preview on screen and debounce: only sweep-stable paths
-		// (stable ~180 ms) start the pipeline, so rapid boundary crossings do no work.
+		// (stable ~250 ms) start the pipeline, so rapid boundary crossings do no work.
 		const controller = new AbortController();
 		const timer = setTimeout(() => void runPipeline(filePath, controller), DEBOUNCE_MS);
 

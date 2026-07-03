@@ -297,13 +297,29 @@ export async function populateDirStats(
         array_to_string((string_to_array(f.path, '/'))[1:i.i], '/') AS anc_path,
         (f.segs - i.i) AS rel_depth,
         (CASE WHEN f.is_directory THEN 'dir' ELSE 'file' END)::text AS kind,
-        f.physical_size AS sz,
+        -- Weight the icicle by CONTENT size, not the on-disk footprint. For a normal
+        -- file content_size == physical_size, so nothing changes; the point is archives:
+        -- their entries carry physical_size 0 but a real content_size (uncompressed), so
+        -- weighting by content is what gives an archive width instead of collapsing to a
+        -- zero-size ghost. An archive CONTAINER contributes 0 (its entries already carry
+        -- its content — counting the container's own compressed size on top would
+        -- double-count it at every ancestor), UNLESS it was never expanded (too large /
+        -- extraction_error), in which case there are no entries and we fall back to its
+        -- compressed footprint so it still shows.
+        (CASE
+          WHEN f.is_directory THEN 0
+          WHEN f.is_archive_container THEN (CASE WHEN f.extraction_error IS NOT NULL THEN f.physical_size ELSE 0 END)
+          ELSE COALESCE(f.content_size, f.physical_size)
+        END) AS sz,
         (lpad(f.segs::text, 6, '0') || f.path)::text AS depth_key
       FROM (
         SELECT
           path,
           physical_size,
+          content_size,
           is_directory,
+          is_archive_container,
+          extraction_error,
           (length(path) - length(replace(path, '/', '')) + 1) AS segs
         FROM files
         WHERE run_id = ${runId}
@@ -365,7 +381,16 @@ export async function rollupDirStatsBatch(
     const parts = row.path.split('/').filter(Boolean);
     const segs = parts.length;
     if (segs === 0) continue;
-    const size = row.physical_size ?? 0;
+    // Icicle weight = CONTENT size (see the matching CASE in populateDirStats): archives
+    // get width from their entries' uncompressed content; the container itself contributes
+    // 0 (its entries carry it) unless it was never expanded, then its compressed footprint.
+    const size = row.is_directory
+      ? 0
+      : row.is_archive_container
+        ? row.extraction_error != null
+          ? (row.physical_size ?? 0)
+          : 0
+        : (row.content_size ?? row.physical_size ?? 0);
     // Attribute the item to each ancestor directory (strict path prefix), exactly
     // like populateDirStats's generate_series(1, segs - 1).
     for (let i = 1; i < segs; i++) {

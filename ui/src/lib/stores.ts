@@ -724,6 +724,70 @@ function persistedBool(key: string, def: boolean) {
  *  surface. On by default; turning it off shows a light-gray (dark: near-black) frame. */
 export const windowEffect = persistedBool('archifiltre-window-effect', true);
 
+/** Icicle magnification lens mode (Settings → Appearance):
+ *  - 'off'       — no lens, ever.
+ *  - 'always'    — ambient fisheye under the cursor whenever you hover the chart.
+ *  - 'aggregate' — dormant on normal hover; engages only when you click a folded "+N"
+ *                  group, then follows the cursor until you pick an item / press Esc /
+ *                  click away / leave the chart. The quiet default. */
+export type LensMode = 'off' | 'always' | 'aggregate';
+function persistedLensMode() {
+	const KEY = 'archifiltre-icicle-lens-mode';
+	let initial: LensMode = 'aggregate';
+	try {
+		const v = localStorage.getItem(KEY);
+		if (v === 'off' || v === 'always' || v === 'aggregate') initial = v;
+		else {
+			// Migrate the old boolean toggle (`archifiltre-icicle-lens` 1/0): on → ambient.
+			const old = localStorage.getItem('archifiltre-icicle-lens');
+			if (old === '0') initial = 'off';
+			else if (old === '1') initial = 'always';
+		}
+	} catch {
+		/* no localStorage (prerender) */
+	}
+	const store = writable<LensMode>(initial);
+	store.subscribe((v) => {
+		try {
+			localStorage.setItem(KEY, v);
+		} catch {
+			/* ignore */
+		}
+	});
+	return store;
+}
+export const lensMode = persistedLensMode();
+
+/** Icicle vertical sizing (Settings → Appearance). All three fill the height by sharing it
+ *  across the levels, clamped between a 6px floor and a per-mode cap — they differ only in
+ *  the cap, so rows shrink toward the floor as a tree gets deeper (more folders):
+ *  - 'small'       — a low cap: compact rows that shrink further when there are many folders.
+ *  - 'comfortable' — a middle cap: roomier rows, still capped so shallow trees stay tidy. Default.
+ *  - 'fill'        — no cap: rows share the whole height (v4 behaviour). */
+export type IcicleHeight = 'small' | 'comfortable' | 'fill';
+function persistedIcicleHeight() {
+	const KEY = 'archifiltre-icicle-height';
+	let initial: IcicleHeight = 'comfortable';
+	try {
+		const v = localStorage.getItem(KEY);
+		if (v === 'small' || v === 'comfortable' || v === 'fill') initial = v;
+		else if (v === 'fixed') initial = 'small'; // renamed
+		else if (v === 'fit') initial = 'fill'; // earlier two-way value
+	} catch {
+		/* no localStorage (prerender) */
+	}
+	const store = writable<IcicleHeight>(initial);
+	store.subscribe((v) => {
+		try {
+			localStorage.setItem(KEY, v);
+		} catch {
+			/* ignore */
+		}
+	});
+	return store;
+}
+export const icicleHeight = persistedIcicleHeight();
+
 /** A JSON-serialisable value persisted to localStorage (merged over `def` so new fields
  *  added later still get defaults). */
 function persistedJson<T extends object>(key: string, def: T) {

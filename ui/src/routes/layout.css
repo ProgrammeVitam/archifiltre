@@ -50,6 +50,10 @@
 	--color-type-audio: #d946ef;
 	--color-type-compressed: #52525b;
 	--color-type-other: #94a3b8;
+	/* Folded "rest" aggregate — a run of siblings too small to draw individually. A
+	   distinct blue-slate so it reads as "N items folded here", NOT as an unknown-type
+	   file (which is the pale --color-type-other above). */
+	--color-aggregate: #3a4658;
 
 	/* Visualization: date gradient endpoints */
 	--color-date-oldest: #145682;
@@ -200,6 +204,14 @@
 	position: relative;
 }
 
+/* Effect disabled (Settings) or unavailable → a solid surface instead of translucency. */
+.window-frame.solid-bg {
+	background-color: #f4f4f5; /* zinc-100 */
+}
+.dark .window-frame.solid-bg {
+	background-color: #18181b; /* zinc-900 */
+}
+
 .window-frame-linux {
 	box-shadow: var(--window-shadow);
 }
@@ -211,11 +223,12 @@
 .titlebar {
 	display: flex;
 	align-items: center;
+	position: relative;
 	height: 48px;
 	padding: 0 12px;
 	background-color: var(--card);
 	user-select: none;
-	gap: 12px;
+	gap: 8px;
 }
 
 .titlebar-linux {

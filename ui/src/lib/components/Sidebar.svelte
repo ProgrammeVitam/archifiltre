@@ -21,6 +21,7 @@
 	} from '@lucide/svelte';
 	import ArchifiltreLogo from './ArchifiltreLogo.svelte';
 	import SettingsDialog from './SettingsDialog.svelte';
+	import { _ } from '$lib/i18n';
 
 	// Props
 	let {
@@ -128,8 +129,9 @@
 			<span class="sidebar-version">v5</span>
 		</div>
 		<div class="flex items-center gap-0.5">
-			<SettingsDialog />
-			<button class="toggle-btn" onclick={toggleCollapsed} title="Close sidebar (Ctrl+B)">
+			<!-- Settings is reached from the app menu; the dialog still mounts here (no gear). -->
+			<SettingsDialog showTrigger={false} />
+			<button class="toggle-btn" onclick={toggleCollapsed} title="{$_('common.closeSidebar')} (Ctrl+B)">
 				<PanelLeftCloseIcon size={18} />
 			</button>
 		</div>
@@ -137,13 +139,13 @@
 
 	<!-- Scans Section Header -->
 	<div class="scans-header">
-		<span class="sidebar-section-title">Scans</span>
+		<span class="sidebar-section-title">{$_('common.scans')}</span>
 	</div>
 	<div class="scans-list">
 		{#if scansWithPath.length === 0}
 			<div class="empty-state">
 				<FolderIcon size={32} strokeWidth={1} />
-				<span class="empty-state-text">No scans yet</span>
+				<span class="empty-state-text">{$_('common.noScansYet')}</span>
 			</div>
 		{/if}
 		{#each scansWithPath as scan (scan.id)}
@@ -163,7 +165,7 @@
 					<button
 						class="scan-icon resume-icon {stateClass}"
 						onclick={(e) => handleResume(e, scan)}
-						title="Continue scan"
+						title={$_('common.continueScan')}
 					>
 						<PauseIcon size={16} class="paused-glyph" />
 						<PlayIcon size={16} class="resume-glyph" />
@@ -174,7 +176,7 @@
 					</span>
 				{/if}
 				<span class="scan-name">{scan.name}</span>
-				<button class="delete-btn" onclick={(e) => handleDeleteScan(e, scan)} title="Delete scan">
+				<button class="delete-btn" onclick={(e) => handleDeleteScan(e, scan)} title={$_('common.deleteScan')}>
 					<Trash2Icon size={14} />
 				</button>
 			</div>
@@ -183,9 +185,9 @@
 
 	<!-- Sidebar Footer -->
 	<div class="sidebar-footer">
-		<button class="new-scan-btn" onclick={handleNewScan} title="New scan (Ctrl+N)">
+		<button class="new-scan-btn" onclick={handleNewScan} title="{$_('common.newScan')} (Ctrl+N)">
 			<PlusIcon size={18} />
-			<span>New Scan</span>
+			<span>{$_('common.newScan')}</span>
 		</button>
 	</div>
 </aside>
@@ -209,6 +211,14 @@
 
 	.sidebar.sidebar-linux {
 		border-radius: var(--window-radius) 0 0 var(--window-radius);
+		/* Linux has no window blur/vibrancy backend, so the translucent --sidebar
+		   (rgba …, 0.85) would show the desktop bleeding through. Use a SOLID, opaque
+		   background there instead. */
+		background-color: rgb(250, 250, 252);
+	}
+
+	:global(.dark) .sidebar.sidebar-linux {
+		background-color: rgb(30, 30, 35);
 	}
 
 	.sidebar.sidebar-linux.collapsed {

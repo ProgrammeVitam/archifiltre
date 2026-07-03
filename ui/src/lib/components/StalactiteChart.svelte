@@ -24,7 +24,9 @@
 		enrichmentInvalidation,
 		selectedItem,
 		colorMode,
-		sortMode
+		sortMode,
+		lensMode,
+		icicleHeight
 	} from '$lib/stores';
 	import { getFileType } from '$lib/file-types';
 	import { Menu, MenuItem, PredefinedMenuItem } from '@tauri-apps/api/menu';
@@ -65,6 +67,7 @@
 		audio: string;
 		compressed: string;
 		other: string;
+		aggregate: string;
 		dateOldest: string;
 		dateNewest: string;
 		enrichDelete: string;
@@ -160,7 +163,11 @@
 	$effect(() => {
 		$colorMode;
 		$sortMode;
+		$lensMode; // switching lens mode re-folds to/from the plain layout
+		$icicleHeight; // fit ↔ fixed re-sizes the rows
 		untrack(() => {
+			// leaving 'aggregate' (or turning the lens off) drops any engaged lens
+			if ($lensMode !== 'aggregate') lensEngaged = false;
 			if (!ctx || canvasWidth === 0 || !data) return;
 			computeLayout();
 			updateCanvasHeight();
@@ -213,12 +220,174 @@
 	let loadingFiles: SvelteSet<string> = new SvelteSet();
 
 	// Constants
+	// Base per-level height: the recursion lays rows out at this pitch, then applyRowHeight
+	// (below) rescales each rect to the sizing mode's `rowHeight`. Also the 'small' cap.
 	const ROW_HEIGHT = 28;
-	const PADDING = 1;
+	// Floor for every sizing mode: rows never get shorter than this (below it the chart
+	// overflows and pans instead of collapsing into un-hittable slivers). Only pathologically
+	// deep trees ever hit it.
+	const MIN_ROW_PX = 6;
+	// Per-mode caps: rows fill by sharing the height across the levels but never grow past the
+	// cap, so shallow trees stay tidy. 'small' shrinks sooner (many folders → thinner rows),
+	// 'comfortable' is roomier, 'fill' is uncapped (v4). All floor at MIN_ROW_PX.
+	const SMALL_CAP = 28;
+	const COMFORTABLE_CAP = 38;
+	// Effective per-level height used by the layout (baked into each rect's y/height): the
+	// viewport height shared across the levels, clamped to the mode's [floor, cap]. Recomputed
+	// each settled layout, but FROZEN while the lens is active so hovering (which can unfold
+	// deeper levels) never rescales the chart vertically.
+	let rowHeight = ROW_HEIGHT;
+	function applyRowHeight(rects: LayoutRect[]) {
+		if (lensFocusX === null) {
+			if (viewportHeight <= 0) {
+				rowHeight = ROW_HEIGHT; // pre-measure fallback
+			} else {
+				// Share the viewport height across the levels, clamped to [floor, cap]. The cap
+				// is the only thing that differs between modes, so rows shrink toward the floor
+				// as the tree deepens (more folders) and past the floor the chart overflows + pans.
+				const share = viewportHeight / (maxDepth + 1);
+				const cap =
+					$icicleHeight === 'small'
+						? SMALL_CAP
+						: $icicleHeight === 'comfortable'
+							? COMFORTABLE_CAP
+							: Infinity;
+				rowHeight = Math.max(MIN_ROW_PX, Math.min(cap, share));
+			}
+		}
+		if (rowHeight !== ROW_HEIGHT) {
+			for (const r of rects) {
+				r.y = r.depth * rowHeight;
+				r.height = rowHeight - PADDING;
+			}
+		}
+	}
+	// v4 look: cells sit flush (no gap) and are separated purely by a 1px white stroke
+	// (see icicle-rect.tsx `stroke="#fff"`). PADDING stays 0 so neighbours share an edge
+	// and the white hairlines read as thin gridlines between blocks.
+	const PADDING = 0;
 	// A block is drawn individually once its ON-SCREEN width (content width × zoom)
 	// clears this floor; smaller siblings fold into one aggregate "rest" block that
 	// fills their slice exactly (so gaps never form, and zooming reveals more).
 	const MIN_REVEAL_PX = 3;
+
+	// ── Magnification lens ──────────────────────────────────────────────────────
+	// A horizontal fisheye centred on the cursor: it expands the region under the
+	// pointer (compressing the rest) so a dense folder's long tail of tiny items
+	// becomes readable/clickable — and, because the fold decision below uses the
+	// LENS-magnified on-screen width, aggregates unfold live as you sweep across
+	// them. It's a display-space transform (screen px → screen px), independent of
+	// zoom/pan, so it composes with both. Toggleable in Settings → Appearance.
+	//
+	// `lensFocusX` is the cursor's x in canvas CSS px, or null when the lens is
+	// inactive (pointer outside, dragging a pan, or the setting is off) — in which
+	// case the map is the identity and nothing about the existing layout changes.
+	let lensFocusX: number | null = $state(null);
+	// In 'aggregate' mode the lens is dormant until you click a folded "+N" group; this
+	// flag is that engaged state (irrelevant in 'always'/'off'). Released on Esc / picking
+	// an item / clicking empty space / leaving the chart.
+	let lensEngaged = $state(false);
+	// True when the lens should currently distort: 'always' whenever the cursor is on the
+	// chart, 'aggregate' only while engaged, never when 'off'.
+	let lensLive = $derived($lensMode === 'always' || ($lensMode === 'aggregate' && lensEngaged));
+	// Canvas cursor: grabbing while panning; a magnifier over a folded "+N" in 'aggregate'
+	// mode (so it reads as "click to open"); otherwise grab/default per pannability.
+	let canvasCursor = $derived.by(() => {
+		if (pointerDown && canPan) return 'cursor-grabbing';
+		if ($lensMode === 'aggregate' && !lensEngaged && hoveredRect?.isAggregate === true)
+			return 'cursor-zoom-in';
+		return canPan ? 'cursor-grab' : 'cursor-default';
+	});
+	// Peak magnification. The map normalises to preserve total width, so the effective
+	// peak is (1+amp)/(1 + amp·σ√(2π)/vw) — sub-linear in amp. A high amp + a tight σ
+	// (below) give a strong, localised bump that can push sub-pixel items past the
+	// MIN_REVEAL floor so a hovered aggregate actually unfolds under the cursor.
+	const LENS_AMPLITUDE = 12;
+	// Cache the built map: rebuilding the Gaussian integral every mousemove is cheap,
+	// but the map only changes when the focus or viewport width changes.
+	let _lensKey = '';
+	let _lensMap: (x: number) => number = (x) => x;
+	let _lensInv: (x: number) => number = (x) => x;
+
+	/** On-screen [left, right] the lens is allowed to distort. When zoomed into a folder
+	 *  it's that folder's own span (clamped to the viewport), so the folder's frame stays
+	 *  put and only its contents redistribute; otherwise the whole viewport. */
+	function lensDomain(vw: number): [number, number] {
+		if (focusPath && isZoomed) {
+			const rect = layoutRects.find((r) => r.node?.path === focusPath);
+			if (rect) {
+				const l = Math.max(0, rect.x * zoom + panX);
+				const r = Math.min(vw, (rect.x + rect.width) * zoom + panX);
+				if (r - l > 24) return [l, r]; // ignore a degenerate sliver
+			}
+		}
+		return [0, vw];
+	}
+
+	/** Rebuild (if needed) and return the current lens as {map, inv}. The fisheye acts only
+	 *  within [lo, hi] (the focused folder's span) and is the identity outside it — so the
+	 *  zoomed folder's borders are fixed points and just its interior magnifies. */
+	function getLens(): { map: (x: number) => number; inv: (x: number) => number } {
+		const dpr = window.devicePixelRatio || 1;
+		const vw = canvasWidth / dpr;
+		const active = lensLive && lensFocusX !== null && !dragged && vw > 0;
+		const [lo, hi] = active ? lensDomain(vw) : [0, vw];
+		const key = active ? `${Math.round(lensFocusX!)}|${Math.round(lo)}|${Math.round(hi)}` : 'off';
+		if (key === _lensKey) return { map: _lensMap, inv: _lensInv };
+		_lensKey = key;
+		if (!active) {
+			_lensMap = (x) => x;
+			_lensInv = (x) => x;
+			return { map: _lensMap, inv: _lensInv };
+		}
+		// Gaussian density g(x) = 1 + amp·exp(-(x-focus)²/2σ²); the displayed position is its
+		// normalised cumulative integral over [lo, hi], so the axis stretches near the focus
+		// and compresses away from it while the span's width is preserved (monotonic,
+		// invertible, endpoints pinned to lo/hi).
+		const span = hi - lo;
+		const focus = Math.max(lo, Math.min(hi, lensFocusX!)); // pin the bump inside the span
+		// A tight bump (relative to the span) keeps the peak magnification high after
+		// normalisation, so the lens core reads as a real magnifier rather than a gentle swell.
+		const sigma = Math.min(120, Math.max(38, span * 0.05));
+		const S = 512;
+		const dx = span / S;
+		const xs = new Float64Array(S + 1);
+		const M = new Float64Array(S + 1);
+		const g = (x: number) => 1 + LENS_AMPLITUDE * Math.exp(-((x - focus) ** 2) / (2 * sigma * sigma));
+		let acc = 0;
+		let prev = g(lo);
+		xs[0] = lo;
+		M[0] = 0;
+		for (let i = 1; i <= S; i++) {
+			const x = lo + i * dx;
+			const gx = g(x);
+			acc += ((gx + prev) * 0.5) * dx;
+			prev = gx;
+			xs[i] = x;
+			M[i] = acc;
+		}
+		const total = acc || 1;
+		for (let i = 0; i <= S; i++) M[i] = lo + (M[i] / total) * span; // maps [lo,hi] → [lo,hi]
+		_lensMap = (x: number) => {
+			if (x <= lo || x >= hi) return x; // identity outside the focused folder's frame
+			const t = (x - lo) / dx;
+			const i = Math.floor(t);
+			return M[i] + (M[i + 1] - M[i]) * (t - i);
+		};
+		_lensInv = (y: number) => {
+			if (y <= lo || y >= hi) return y;
+			let a = 0;
+			let b = S;
+			while (b - a > 1) {
+				const mid = (a + b) >> 1;
+				if (M[mid] < y) a = mid;
+				else b = mid;
+			}
+			const d = M[b] - M[a] || 1;
+			return xs[a] + (xs[b] - xs[a]) * ((y - M[a]) / d);
+		};
+		return { map: _lensMap, inv: _lensInv };
+	}
 
 	// ================================
 	// Lifecycle
@@ -269,6 +438,7 @@
 					viewportHeight = height;
 				}
 				computeLayout();
+				updateCanvasHeight(); // filled rows depend on viewport height — refresh on resize
 				clampView();
 				render();
 			}
@@ -296,6 +466,7 @@
 			audio: v('--color-type-audio'),
 			compressed: v('--color-type-compressed'),
 			other: v('--color-type-other'),
+			aggregate: v('--color-aggregate'),
 			dateOldest: v('--color-date-oldest'),
 			dateNewest: v('--color-date-newest'),
 			enrichDelete: v('--color-enrich-delete'),
@@ -398,6 +569,10 @@
 			// a flat yellow. Falls back to the folder hue when no date is known (live scan).
 			if ($colorMode === 'date' && dir.median_mtime != null)
 				return getDateColor(dir.median_mtime, minMtime, maxMtime, palette);
+			// An archive container (foo.zip) drills in like a folder but should LOOK like a
+			// compressed file (v4 tinted zips dark grey). In date mode it stays on the
+			// timeline like any other folder (handled above).
+			if (dir.is_archive) return palette.compressed;
 			return palette.folder;
 		}
 		if (file === null) return palette.other;
@@ -554,7 +729,10 @@
 	// used to clamp panning so you can't drag the tree off-screen.
 	function updateCanvasHeight() {
 		const rows = Math.max(1, maxDepth + 1);
-		contentHeight = rows * ROW_HEIGHT;
+		// rowHeight reflects the sizing mode's clamp, so contentHeight ≈ viewport when the rows
+		// fill it (centres, no whitespace), is shorter when capped (shallow trees), and overflows
+		// to pan only for pathologically deep trees past the MIN_ROW_PX floor.
+		contentHeight = rows * rowHeight;
 	}
 
 	// ================================
@@ -690,6 +868,7 @@
 	function handleWheel(e: WheelEvent) {
 		e.preventDefault();
 		if (!canvas) return;
+		lensEngaged = false; // zooming changes the frame — drop any engaged lens
 		cancelAnim(); // user took over mid-snap
 		const r = canvas.getBoundingClientRect();
 		const px = e.clientX - r.left;
@@ -785,8 +964,12 @@
 			const totalSize = dirsSize + filesSize;
 			if (totalSize === 0) return;
 
-			// Visible iff on-screen width (content width × zoom) clears the floor.
-			const minContentWidth = MIN_REVEAL_PX / zoom;
+			// Visible iff on-screen width clears the floor. The width is measured AFTER the
+			// magnification lens (identity when the lens is off), so a block the cursor is
+			// hovering can clear the floor and unfold even when it'd be sub-pixel at rest.
+			const lens = getLens();
+			const onScreenWidth = (cx: number, w: number) =>
+				lens.map((cx + w) * zoom + panX) - lens.map(cx * zoom + panX);
 
 			let currentX = x;
 			let aggStart = 0;
@@ -805,7 +988,7 @@
 					y,
 					width: Math.max(1, aggWidth - PADDING),
 					height: ROW_HEIGHT - PADDING,
-					color: palette.other,
+					color: palette.aggregate,
 					opacity: 1,
 					depth: levelIndex
 				});
@@ -842,7 +1025,7 @@
 			}
 			for (const dir of dirs) {
 				const nodeWidth = (dir.total_size / totalSize) * width;
-				if (nodeWidth >= minContentWidth) {
+				if (onScreenWidth(currentX, nodeWidth) >= MIN_REVEAL_PX) {
 					flushAgg();
 					rects.push({
 						node: dir,
@@ -872,7 +1055,7 @@
 			}
 			for (const file of files) {
 				const fileWidth = (file.size / totalSize) * width;
-				if (fileWidth >= minContentWidth) {
+				if (onScreenWidth(currentX, fileWidth) >= MIN_REVEAL_PX) {
 					flushAgg();
 					rects.push({
 						node: null,
@@ -896,6 +1079,7 @@
 		layoutRootLevel(startDirs, 0, viewWidth, startDepth);
 		layoutRects = rects;
 		maxDepth = currentMaxDepth;
+		applyRowHeight(rects); // rescale rows to the sizing mode (fill/clamp the height)
 
 		// Drain the lazy-load queue: fetch files only for the folders this layout
 		// actually drew. loadFilesForDirectory is guarded (cache + in-flight set), so
@@ -937,7 +1121,9 @@
 
 		maxDepth = 0; // Files only = single row
 
-		const minContentWidth = MIN_REVEAL_PX / zoom;
+		const lens = getLens();
+		const onScreenWidth = (cx: number, w: number) =>
+			lens.map((cx + w) * zoom + panX) - lens.map(cx * zoom + panX);
 		let currentX = 0;
 		let aggStart = 0;
 		let aggWidth = 0;
@@ -953,7 +1139,7 @@
 				y: 0,
 				width: Math.max(1, aggWidth - PADDING),
 				height: ROW_HEIGHT - PADDING,
-				color: palette.other,
+				color: palette.aggregate,
 				opacity: 1,
 				depth: 0
 			});
@@ -962,7 +1148,7 @@
 		};
 		for (const file of files) {
 			const fileWidth = (file.size / totalSize) * viewWidth;
-			if (fileWidth >= minContentWidth) {
+			if (onScreenWidth(currentX, fileWidth) >= MIN_REVEAL_PX) {
 				flushAgg();
 				rects.push({
 					node: null,
@@ -985,6 +1171,7 @@
 		flushAgg();
 
 		layoutRects = rects;
+		applyRowHeight(rects); // files-only root: size the single row per the mode
 	}
 
 	// ================================
@@ -996,15 +1183,15 @@
 	// grows out of the item. Colour comes from the item (strongest at the item,
 	// fading into the panel below). A leaf curves straight out of the item; a
 	// directory holds its width as a column behind its subtree, then flares.
-	function drawConnector(dpr: number, vw: number, vh: number) {
+	function drawConnector(dpr: number, vw: number, vh: number, path: string | null, strength = 1) {
 		if (!ctx) return;
-		const path = selectedPath;
 		if (!path) return; // root / nothing selected → no connector
 		const rect = layoutRects.find((r) => (r.node?.path ?? r.file?.path) === path);
 		if (!rect) return;
 
-		const itemLeft = rect.x * zoom + panX;
-		const itemRight = (rect.x + rect.width) * zoom + panX;
+		const lens = getLens();
+		const itemLeft = lens.map(rect.x * zoom + panX);
+		const itemRight = lens.map((rect.x + rect.width) * zoom + panX);
 		const itemBottom = rect.y + rect.height + panY; // rows are fixed-height (no zoom on Y)
 
 		// The column extends only while there's a subtree to thread behind.
@@ -1023,8 +1210,8 @@
 
 		const [cr, cg, cb] = parseRgb(rect.color);
 		const grad = ctx.createLinearGradient(0, Math.max(0, itemBottom), 0, vh);
-		grad.addColorStop(0, `rgba(${cr}, ${cg}, ${cb}, 0.5)`); // from the item
-		grad.addColorStop(1, `rgba(${cr}, ${cg}, ${cb}, 0.04)`); // into the panel
+		grad.addColorStop(0, `rgba(${cr}, ${cg}, ${cb}, ${0.5 * strength})`); // from the item
+		grad.addColorStop(1, `rgba(${cr}, ${cg}, ${cb}, ${0.04 * strength})`); // into the panel
 
 		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 		ctx.fillStyle = grad;
@@ -1045,6 +1232,10 @@
 		const dpr = window.devicePixelRatio || 1;
 		const viewWidth = canvasWidth / dpr;
 		const viewHeight = canvasHeight / dpr;
+
+		// The magnification lens (identity when off/inactive); the same map the layout
+		// used, so drawn positions match the fold/unfold decisions exactly.
+		const lens = getLens();
 
 		// Clear the whole viewport (device space), then apply the zoom/pan view
 		// transform so all content-space drawing below lands in the right place.
@@ -1077,8 +1268,22 @@
 			return;
 		}
 
-		// Connector first, so the blocks paint over it (it stays in the background).
-		drawConnector(dpr, viewWidth, viewHeight);
+		// The block the panel is currently previewing while hovering a real element:
+		// its lineage lights (cascade hover) and its conduit ties it to the panel.
+		// Suppressed mid-drag so a pan doesn't strobe the chart.
+		const hoverPath =
+			!dragged && hoveredRect && !hoveredRect.isAggregate
+				? (hoveredRect.node?.path ?? hoveredRect.file?.path ?? null)
+				: null;
+
+		// Conduits (drawn first, behind the blocks). While a hover previews a
+		// different item, the committed selection stays as a faint anchor and the
+		// hovered item gets the full-strength ribbon — so the conduit always ties the
+		// panel to whichever block it's showing.
+		if (hoverPath && selectedPath && selectedPath !== hoverPath) {
+			drawConnector(dpr, viewWidth, viewHeight, selectedPath, 0.3);
+		}
+		drawConnector(dpr, viewWidth, viewHeight, hoverPath ?? selectedPath, 1);
 		ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
 		// Draw rectangles
@@ -1091,8 +1296,11 @@
 		// X carries the zoom (breadth), Y is a fixed-height row (depth), so strokes
 		// and labels stay crisp at any zoom.
 		for (const rect of layoutRects) {
-			const sx = rect.x * zoom + panX;
-			const sw = rect.width * zoom;
+			// Screen X, then the magnification lens (identity when off) — the same map the
+			// layout used for its fold decision, so positions and unfolding stay in sync.
+			const lx = lens.map(rect.x * zoom + panX);
+			const sx = lx;
+			const sw = lens.map((rect.x + rect.width) * zoom + panX) - lx;
 			const sy = rect.y + panY; // rows keep a constant height regardless of zoom
 			const sh = rect.height;
 
@@ -1103,20 +1311,26 @@
 			const isHovered =
 				hoveredRect && (hoveredRect.node?.path ?? hoveredRect.file?.path) === rectPath;
 
-			// Spotlight the selected subtree: when a non-root node is selected, dim
-			// everything outside it (the node itself and its descendants stay vivid).
-			const inSelection =
-				!selectedPath ||
-				rectPath === selectedPath ||
-				rectPath.startsWith(selectedPath + '/');
-			ctx.globalAlpha = inSelection ? 1 : 0.35;
+			// Cascade hover (v4): while hovering a real block, its ancestry spine
+			// (root → item) stays lit and everything off it dims — so its lineage, the
+			// chain of folders that contains it, reads at a glance. With no hover, fall
+			// back to the selection spotlight (the selected subtree stays vivid).
+			let inFocus: boolean;
+			if (hoverPath !== null) {
+				inFocus = rectPath === hoverPath || hoverPath.startsWith(rectPath + '/');
+			} else {
+				inFocus =
+					!selectedPath || rectPath === selectedPath || rectPath.startsWith(selectedPath + '/');
+			}
+			ctx.globalAlpha = inFocus ? 1 : hoverPath !== null ? 0.3 : 0.35;
 
 			// Draw background
 			ctx.fillStyle = isHovered ? lightenColor(rect.color, 0.15) : rect.color;
 			ctx.fillRect(sx, sy, sw, sh);
 
-			// Draw border (uniform 1px — the view transform no longer scales it)
-			ctx.strokeStyle = 'rgba(0, 0, 0, 0.3)';
+			// Separator: a 1px WHITE stroke like v4 (icicle-rect.tsx `stroke="#fff"`).
+			// Flush cells share edges, so these hairlines read as thin white gridlines.
+			ctx.strokeStyle = '#ffffff';
 			ctx.lineWidth = 1;
 			ctx.strokeRect(sx, sy, sw, sh);
 
@@ -1182,6 +1396,41 @@
 				}
 			}
 
+			// Honest aggregate: a folded "rest" block stands for a run of items too small
+			// to draw. Mark it as such — a diagonal hatch (so it never reads as a single
+			// real block) and a "+N" count once there's room — so it's clearly "N items
+			// folded here, double-click to zoom", not an unknown-type file.
+			if (rect.isAggregate) {
+				const prevAlpha = ctx.globalAlpha;
+				ctx.save();
+				ctx.beginPath();
+				ctx.rect(sx, sy, sw, sh);
+				ctx.clip();
+				ctx.globalAlpha = prevAlpha * 0.4;
+				ctx.strokeStyle = 'rgba(226, 232, 240, 0.6)';
+				ctx.lineWidth = 1;
+				ctx.beginPath();
+				for (let hx = sx - sh; hx < sx + sw; hx += 6) {
+					ctx.moveTo(hx, sy + sh);
+					ctx.lineTo(hx + sh, sy);
+				}
+				ctx.stroke();
+				ctx.restore();
+				ctx.globalAlpha = prevAlpha;
+
+				const count = rect.aggChildCount ?? 0;
+				if (count > 0 && sw > 26 && sh > 12) {
+					const label = `+${count}`;
+					ctx.fillStyle = '#e2e8f0';
+					ctx.font = '600 11px system-ui, sans-serif';
+					ctx.textAlign = 'center';
+					ctx.textBaseline = 'middle';
+					if (ctx.measureText(label).width < sw - 6)
+						ctx.fillText(label, sx + sw / 2, sy + sh / 2);
+					ctx.textAlign = 'left';
+				}
+			}
+
 			// "Goes deep" signal. A folded aggregate hides whole subtrees; mark how
 			// deep with a small "layers" glyph in its bottom-left corner — a stack of
 			// ticks, one per hidden level (capped). Kept to a fixed small width and
@@ -1228,11 +1477,14 @@
 		return null;
 	}
 
-	// Screen (canvas CSS px) → content space, inverting the zoom/pan transform.
+	// Screen (canvas CSS px) → content space, inverting the lens then the zoom/pan
+	// transform (the lens inverse is identity when the lens is off), so hover/click
+	// land on the block actually under the cursor even while it's magnified.
 	function toContent(e: { clientX: number; clientY: number }): { x: number; y: number } {
 		const r = canvas!.getBoundingClientRect();
+		const screenX = e.clientX - r.left;
 		return {
-			x: (e.clientX - r.left - panX) / zoom,
+			x: (getLens().inv(screenX) - panX) / zoom,
 			y: e.clientY - r.top - panY // Y isn't zoomed (fixed-height rows)
 		};
 	}
@@ -1279,19 +1531,77 @@
 			}
 		}
 
-		// Hover hit-test (content space)
+		// With the lens on, the cursor magnifies the region it's over — and, because the
+		// fold decision reads the magnified width, a hovered aggregate unfolds. Both need a
+		// relayout as the cursor moves, coalesced into one rAF frame so a fast sweep does at
+		// most one relayout per frame (and re-hovering re-uses the lens map cache).
+		if (lensLive && !dragged) {
+			const r = canvas.getBoundingClientRect();
+			lensFocusX = e.clientX - r.left;
+			pendingHover = e;
+			if (lensRaf === null) lensRaf = requestAnimationFrame(lensFrame);
+			return;
+		}
+
+		// Lens not live (off, or 'aggregate' mode not yet engaged): the original, cheap hover
+		// path (no relayout). Hovering a folded "+N" in 'aggregate' mode shows a magnifier
+		// cursor (see canvasCursor) so it's discoverable that clicking it engages the lens.
 		const { x, y } = toContent(e);
 		const hit = findRectAt(x, y);
 		if (hit !== hoveredRect) {
 			hoveredRect = hit;
 			render();
-			if (hit) {
-				if (hit.node) hoverDirectory(hit.node);
-				else if (hit.file) hoverFile(hit.file);
-			} else {
-				clearHoveredItem();
-			}
+			emitHover(hit);
 		}
+	}
+
+	// Distinguish hovered items by identity, not object reference: a lens relayout builds
+	// a fresh rects array every frame, so reference equality would report a new hover each
+	// frame and thrash the details panel. Aggregates fold to one bucket ('§agg').
+	function hoverKey(r: LayoutRect | null): string | null {
+		if (!r) return null;
+		return r.node?.path ?? r.file?.path ?? (r.isAggregate ? '§agg' : '');
+	}
+	function emitHover(hit: LayoutRect | null) {
+		if (hit?.node) hoverDirectory(hit.node);
+		else if (hit?.file) hoverFile(hit.file);
+		else clearHoveredItem();
+	}
+
+	let lensRaf: number | null = null;
+	let pendingHover: PointerEvent | null = null;
+	function lensFrame() {
+		lensRaf = null;
+		const e = pendingHover;
+		if (!e || !canvas) return;
+		// Re-fold under the lens, then hit-test against the fresh layout so hover lands on
+		// the block actually under the cursor (which may have just unfolded).
+		computeLayout();
+		const { x, y } = toContent(e);
+		const hit = findRectAt(x, y);
+		const changed = hoverKey(hit) !== hoverKey(hoveredRect);
+		hoveredRect = hit;
+		render();
+		if (changed) emitHover(hit);
+	}
+
+	// ── 'aggregate' lens mode: click a folded "+N" to engage the (folder-scoped) lens
+	// centred on it, then it follows the cursor until released. ──────────────────────
+	function engageLens(rect: LayoutRect) {
+		lensFocusX = (rect.x + rect.width / 2) * zoom + panX; // centre the bump on the group
+		lensEngaged = true;
+		computeLayout(); // unfold it right away
+		render();
+	}
+	function releaseLens() {
+		if (!lensEngaged) return;
+		lensEngaged = false;
+		if (lensRaf !== null) {
+			cancelAnimationFrame(lensRaf);
+			lensRaf = null;
+		}
+		computeLayout(); // re-fold to the plain layout
+		render();
 	}
 
 	function handlePointerUp(e: PointerEvent) {
@@ -1314,6 +1624,7 @@
 		const { x, y } = toContent(e);
 		const hit = findRectAt(x, y);
 		if (!hit) {
+			releaseLens(); // clicking empty space closes an engaged lens
 			// Empty-click resets the item focus back to the zoomed folder — or, at
 			// the root, clears it entirely. Deferred so a double-click can go home.
 			clickTimer = setTimeout(() => {
@@ -1324,12 +1635,18 @@
 			return;
 		}
 
-		if (hit.isAggregate) return; // a folded "rest" block — not selectable
+		if (hit.isAggregate) {
+			// In 'aggregate' mode a click opens the lens onto this group; otherwise a folded
+			// "rest" block is inert to a single click (double-click still zooms into it).
+			if ($lensMode === 'aggregate') engageLens(hit);
+			return;
+		}
 
 		// Click selects. If the clicked item is OUTSIDE the current view (the zoomed
 		// folder's subtree), also zoom out to the folder that holds both — so you see
 		// where it sits. Selection is immediate; the zoom-out is deferred so a
 		// double-click (navigate) can cancel it.
+		releaseLens(); // picking a real item closes an engaged lens
 		const hitPath = hit.node?.path ?? hit.file?.path ?? '';
 		if (hit.node) selectDirectory(hit.node);
 		else if (hit.file) selectFile(hit.file);
@@ -1347,7 +1664,23 @@
 		pointerInside = false;
 		hoveredRect = null;
 		clearHoveredItem();
+		if (lensRaf !== null) {
+			cancelAnimationFrame(lensRaf);
+			lensRaf = null;
+		}
+		// Relax the magnification: drop the focus, release any engaged lens, and re-fold to
+		// the resting layout.
+		lensEngaged = false;
+		if (lensFocusX !== null) {
+			lensFocusX = null;
+			computeLayout();
+		}
 		render();
+	}
+
+	// Esc closes an engaged 'aggregate' lens (no preventDefault — Esc stays free elsewhere).
+	function handleKeydown(e: KeyboardEvent) {
+		if (e.key === 'Escape' && lensEngaged) releaseLens();
 	}
 
 	// After a zoom settles, promote the item now under the cursor to the
@@ -1390,6 +1723,7 @@
 
 	function zoomToRect(rect: LayoutRect, activateAfter = false) {
 		if (viewportCss().w <= 0) return;
+		lensEngaged = false; // a zoom changes the focused folder — drop any engaged lens
 		if (rect.node) focusPath = rect.node.path; // this folder is now the zoom focus
 		animateTo(frameTarget(rect), activateAfter);
 	}
@@ -1559,6 +1893,8 @@
 	}
 </script>
 
+<svelte:window onkeydown={handleKeydown} />
+
 <div class="flex w-full flex-col {className}">
 	<!-- Chart container: fills the pane; the canvas below is a fixed viewport -->
 	<div bind:this={container} class="relative flex min-h-0 w-full flex-1 flex-col">
@@ -1572,11 +1908,7 @@
 				onpointerleave={handlePointerLeave}
 				ondblclick={handleDoubleClick}
 				oncontextmenu={handleContextMenu}
-				class="absolute inset-0 block h-full w-full {canPan
-					? pointerDown
-						? 'cursor-grabbing'
-						: 'cursor-grab'
-					: 'cursor-default'}"
+				class="absolute inset-0 block h-full w-full {canvasCursor}"
 			></canvas>
 
 			<!-- Focus vignette: when zoomed in, fade all four edges to the background

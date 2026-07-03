@@ -24,8 +24,18 @@ import { promisify } from 'node:util';
 import { createGzip } from 'node:zlib';
 import { pipeline } from 'node:stream/promises';
 import * as tar from 'tar-stream';
+import { zipSync } from 'fflate';
+import * as os from 'node:os';
+import pkg from '../../package.json' with { type: 'json' };
 
 const execAsync = promisify(exec);
+
+/** Frontend snapshot piped over stdin by the desktop app (--snapshot-stdin):
+ *  the webview's in-memory error ring buffer + a UI-state summary. */
+interface FrontendSnapshot {
+  frontendLog?: string;
+  uiState?: string;
+}
 
 export default class Logs extends Command {
   static override description = 'View, monitor, and export application logs';
@@ -66,6 +76,11 @@ export default class Logs extends Command {
       char: 'p',
       description: 'Output path for exported logs (used with --export)',
       required: false,
+    }),
+    'snapshot-stdin': Flags.boolean({
+      description:
+        'Read a frontend snapshot (JSON: {frontendLog, uiState}) from stdin and include it in the export — used by the desktop app',
+      default: false,
     }),
     open: Flags.boolean({
       char: 'o',
@@ -467,13 +482,15 @@ export default class Logs extends Command {
     logsDir: string,
     outputPath: string | undefined,
     noColor: boolean,
-    scanFilter?: { startTime: Date; runId: string }
+    scanFilter?: { startTime: Date; runId: string },
+    snapshot?: FrontendSnapshot
   ): Promise<void> {
     // Cast config to access custom originalCwd property from StandaloneConfig
     const config = this.config as typeof this.config & { originalCwd?: string };
     const originalCwd = config.originalCwd || process.cwd();
 
-    // Determine output path
+    // Determine output path. Format follows the extension: .zip (what the desktop app
+    // requests — friendlier to open/mail on Windows) or .tar.gz/.tgz (CLI default).
     let resolvedOutput: string;
 
     if (outputPath) {
@@ -484,7 +501,11 @@ export default class Logs extends Command {
       if (fs.existsSync(resolvedOutput) && (await fsp.stat(resolvedOutput)).isDirectory()) {
         const filename = generateExportFilename({ type: 'logs', extension: 'tar.gz' });
         resolvedOutput = path.join(resolvedOutput, filename);
-      } else if (!resolvedOutput.endsWith('.tar.gz') && !resolvedOutput.endsWith('.tgz')) {
+      } else if (
+        !resolvedOutput.endsWith('.tar.gz') &&
+        !resolvedOutput.endsWith('.tgz') &&
+        !resolvedOutput.endsWith('.zip')
+      ) {
         // Add extension if not present
         resolvedOutput += '.tar.gz';
       }
@@ -493,6 +514,7 @@ export default class Logs extends Command {
       const filename = generateExportFilename({ type: 'logs', extension: 'tar.gz' });
       resolvedOutput = path.join(originalCwd, filename);
     }
+    const asZip = resolvedOutput.endsWith('.zip');
 
     this.log(this.colorize('Exporting logs...', 'cyan', noColor));
 
@@ -507,17 +529,9 @@ export default class Logs extends Command {
       this.error('No log files found. Nothing to export.', { exit: 1 });
     }
 
-    // Create a tar.gz archive using tar-stream (pure JS, cross-platform)
-    const outputDir = path.dirname(resolvedOutput);
-    await ensureDirectory(outputDir);
-
-    // Create tar pack stream and pipe through gzip to output file
-    const pack = tar.pack();
-    const gzip = createGzip();
-    const output = fs.createWriteStream(resolvedOutput);
-
-    // Set up the pipeline: tar -> gzip -> file
-    const pipelinePromise = pipeline(pack, gzip, output);
+    // Collect the bundle entries first, then write them in the chosen container.
+    const entries: { name: string; content: Buffer; mtime?: Date }[] = [];
+    let filteredCount = 0;
 
     if (scanFilter) {
       // When filtering by scan, create a filtered log entry
@@ -525,48 +539,112 @@ export default class Logs extends Command {
       const filteredLines = await this.readLinesAfterTime(mostRecent.path, scanFilter.startTime);
 
       if (filteredLines.length === 0) {
-        pack.finalize();
-        await pipelinePromise;
-        // Clean up empty file
-        await fsp.unlink(resolvedOutput).catch(() => {});
         this.error('No log entries found for this scan. Nothing to export.', { exit: 1 });
       }
-
-      const filteredContent = `${filteredLines.join('\n')}\n`;
-      const filteredBuffer = Buffer.from(filteredContent, 'utf-8');
-      const filteredName = `filtered-${scanFilter.runId}.log`;
-
-      // Add filtered log to tar archive
-      pack.entry({ name: filteredName, size: filteredBuffer.length }, filteredBuffer);
-      pack.finalize();
-
-      await pipelinePromise;
-
-      this.log('');
-      this.log(this.colorize('✓ Scan logs exported successfully!', 'green', noColor));
-      this.log(`  ${this.colorize('Location:', 'bold', noColor)} ${resolvedOutput}`);
-      this.log(`  ${this.colorize('Scan:', 'bold', noColor)} ${scanFilter.runId}`);
-      this.log(`  ${this.colorize('Log entries:', 'bold', noColor)} ${filteredLines.length}`);
-
-      const stats = await fsp.stat(resolvedOutput);
-      this.log(`  ${this.colorize('Size:', 'bold', noColor)} ${formatBytes(stats.size)}`);
+      filteredCount = filteredLines.length;
+      entries.push({
+        name: `filtered-${scanFilter.runId}.log`,
+        content: Buffer.from(`${filteredLines.join('\n')}\n`, 'utf-8'),
+      });
     } else {
-      // Export all log files
       for (const logFile of logFiles) {
-        const content = await fsp.readFile(logFile.path);
-        pack.entry({ name: logFile.name, size: content.length, mtime: logFile.mtime }, content);
+        entries.push({
+          name: logFile.name,
+          content: await fsp.readFile(logFile.path),
+          mtime: logFile.mtime,
+        });
+      }
+    }
+
+    // Frontend snapshot (desktop app): the webview's error ring buffer + UI-state summary.
+    if (snapshot?.frontendLog) {
+      entries.push({ name: 'frontend.log', content: Buffer.from(snapshot.frontendLog, 'utf-8') });
+    }
+    if (snapshot?.uiState) {
+      entries.push({ name: 'ui-state.json', content: Buffer.from(snapshot.uiState, 'utf-8') });
+    }
+
+    // system-info.txt — enough environment context to read the bundle on its own.
+    const sysInfo = [
+      'Archifiltre log bundle',
+      `Generated:      ${new Date().toISOString()}`,
+      `App version:    ${(pkg as { version?: string }).version ?? 'unknown'}`,
+      `Runtime:        Bun ${process.versions?.bun ?? '?'} (${os.platform()} ${os.release()}, ${os.arch()})`,
+      `Hostname:       ${os.hostname()}`,
+      `Logs directory: ${logsDir}`,
+      `Log files:      ${scanFilter ? `1 (filtered, ${filteredCount} entries)` : logFiles.length}`,
+      `Frontend snapshot: ${snapshot?.frontendLog || snapshot?.uiState ? 'included' : 'not included'}`,
+      '',
+    ].join('\n');
+    entries.push({ name: 'system-info.txt', content: Buffer.from(sysInfo, 'utf-8') });
+
+    const outputDir = path.dirname(resolvedOutput);
+    await ensureDirectory(outputDir);
+
+    if (asZip) {
+      // .zip via fflate (pure JS, bundles cleanly into the compiled sidecar).
+      const zipInput: Record<string, Uint8Array> = {};
+      for (const e of entries) zipInput[e.name] = new Uint8Array(e.content);
+      const zipped = zipSync(zipInput, { level: 6 });
+      await fsp.writeFile(resolvedOutput, zipped);
+    } else {
+      // .tar.gz via tar-stream (the historical CLI format).
+      const pack = tar.pack();
+      const gzip = createGzip();
+      const output = fs.createWriteStream(resolvedOutput);
+      const pipelinePromise = pipeline(pack, gzip, output);
+      for (const e of entries) {
+        pack.entry({ name: e.name, size: e.content.length, mtime: e.mtime }, e.content);
       }
       pack.finalize();
-
       await pipelinePromise;
+    }
 
-      this.log('');
-      this.log(this.colorize('✓ Logs exported successfully!', 'green', noColor));
-      this.log(`  ${this.colorize('Location:', 'bold', noColor)} ${resolvedOutput}`);
-      this.log(`  ${this.colorize('Files:', 'bold', noColor)} ${logFiles.length} log file(s)`);
+    this.log('');
+    this.log(
+      this.colorize(
+        scanFilter ? '✓ Scan logs exported successfully!' : '✓ Logs exported successfully!',
+        'green',
+        noColor
+      )
+    );
+    this.log(`  ${this.colorize('Location:', 'bold', noColor)} ${resolvedOutput}`);
+    if (scanFilter) {
+      this.log(`  ${this.colorize('Scan:', 'bold', noColor)} ${scanFilter.runId}`);
+      this.log(`  ${this.colorize('Log entries:', 'bold', noColor)} ${filteredCount}`);
+    } else {
+      this.log(`  ${this.colorize('Files:', 'bold', noColor)} ${entries.length} file(s)`);
+    }
 
-      const stats = await fsp.stat(resolvedOutput);
-      this.log(`  ${this.colorize('Size:', 'bold', noColor)} ${formatBytes(stats.size)}`);
+    const stats = await fsp.stat(resolvedOutput);
+    this.log(`  ${this.colorize('Size:', 'bold', noColor)} ${formatBytes(stats.size)}`);
+  }
+
+  /** Read the full frontend snapshot JSON from stdin (--snapshot-stdin). Tolerant:
+   *  a malformed/empty payload degrades to "no snapshot", never a failed export. */
+  private async readSnapshotFromStdin(): Promise<FrontendSnapshot | undefined> {
+    try {
+      let data = '';
+      // Bun's stdin primitive is the reliable path (the compiled sidecar always runs on
+      // Bun); the node-stream loop covers other runtimes.
+      const bunStdin = (globalThis as { Bun?: { stdin: { text(): Promise<string> } } }).Bun?.stdin;
+      if (bunStdin) {
+        data = await bunStdin.text();
+      } else {
+        for await (const chunk of process.stdin) {
+          data += chunk;
+          if (data.length > 50 * 1024 * 1024) break; // hard cap — snapshots are ring-buffered anyway
+        }
+      }
+      if (!data.trim()) return undefined;
+      const parsed = JSON.parse(data) as FrontendSnapshot;
+      return {
+        frontendLog: typeof parsed.frontendLog === 'string' ? parsed.frontendLog : undefined,
+        uiState: typeof parsed.uiState === 'string' ? parsed.uiState : undefined,
+      };
+    } catch {
+      this.warn('Could not read frontend snapshot from stdin — exporting sidecar logs only.');
+      return undefined;
     }
   }
 
@@ -633,7 +711,8 @@ export default class Logs extends Command {
 
       // Handle --export flag
       if (flags.export) {
-        await this.exportLogs(logsDir, flags['export-path'], noColor, scanFilter);
+        const snapshot = flags['snapshot-stdin'] ? await this.readSnapshotFromStdin() : undefined;
+        await this.exportLogs(logsDir, flags['export-path'], noColor, scanFilter, snapshot);
         return;
       }
 

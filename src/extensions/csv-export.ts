@@ -41,6 +41,7 @@ import { pausable } from '@lib/pausable.ts';
 import { BaseCommand } from '@lib/base-command.ts';
 import type { JobContext } from '@lib/job-context.ts';
 import { exportToResip, exportToXlsx } from '@extensions/archival-export.ts';
+import { exportToAuditDocx } from '@extensions/audit-report.ts';
 
 // === Types ===
 
@@ -677,14 +678,17 @@ class ExportCommand extends BaseCommand {
       default: false,
     }),
     format: Flags.string({
-      description: 'Export format: csv (default), resip (SEDA archival CSV), or xlsx (Excel)',
-      options: ['csv', 'resip', 'xlsx'],
+      description: 'Export format: csv (default), resip (SEDA archival CSV), xlsx (Excel), or docx (French audit report)',
+      options: ['csv', 'resip', 'xlsx', 'docx'],
       default: 'csv',
     }),
     db: Flags.string({
       description: 'Database name to export from',
       default: 'main',
     }),
+    // Header fields for the docx audit report (else: scanned folder name + a placeholder).
+    service: Flags.string({ description: 'Audit report: service name (docx format)' }),
+    'tree-name': Flags.string({ description: 'Audit report: arborescence name (docx format)' }),
   };
 
   private _resolvedOutput = '';
@@ -697,16 +701,18 @@ class ExportCommand extends BaseCommand {
     const { args, flags } = await this.parse(ExportCommand);
 
     const config = this.config as typeof this.config & { originalCwd: string };
-    const format = flags.format as 'csv' | 'resip' | 'xlsx';
-    const extension = format === 'xlsx' ? 'xlsx' : 'csv';
+    const format = flags.format as 'csv' | 'resip' | 'xlsx' | 'docx';
+    const extension = format === 'xlsx' ? 'xlsx' : format === 'docx' ? 'docx' : 'csv';
     const fileType =
       format === 'resip'
         ? 'resip'
         : format === 'xlsx'
           ? 'archifiltre'
-          : flags['deletion-only']
-            ? 'bordereau-elimination'
-            : 'export';
+          : format === 'docx'
+            ? 'rapport-audit'
+            : flags['deletion-only']
+              ? 'bordereau-elimination'
+              : 'export';
     const outputPath = args.output || generateExportFilename({ type: fileType, extension });
     const resolvedOutput = path.resolve(config.originalCwd, outputPath);
     await ensureDirectory(path.dirname(resolvedOutput));
@@ -738,16 +744,21 @@ class ExportCommand extends BaseCommand {
     const { flags } = await this.parse(ExportCommand);
     const fullPaths = flags['full-paths'];
     const deletionOnly = flags['deletion-only'];
-    const format = flags.format as 'csv' | 'resip' | 'xlsx';
+    const format = flags.format as 'csv' | 'resip' | 'xlsx' | 'docx';
 
-    // Archival formats (RESIP SEDA CSV, Excel workbook) walk the scan as a tree with
-    // enrichment folded in; they share their own generator instead of the flat CSV path.
-    if (format === 'resip' || format === 'xlsx') {
+    // Archival formats (RESIP SEDA CSV, Excel workbook, French audit report .docx) walk the
+    // scan/DB instead of the flat CSV path; each has its own generator.
+    if (format === 'resip' || format === 'xlsx' || format === 'docx') {
       ux.action.start(`Exporting (${format}) to ${this._resolvedOutput}`);
       const total =
         format === 'resip'
           ? await exportToResip(context, this._resolvedOutput)
-          : await exportToXlsx(context, this._resolvedOutput);
+          : format === 'xlsx'
+            ? await exportToXlsx(context, this._resolvedOutput)
+            : await exportToAuditDocx(context, this._resolvedOutput, {
+                serviceName: flags.service,
+                treeName: flags['tree-name'],
+              });
       ux.action.stop(`${total.toLocaleString()} elements`);
       this.log('');
       this.log(`Export completed: ${this._resolvedOutput}`);

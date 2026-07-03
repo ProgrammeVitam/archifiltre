@@ -4,9 +4,15 @@
 	import { extensionRegistry, type ExportMenuItem } from '$lib/extensions/registry';
 	import { exportCsv, selectExportPath, generateId, getDeleteTags } from '$lib/tauri';
 	import { jobsStore } from '$lib/jobs';
+	import { _ } from '$lib/i18n';
 	import { DownloadIcon, ChevronDownIcon } from '@lucide/svelte';
 
 	let { disabled = false }: { disabled?: boolean } = $props();
+
+	// The audit report's redundancy section needs a fully finished scan (hashes computed);
+	// a paused/partial scan would produce all-zero duplicate figures — so gate it on complete,
+	// not merely on the export dropdown being enabled (which also opens for paused scans).
+	let scanComplete = $derived($activeScan?.state === 'complete');
 
 	async function handleCsvExport(): Promise<void> {
 		const scan = $activeScan;
@@ -30,12 +36,17 @@
 		exportCsv({ outputPath, jobId, dbName: scan.dbName, fullPaths: true, deletionOnly: true });
 	}
 
-	// Archival exports: RESIP (SEDA import CSV) and a two-sheet Excel workbook.
-	async function handleArchivalExport(format: 'resip' | 'xlsx'): Promise<void> {
+	// Archival exports: RESIP (SEDA import CSV), a two-sheet Excel workbook, and the
+	// French audit report (.docx).
+	async function handleArchivalExport(format: 'resip' | 'xlsx' | 'docx'): Promise<void> {
 		const scan = $activeScan;
 		if (!scan) return;
 		const [type, ext, filter] =
-			format === 'xlsx' ? ['excel', 'xlsx', 'Excel'] : ['resip', 'csv', 'CSV'];
+			format === 'xlsx'
+				? ['excel', 'xlsx', 'Excel']
+				: format === 'docx'
+					? ['rapport-audit', 'docx', 'Word']
+					: ['resip', 'csv', 'CSV'];
 		const outputPath = await selectExportPath(type, ext, filter);
 		if (!outputPath) return;
 		exportCsv({ outputPath, jobId: generateId(), dbName: scan.dbName, format });
@@ -58,24 +69,30 @@
 	let builtinItems: ExportMenuItem[] = $derived([
 		{
 			id: 'csv-export',
-			label: 'Export as CSV',
+			label: $_('export.csv'),
 			action: handleCsvExport
 		},
 		{
 			id: 'deletion-manifest',
-			label: 'Deletion manifest (CSV)',
+			label: $_('export.deletionManifest'),
 			action: handleDeletionManifestExport,
 			disabled: !hasDeletionTags
 		},
 		{
 			id: 'resip-export',
-			label: 'RESIP (SEDA) CSV',
+			label: $_('export.resip'),
 			action: () => handleArchivalExport('resip')
 		},
 		{
 			id: 'xlsx-export',
-			label: 'Excel workbook (.xlsx)',
+			label: $_('export.xlsx'),
 			action: () => handleArchivalExport('xlsx')
+		},
+		{
+			id: 'audit-docx-export',
+			label: $_('export.auditReport'),
+			action: () => handleArchivalExport('docx'),
+			disabled: !scanComplete
 		}
 	]);
 
@@ -97,7 +114,7 @@
 				data-no-drag
 			>
 				<DownloadIcon size={14} />
-				<span>Export</span>
+				<span>{$_('export.label')}</span>
 				<ChevronDownIcon size={12} class="opacity-60" />
 			</button>
 		{/snippet}

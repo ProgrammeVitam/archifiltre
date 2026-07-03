@@ -15,6 +15,9 @@ import { callLLM } from '@extensions/ai-describe/llm-client.ts';
 import {
   buildTreeString,
   buildStatsBlock,
+  buildTreeStringFromFs,
+  buildStatsBlockFromFs,
+  queryDirectChildren,
   buildPrompt,
   SYSTEM_PROMPT,
 } from '@extensions/ai-describe/prompt.ts';
@@ -118,7 +121,9 @@ export interface DescribeResult {
 export async function handleDescribeDirectory(
   db: DatabaseConnection,
   runId: string,
-  dirPath: string
+  dirPath: string,
+  override?: { baseUrl?: string; apiKey?: string; model?: string },
+  scanning = false
 ): Promise<DescribeResult> {
   try {
     // 1. Ensure table exists
@@ -130,35 +135,75 @@ export async function handleDescribeDirectory(
       return { description: cached.description, model: cached.model, cached: true };
     }
 
-    // 3. Get LLM config
-    const config = getLLMConfig();
+    // 3. Resolve LLM config: the app Settings (passed in `override`) take precedence,
+    //    with the LLM_BASE_URL / LLM_API_KEY environment variables as a fallback.
+    const config =
+      override?.baseUrl && override?.apiKey
+        ? { baseUrl: override.baseUrl.trim().replace(/\/+$/, ''), apiKey: override.apiKey.trim() }
+        : getLLMConfig();
     if (!config) {
       return {
         description: null,
-        error: 'AI service not configured. Set LLM_BASE_URL and LLM_API_KEY environment variables.',
+        error:
+          'AI service not configured. Set the base URL and API key in Settings › AI (or the LLM_BASE_URL / LLM_API_KEY environment variables).',
       };
     }
 
-    // 4. Build tree string
-    const treeString = await buildTreeString(db, runId, dirPath);
-
-    // 5. Build stats block
-    const statsBlock = await buildStatsBlock(db, runId, dirPath);
+    // 4/5. Build the prompt context. During a scan the walker may not have inserted this
+    //      folder's children into the DB yet — the DB prompt would then say "empty" and
+    //      cache that wrong answer. When that happens, read the immediate structure straight
+    //      off disk (cheap readdir) so the summary is correct from the start of the scan.
+    let treeString: string;
+    let statsBlock: string;
+    let fromFilesystem = false;
+    if (scanning && (await queryDirectChildren(db, runId, dirPath)).length === 0) {
+      const rootPath = await getScanRootPath(db, runId);
+      if (rootPath) {
+        treeString = await buildTreeStringFromFs(rootPath, dirPath);
+        statsBlock = await buildStatsBlockFromFs(rootPath, dirPath);
+        fromFilesystem = true;
+      }
+    }
+    if (!fromFilesystem) {
+      treeString = await buildTreeString(db, runId, dirPath);
+      statsBlock = await buildStatsBlock(db, runId, dirPath);
+    }
 
     // 6. Build prompt
-    const userPrompt = buildPrompt(treeString, statsBlock);
+    const userPrompt = buildPrompt(treeString!, statsBlock!);
 
-    // 7. Call LLM API
-    const aiResult = await callLLM(config, SYSTEM_PROMPT, userPrompt);
+    // 7. Call LLM API (Settings model wins over the LLM_MODEL env / built-in default)
+    const aiResult = await callLLM(config, SYSTEM_PROMPT, userPrompt, {
+      model: override?.model?.trim() || undefined,
+    });
 
-    // 8. Save to database
-    await saveDescription(db, runId, dirPath, aiResult.description, aiResult.model);
+    // 8. Persist for future cache hits — but NOT a filesystem-derived, mid-scan summary:
+    //    leave it uncached so the post-scan pass regenerates it from the full DB (real
+    //    subtree sizes/dates) and caches that richer version instead.
+    if (!fromFilesystem) {
+      await saveDescription(db, runId, dirPath, aiResult.description, aiResult.model);
+    }
 
     // 9. Return result
     return { description: aiResult.description, model: aiResult.model, cached: false };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { description: null, error: message };
+  }
+}
+
+/** The scanned root's absolute path (files are stored relative to it), or null if the
+ *  scan_metadata row isn't present yet. Used to resolve the on-disk path for the
+ *  mid-scan filesystem fallback. */
+async function getScanRootPath(db: DatabaseConnection, runId: string): Promise<string | null> {
+  try {
+    const result = await db.pg.query<{ root_path: string | null }>(
+      `SELECT root_path FROM scan_metadata WHERE run_id = $1 LIMIT 1`,
+      [runId]
+    );
+    return result.rows[0]?.root_path ?? null;
+  } catch {
+    return null;
   }
 }
 
