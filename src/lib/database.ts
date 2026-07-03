@@ -10,6 +10,7 @@ import { promises as fs } from 'node:fs';
 import { file } from 'bun';
 import { getDatabasePath } from './platform-paths.ts';
 import { ensureDirectory } from './helpers.ts';
+import type { ScanCounts } from '@lib/job-context.ts';
 import type { Observable } from 'rxjs';
 import { from, of, defer, EMPTY, concat } from 'rxjs';
 import { map, catchError, tap, switchMap } from 'rxjs/operators';
@@ -118,14 +119,18 @@ export interface DatabaseConnection {
 }
 
 export interface ScanStats {
+  // Canonical counts (see ScanCounts / project-canonical-count-model): `totalFiles` is
+  // non-directory rows (real files + archive entries), `totalFolders` is directory rows
+  // (incl. dirs inside archives). NOT COUNT(*) — every surface shows these.
   totalFiles: number;
+  totalFolders: number;
   totalPhysicalSize: number; // Renamed from totalSize
   totalContentSize: number; // New - sum of content sizes
   duplicateGroups: number;
   duplicateFiles: number;
   // Archive statistics
   totalArchives: number; // Number of archive containers
-  totalArchiveEntries: number; // Number of files within archives
+  totalArchiveEntries: number; // Number of files within archives (sub-count of totalFiles)
   archiveFormats: string[]; // List of archive formats found
 }
 
@@ -528,45 +533,78 @@ export function getFrontierArchives(
 }
 
 /**
- * Resume seed for the progress counters: how many already-committed rows the resumed
- * walk will NOT re-emit, so `filesDiscovered` continues exactly where the paused run
- * left off (seed + re-walked remainder = what an uninterrupted run would have counted).
+ * Resume seed for the canonical committed counts: the already-committed rows the resumed
+ * walk will NOT re-emit, split by type, so the live count continues exactly where the
+ * paused run left off (seed + re-walked remainder = an uninterrupted run's counts).
  *
- * On resume the walker re-lists the root and every un-stamped directory, so their
- * committed children ARE re-emitted (and re-counted). Excluded from the seed:
- *   - top-level rows (the root is always re-listed),
- *   - rows whose parent directory is un-stamped (that dir will be re-listed),
- *   - un-stamped archive containers (re-counted via their synthetic re-expansion).
- * Archive-inner entries never pass through the walker counter, so only filesystem
- * rows (archive_parent_path IS NULL) participate.
+ * A row will be RE-EMITTED on resume (and re-counted by the walk) when:
+ *   - filesystem row: it's top-level (root is always re-listed), OR its parent directory
+ *     is un-stamped (that dir will be re-listed), OR it's an un-stamped archive container
+ *     (re-expanded via a synthetic entry);
+ *   - archive entry: its container is un-stamped (the container is re-expanded).
+ * Everything else is durable and un-re-emitted → seeded. Typed by the canonical
+ * definitions (files = non-dir incl. archive entries; folders = dir incl. archive dirs).
  */
-export function getResumeSeedCount(
+/** Raw count row from a PGlite aggregate (int → number, bigint → string). */
+type ScanCountsRow = { files: unknown; folders: unknown; archiveEntries: unknown; bytes: unknown } | undefined;
+
+/** Normalize a raw count row to canonical ScanCounts (numbers). */
+function rowToScanCounts(row: ScanCountsRow): ScanCounts {
+  return {
+    files: Number(row?.files ?? 0),
+    folders: Number(row?.folders ?? 0),
+    archiveEntries: Number(row?.archiveEntries ?? 0),
+    bytes: Number(row?.bytes ?? 0),
+  };
+}
+
+export function getResumeSeedCounts(
   connection: DatabaseConnection,
   runId: string
-): Observable<number> {
+): Observable<ScanCounts> {
   return defer(() =>
     from(
       connection.db.execute(sql`
-        SELECT count(*)::int AS n
+        SELECT
+          count(*) FILTER (WHERE f.is_directory = false)::int AS files,
+          count(*) FILTER (WHERE f.is_directory = true)::int AS folders,
+          count(*) FILTER (WHERE f.is_directory = false AND f.archive_parent_path IS NOT NULL)::int AS "archiveEntries",
+          COALESCE(sum(f.physical_size) FILTER (WHERE f.is_directory = false), 0)::bigint AS bytes
         FROM files f
         WHERE f.run_id = ${runId}
-          AND f.archive_parent_path IS NULL
-          AND position('/' in f.path) > 0
-          AND NOT EXISTS (
-            SELECT 1 FROM files u
-            WHERE u.run_id = ${runId}
-              AND u.is_directory = true
-              AND u.archive_parent_path IS NULL
-              AND u.enumerated_at IS NULL
-              AND u.path = left(f.path, length(f.path) - position('/' in reverse(f.path)))
-          )
-          AND NOT (f.is_archive_container = true AND f.enumerated_at IS NULL)
+          AND CASE
+            WHEN f.archive_parent_path IS NULL THEN
+              position('/' in f.path) > 0
+              AND NOT EXISTS (
+                SELECT 1 FROM files u
+                WHERE u.run_id = ${runId}
+                  AND u.is_directory = true
+                  AND u.archive_parent_path IS NULL
+                  AND u.enumerated_at IS NULL
+                  AND u.path = left(f.path, length(f.path) - position('/' in reverse(f.path)))
+              )
+              AND NOT (f.is_archive_container = true AND f.enumerated_at IS NULL)
+            ELSE
+              -- An archive entry is re-emitted iff its CONTAINER is re-emitted (the walk
+              -- re-lists the container's dir → re-emits the container → re-expands all its
+              -- entries). So an entry won't re-emit iff its container won't: container not
+              -- top-level AND the container's parent directory is stamped.
+              position('/' in f.archive_parent_path) > 0
+              AND NOT EXISTS (
+                SELECT 1 FROM files u
+                WHERE u.run_id = ${runId}
+                  AND u.is_directory = true
+                  AND u.archive_parent_path IS NULL
+                  AND u.enumerated_at IS NULL
+                  AND u.path = left(f.archive_parent_path, length(f.archive_parent_path) - position('/' in reverse(f.archive_parent_path)))
+              )
+          END
       `)
     ).pipe(
-      map(result => Number((result.rows[0] as { n: number | string } | undefined)?.n ?? 0)),
+      map(result => rowToScanCounts(result.rows[0])),
       catchError(error => {
-        logger.error('Failed to compute resume seed count', error as Error, { runId });
-        return of(0); // degrade to the old restart-from-zero behavior, never block resume
+        logger.error('Failed to compute resume seed counts', error as Error, { runId });
+        return of({ files: 0, folders: 0, archiveEntries: 0, bytes: 0 }); // never block resume
       })
     )
   );
@@ -956,11 +994,14 @@ export function getScanStats(connection: DatabaseConnection, runId: string): Obs
   return defer(() => {
     logger.debug('Getting scan statistics', { runId });
 
-    // Get basic stats
+    // Get basic stats. Canonical split (NOT COUNT(*)): files = non-directory rows
+    // (real files + archive entries), folders = directory rows — the numbers every
+    // surface shows, so the panel/status bar/tree can never disagree.
     return from(
       connection.db
         .select({
-          totalFiles: count(),
+          totalFiles: sql<number>`count(*) FILTER (WHERE ${files.is_directory} = false)`,
+          totalFolders: sql<number>`count(*) FILTER (WHERE ${files.is_directory} = true)`,
           totalPhysicalSize: sum(files.physical_size),
           totalContentSize: sum(files.content_size),
         })
@@ -968,7 +1009,8 @@ export function getScanStats(connection: DatabaseConnection, runId: string): Obs
         .where(eq(files.run_id, runId))
     ).pipe(
       switchMap(basicStats => {
-        const totalFiles = basicStats[0]?.totalFiles || 0;
+        const totalFiles = Number(basicStats[0]?.totalFiles) || 0;
+        const totalFolders = Number(basicStats[0]?.totalFolders) || 0;
         const totalPhysicalSize = Number(basicStats[0]?.totalPhysicalSize) || 0;
         const totalContentSize = Number(basicStats[0]?.totalContentSize) || 0;
 
@@ -988,7 +1030,16 @@ export function getScanStats(connection: DatabaseConnection, runId: string): Obs
             totalArchiveEntries: count(),
           })
           .from(files)
-          .where(and(eq(files.run_id, runId), isNotNull(files.archive_parent_path)));
+          // Sub-count of `totalFiles`: archive entries that are FILES (non-dir), matching
+          // the canonical definition — directories inside archives count as folders, not
+          // archive entries. (See project-canonical-count-model.)
+          .where(
+            and(
+              eq(files.run_id, runId),
+              isNotNull(files.archive_parent_path),
+              eq(files.is_directory, false)
+            )
+          );
 
         // Get duplicate stats
         const duplicateStatsQuery = connection.db
@@ -1017,6 +1068,7 @@ export function getScanStats(connection: DatabaseConnection, runId: string): Obs
 
             return {
               totalFiles,
+              totalFolders,
               totalPhysicalSize,
               totalContentSize,
               duplicateGroups: duplicateGroupsCount,
@@ -1032,6 +1084,7 @@ export function getScanStats(connection: DatabaseConnection, runId: string): Obs
         logger.error('Failed to get scan statistics', error as Error, { runId });
         return of({
           totalFiles: 0,
+          totalFolders: 0,
           totalPhysicalSize: 0,
           totalContentSize: 0,
           duplicateGroups: 0,

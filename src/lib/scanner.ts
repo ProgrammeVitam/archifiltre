@@ -30,7 +30,7 @@ import {
   isNotNull as _isNotNull,
 } from 'drizzle-orm';
 import { logger } from '@lib/logging.ts';
-import type { ProvisionalDir } from '@lib/job-context.ts';
+import type { ProvisionalDir, ScanCounts } from '@lib/job-context.ts';
 import {
   cleanDatabase,
   insertFileBatch,
@@ -40,7 +40,7 @@ import {
   getFrontierDirs,
   getEnumeratedDirs,
   getFrontierArchives,
-  getResumeSeedCount,
+  getResumeSeedCounts,
   findDuplicateSizes,
   countRealDuplicateGroups,
   type DatabaseConnection,
@@ -531,6 +531,8 @@ export interface ScanProgressEvent {
   phase: ScanPhase;
   filesDiscovered: number;
   filesIngested: number;
+  /** Canonical committed-so-far counts (DB-true) — the numbers every surface shows. */
+  counts: ScanCounts;
   filesHashed?: number;
   filesToHash?: number;
   hashErrors?: number;
@@ -540,7 +542,8 @@ export interface ScanProgressEvent {
 }
 
 // Scanner progress → canonical job:progress {processed, total}. Phase-aware:
-// hashing counts checksums, every other phase counts discovered files.
+// hashing counts checksums, every other phase counts committed files (the canonical
+// `files` count, DB-true — NOT the walker's pre-expansion discovered count).
 export function scanProgressMetrics(e: ScanProgressEvent): {
   processed: number;
   total: number | null;
@@ -548,7 +551,7 @@ export function scanProgressMetrics(e: ScanProgressEvent): {
   if (e.phase === 'hashing') {
     return { processed: e.filesHashed ?? 0, total: e.filesToHash ?? null };
   }
-  return { processed: e.filesDiscovered, total: null };
+  return { processed: e.counts.files, total: null };
 }
 
 /**
@@ -564,6 +567,24 @@ export function scanDirectory(
   let filesIngested = 0;
   let duplicateGroups = 0;
   let duplicateSizesCount = 0;
+  // Canonical committed-so-far counts (DB-true) — the numbers every surface shows. Folded
+  // per successfully-inserted batch below; seeded from the DB on resume. `files` + `folders`
+  // == filesIngested (this is filesIngested partitioned by type).
+  const committed: ScanCounts = { files: 0, folders: 0, archiveEntries: 0, bytes: 0 };
+
+  /** Fold one committed batch into the canonical counts (matches insertFileBatch's
+   *  batch-length accounting, so committed stays == the DB rows the batch produced).
+   *  The batch is FileRow[] — the DB row shape (snake_case columns). */
+  const tallyCommitted = (batch: FileRow[]): void => {
+    for (const r of batch) {
+      if (r.is_directory) committed.folders++;
+      else {
+        committed.files++;
+        if (r.archive_parent_path) committed.archiveEntries++;
+        committed.bytes += r.physical_size || 0;
+      }
+    }
+  };
 
   const emitProgress = (phase: ScanPhase, status: string, extra?: Partial<ScanProgressEvent>) => {
     progressCallback?.({
@@ -571,6 +592,7 @@ export function scanDirectory(
       phase,
       filesDiscovered,
       filesIngested,
+      counts: { ...committed },
       duplicateGroups,
       status,
       ...extra,
@@ -685,19 +707,24 @@ export function scanDirectory(
     if (!config.frontier || !config.resume) {
       return { seedDirs: [], enumeratedDirs: new Set(), archiveEntries: [] };
     }
-    const [seedDirs, enumDirs, archiveRows, seedCount] = await Promise.all([
+    const [seedDirs, enumDirs, archiveRows, seed] = await Promise.all([
       firstValueFrom(getFrontierDirs(connection, config.runId)),
       firstValueFrom(getEnumeratedDirs(connection, config.runId)),
       firstValueFrom(getFrontierArchives(connection, config.runId)),
-      firstValueFrom(getResumeSeedCount(connection, config.runId)),
+      firstValueFrom(getResumeSeedCounts(connection, config.runId)),
     ]);
-    // Continue the progress counters where the paused run left off: seed with the
-    // committed rows the resumed walk will NOT re-emit, so seed + re-walked remainder
-    // equals what an uninterrupted run would have counted. Both counters get the same
-    // seed, keeping the enumerate backpressure delta (discovered − ingested) at zero.
-    filesDiscovered = seedCount;
-    filesIngested = seedCount;
-    emitProgress('discovery', `resumed at ${seedCount.toLocaleString()} files`);
+    // Continue the counts where the paused run left off: seed with the committed rows the
+    // resumed walk will NOT re-emit (typed by the same canonical definitions), so seed +
+    // re-walked remainder equals what an uninterrupted run would have counted. The scalar
+    // discovered/ingested seed = files + folders (keeps the enumerate backpressure delta 0).
+    const seedTotal = seed.files + seed.folders;
+    filesDiscovered = seedTotal;
+    filesIngested = seedTotal;
+    committed.files = seed.files;
+    committed.folders = seed.folders;
+    committed.archiveEntries = seed.archiveEntries;
+    committed.bytes = seed.bytes;
+    emitProgress('discovery', `resumed at ${seed.files.toLocaleString()} files`);
     // Re-expand only top-level archives; a nested archive can't be re-read standalone and
     // is already stamped (0 children) at creation, so it shouldn't appear here anyway.
     const archiveEntries = archiveRows.filter(r => !r.archive_parent_path).map(archiveRowToEntry);
@@ -706,7 +733,7 @@ export function scanDirectory(
       frontierDirs: seedDirs.length,
       enumeratedDirs: enumDirs.length,
       frontierArchives: archiveEntries.length,
-      counterSeed: seedCount,
+      counterSeed: seed,
     });
     return { seedDirs, enumeratedDirs: new Set(enumDirs), archiveEntries };
   };
@@ -851,18 +878,17 @@ export function scanDirectory(
             insertFileBatch(connection, batch).pipe(
               tap(inserted => {
                 filesIngested += inserted;
+                // Partition the just-committed batch into the canonical counts, so the
+                // live number is the DB-true committed count (not the walker's guess).
+                tallyCommitted(batch);
                 logger.debug('Batch insertion completed', {
                   inserted,
                   totalIngested: filesIngested,
                   runId: config.runId,
                 });
-                if (filesIngested % 1000 === 0) {
-                  logger.debug('Calling ingestion progress callback', {
-                    filesIngested,
-                    runId: config.runId,
-                  });
-                  emitProgress('ingestion', `ingested ${filesIngested.toLocaleString()} files`);
-                }
+                // Emit on every batch so the live count climbs smoothly and precisely
+                // (the UI's smooth counter interpolates between these DB checkpoints).
+                emitProgress('ingestion', `ingested ${committed.files.toLocaleString()} files`);
               }),
               // Incremental, DB-central dir_stats maintenance (owner mode only): fold
               // this batch into the per-directory aggregates so the icicle can read the

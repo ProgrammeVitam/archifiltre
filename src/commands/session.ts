@@ -513,6 +513,8 @@ export default class Session extends Command {
           processed,
           total,
           detail: event.status,
+          // Canonical committed-so-far counts — the numbers every UI surface shows.
+          counts: event.counts,
         });
       }
     ).subscribe({
