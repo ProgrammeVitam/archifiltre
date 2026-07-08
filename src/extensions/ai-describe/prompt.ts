@@ -14,9 +14,26 @@ import path from 'node:path';
 
 /**
  * System prompt instructing the LLM on how to describe directories.
+ * Kept for backward compatibility; new callers should use {@link systemPromptForLang}.
  */
 export const SYSTEM_PROMPT =
   'You are a file system analyst. Given a directory tree, describe in 1-2 sentences what this directory is about. Be concise and specific. Answer in the language of the filenames if they are not in English.';
+
+/**
+ * Localized system prompts so the summary comes back in the user's UI language.
+ * Falls back to English for any unknown locale.
+ */
+const SYSTEM_PROMPTS: Record<string, string> = {
+  en: 'You are a file system analyst. Given a directory tree, describe in 1-2 sentences what this directory is about. Be concise and specific. Answer in English.',
+  fr: "Tu es un analyste de systèmes de fichiers. À partir d'une arborescence, décris en 1 à 2 phrases le contenu et l'usage probable de ce dossier. Sois concis et précis. Réponds en français.",
+  de: 'Du bist ein Dateisystem-Analyst. Beschreibe anhand eines Verzeichnisbaums in 1-2 Sätzen, worum es in diesem Verzeichnis geht. Sei präzise und knapp. Antworte auf Deutsch.',
+};
+
+/** Pick the system prompt for a UI locale (e.g. 'fr', 'de', 'en'); defaults to English. */
+export function systemPromptForLang(lang?: string): string {
+  const key = (lang ?? 'en').slice(0, 2).toLowerCase();
+  return SYSTEM_PROMPTS[key] ?? SYSTEM_PROMPTS.en;
+}
 
 // === Tree Building ===
 
@@ -294,9 +311,14 @@ export async function buildTreeString(
   dirPath: string,
   options?: TreeBuildOptions
 ): Promise<string> {
-  const maxDepth = options?.maxDepth ?? 3;
-  const maxFilesPerDir = options?.maxFilesPerDir ?? 15;
-  const maxTotalLines = options?.maxTotalLines ?? 80;
+  // Kept lean on purpose. The prompt is prefilled on the CPU model before the first token, and
+  // that prefill is memory-bandwidth-bound (measured: it barely speeds up with more cores), so
+  // a bigger tree just costs latency everywhere — ~2× slower for only marginally more specific
+  // summaries. A depth-2, ~40-line skeleton captures what a folder is about; users who want
+  // higher quality pick a bigger MODEL in Settings (0.5B/1.5B/7B), which is the real dial.
+  const maxDepth = options?.maxDepth ?? 2;
+  const maxFilesPerDir = options?.maxFilesPerDir ?? 8;
+  const maxTotalLines = options?.maxTotalLines ?? 40;
 
   const state: TreeBuildState = { totalLines: 0, maxTotalLines };
 
@@ -447,8 +469,21 @@ function formatDate(timestamp: number): string {
  * @param statsBlock - The formatted statistics block
  * @returns The complete user prompt
  */
-export function buildPrompt(treeString: string, statsBlock: string): string {
-  return `What is this directory about?\n\n${treeString}\n\n${statsBlock}`;
+export function buildPrompt(treeString: string, statsBlock: string, lang?: string): string {
+  const key = (lang ?? 'en').slice(0, 2).toLowerCase();
+  // Lead question + a closing instruction, both in the target language. Small models mirror
+  // the language of the *user* content, so an English-only frame around a French/German tree
+  // makes them answer in English despite the system prompt — the localized frame fixes that.
+  const frame: Record<string, { q: string; close: string }> = {
+    en: { q: 'What is this directory about?', close: 'Answer in 1-2 sentences, in English.' },
+    fr: { q: 'De quoi parle ce dossier ?', close: 'Réponds en 1 à 2 phrases, en français.' },
+    de: {
+      q: 'Worum geht es in diesem Verzeichnis?',
+      close: 'Antworte in 1-2 Sätzen auf Deutsch.',
+    },
+  };
+  const { q, close } = frame[key] ?? frame.en;
+  return `${q}\n\n${treeString}\n\n${statsBlock}\n\n${close}`;
 }
 
 // === Filesystem fallback (mid-scan, DB not ready) ===

@@ -27,8 +27,11 @@ interface ChatCompletionRequest {
 
 interface ChatCompletionChoice {
   index: number;
-  message: ChatMessage;
-  finish_reason: string;
+  /** Present on non-streaming responses. */
+  message?: ChatMessage;
+  /** Present on streaming (SSE) chunks — a partial content delta. */
+  delta?: { content?: string };
+  finish_reason: string | null;
 }
 
 interface ChatCompletionResponse {
@@ -115,15 +118,20 @@ export async function callLLM(
     model?: string;
     maxTokens?: number;
     temperature?: number;
+    /** When provided, the response is streamed (OpenAI SSE) and each token delta is passed
+     *  here as it arrives. Works for any OpenAI-compatible endpoint (local llama-server or
+     *  external), so there's no provider-specific path. */
+    onToken?: (delta: string) => void;
   }
 ): Promise<LLMResult> {
   const model = resolveModel(options?.model);
   const maxTokens = options?.maxTokens ?? 150;
   const temperature = options?.temperature ?? 0.3;
+  const stream = typeof options?.onToken === 'function';
 
   const url = `${config.baseUrl}/chat/completions`;
 
-  const requestBody: ChatCompletionRequest = {
+  const requestBody: ChatCompletionRequest & { stream?: boolean } = {
     model,
     messages: [
       { role: 'system', content: systemPrompt },
@@ -131,6 +139,7 @@ export async function callLLM(
     ],
     max_tokens: maxTokens,
     temperature,
+    ...(stream ? { stream: true } : {}),
   };
 
   const response = await fetch(url, {
@@ -145,6 +154,12 @@ export async function callLLM(
   if (!response.ok) {
     const errorText = await response.text().catch(() => 'unknown error');
     throw new Error(`LLM API error (${response.status} ${response.statusText}): ${errorText}`);
+  }
+
+  if (stream) {
+    const content = await consumeSSE(response, options!.onToken!);
+    if (!content) throw new Error('LLM API returned an empty message content');
+    return { description: content.trim(), model };
   }
 
   const data = (await response.json()) as ChatCompletionResponse;
@@ -163,4 +178,42 @@ export async function callLLM(
     description: content.trim(),
     model,
   };
+}
+
+/**
+ * Read an OpenAI-style `text/event-stream` chat completion, invoking `onToken` for each
+ * content delta and returning the full accumulated text. Tolerant of chunk boundaries that
+ * split SSE lines.
+ */
+async function consumeSSE(
+  response: Response,
+  onToken: (delta: string) => void
+): Promise<string> {
+  if (!response.body) throw new Error('LLM API returned no response body to stream');
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let full = '';
+
+  for await (const chunk of response.body as unknown as AsyncIterable<Uint8Array>) {
+    buffer += decoder.decode(chunk, { stream: true });
+    let nl: number;
+    while ((nl = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (!line.startsWith('data:')) continue;
+      const payload = line.slice(5).trim();
+      if (payload === '[DONE]') return full;
+      try {
+        const json = JSON.parse(payload) as ChatCompletionResponse;
+        const delta = json.choices?.[0]?.delta?.content ?? '';
+        if (delta) {
+          full += delta;
+          onToken(delta);
+        }
+      } catch {
+        /* keep-alive / partial line — ignore */
+      }
+    }
+  }
+  return full;
 }
