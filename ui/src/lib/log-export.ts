@@ -85,3 +85,23 @@ export async function exportLogsFlow(): Promise<boolean> {
 		return false;
 	}
 }
+
+/**
+ * Fallback for the log export: open the logs folder in the OS file manager. The sidecar resolves
+ * the path AND opens it (`logs --open`), so it always points at exactly where the logs live — no
+ * recomputation, no dialog, no zip. Bulletproof when the bundle export can't produce a file.
+ * Returns true on success. Technical fallback only (Settings) — Export logs stays the primary way.
+ */
+export async function openLogsFolder(): Promise<boolean> {
+	try {
+		const result = await invoke<CommandResult>('open_logs_dir');
+		if (!result.success) {
+			console.error('Open logs folder failed:', result.error ?? result.output);
+			return false;
+		}
+		return true;
+	} catch (error) {
+		console.error('Open logs folder failed:', error);
+		return false;
+	}
+}

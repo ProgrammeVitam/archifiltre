@@ -10,7 +10,7 @@
 	import { extensionRegistry } from '$lib/extensions/registry';
 	import { settingsOpen, windowEffect, lensMode, type LensMode, icicleHeight, type IcicleHeight, llmConfig, type LlmConfig, aiMode, type AiMode, localModel } from '$lib/stores';
 	import { getLocalModelStatus, downloadLocalModel, type LocalModelStatus } from '$lib/tauri';
-	import { exportLogsFlow } from '$lib/log-export';
+	import { exportLogsFlow, openLogsFolder } from '$lib/log-export';
 	import { _ } from '$lib/i18n';
 	import {
 		getStoredLocalePref,
@@ -261,15 +261,27 @@
 							</DropdownMenu.Root>
 						</div>
 
-						<!-- Support bundle: sidecar logs + frontend snapshot as one .zip. -->
+						<!-- Support bundle: sidecar logs + frontend snapshot as one .zip. Export is the
+						     primary action (the bundle captures the frontend snapshot + system-info a raw
+						     folder can't). "Open logs folder" is a subordinate technical fallback for when
+						     the bundle can't be produced. -->
 						<div class="flex items-center justify-between gap-4 rounded-lg border px-4 py-3">
 							<div class="min-w-0 flex-1">
 								<Label class="text-sm font-medium">{$_('settings.exportLogs')}</Label>
 								<p class="mt-0.5 text-xs text-muted-foreground">{$_('settings.exportLogsHint')}</p>
 							</div>
-							<Button variant="outline" size="sm" onclick={() => void exportLogsFlow()}>
-								{$_('export.label')}
-							</Button>
+							<div class="flex shrink-0 flex-col items-end gap-1.5">
+								<Button variant="outline" size="sm" onclick={() => void exportLogsFlow()}>
+									{$_('export.label')}
+								</Button>
+								<button
+									type="button"
+									class="text-xs text-muted-foreground underline-offset-2 transition-colors hover:text-foreground hover:underline"
+									onclick={() => void openLogsFolder()}
+								>
+									{$_('settings.openLogsFolder')}
+								</button>
+							</div>
 						</div>
 					{:else if active === 'appearance'}
 						<div class="flex items-center justify-between gap-4 rounded-lg border px-4 py-3">

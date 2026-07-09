@@ -83,6 +83,7 @@
 		"languageSystem": "System",
 		"exportLogs": "Export logs",
 		"exportLogsHint": "Save a .zip bundle of application logs and session diagnostics — useful when reporting a problem.",
+		"openLogsFolder": "Open logs folder",
 		"appearance": "Appearance",
 		"windowEffect": "Window effect",
 		"windowEffectHint": "Translucent window (vibrancy on macOS, acrylic on Windows). Turn off for a solid background.",

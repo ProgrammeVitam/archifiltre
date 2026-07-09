@@ -83,6 +83,7 @@
 		"languageSystem": "Système",
 		"exportLogs": "Exporter les journaux",
 		"exportLogsHint": "Enregistrer une archive .zip des journaux de l'application et du diagnostic de session, utile pour signaler un problème.",
+		"openLogsFolder": "Ouvrir le dossier des journaux",
 		"appearance": "Apparence",
 		"windowEffect": "Effet de fenêtre",
 		"windowEffectHint": "Fenêtre translucide (vibrancy sur macOS, acrylic sur Windows). Désactivez pour un fond uni.",

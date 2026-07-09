@@ -83,6 +83,7 @@
 		"languageSystem": "System",
 		"exportLogs": "Protokolle exportieren",
 		"exportLogsHint": "Ein .zip-Archiv der Anwendungsprotokolle und Sitzungsdiagnose speichern — hilfreich beim Melden eines Problems.",
+		"openLogsFolder": "Protokollordner öffnen",
 		"appearance": "Darstellung",
 		"windowEffect": "Fenstereffekt",
 		"windowEffectHint": "Transluzentes Fenster (Vibrancy unter macOS, Acrylic unter Windows). Deaktivieren für einen einfarbigen Hintergrund.",

@@ -411,6 +411,44 @@ async fn export_logs(
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
+    // Success means the ARTIFACT exists — not merely that the process exited 0. A silent
+    // wrong-path / failed write must never be reported to the user as a successful export
+    // (the "said it worked but nothing was there" bug). The app always requests a `.zip`, so
+    // the sidecar writes exactly `output_path`; verify a non-empty file landed there.
+    let exit_ok = output.status.success();
+    let file_ok = std::fs::metadata(&output_path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
+    let error = if exit_ok && file_ok {
+        None
+    } else if !exit_ok {
+        Some(if stderr.is_empty() { stdout.clone() } else { stderr })
+    } else {
+        Some(format!("no file was written at {}", output_path))
+    };
+
+    Ok(CommandResult {
+        success: exit_ok && file_ok,
+        output: stdout,
+        error,
+    })
+}
+
+/// Fallback for the log export: open the logs folder in the OS file manager. Delegates to the
+/// sidecar's `logs --open`, which resolves the logs directory the SAME way it writes to it (one
+/// source of truth — never recomputed here, which would drift from the Tauri identifier path).
+#[tauri::command]
+async fn open_logs_dir(app: tauri::AppHandle) -> Result<CommandResult, String> {
+    let binary_path = find_sidecar_path(&app)?;
+    let output = sidecar_command(&binary_path)
+        .args(["logs", "--open", "--no-color"])
+        .output()
+        .await
+        .map_err(|e| format!("Failed to open logs directory: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
     Ok(CommandResult {
         success: output.status.success(),
         output: stdout,
@@ -1154,6 +1192,7 @@ fn main() {
             get_version,
             list_datadirs,
             export_logs,
+            open_logs_dir,
             // Scan
             scan_directory,
             // Checksum
