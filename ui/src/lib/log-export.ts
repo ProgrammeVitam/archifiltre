@@ -55,7 +55,17 @@ function buildUiState(): string {
 
 /** Run the full export flow. Returns true when a bundle was written. */
 export async function exportLogsFlow(): Promise<boolean> {
-	const outputPath = await selectExportPath('logs', 'zip', 'ZIP');
+	// Anchor the log bundle's Save-As dialog at the user's Downloads folder — one predictable,
+	// always-writable place, never the last-browsed data folder or a read-only network share.
+	// (Scoped to logs only; other exports keep their current default.)
+	let downloadsDir: string | undefined;
+	try {
+		const { downloadDir } = await import('@tauri-apps/api/path');
+		downloadsDir = await downloadDir();
+	} catch {
+		/* Downloads not resolvable → fall back to the OS default location */
+	}
+	const outputPath = await selectExportPath('logs', 'zip', 'ZIP', downloadsDir);
 	if (!outputPath) return false; // user cancelled the dialog
 
 	reportSaveStatus('saving', 'logs');

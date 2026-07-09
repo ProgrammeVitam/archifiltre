@@ -11,20 +11,20 @@
 		listMode,
 		activeScan,
 		scanPhase,
-		isDiscovering
+		isDiscovering,
+		aiMode
 	} from '$lib/stores';
 	import { smoothFilesDiscovered } from '$lib/scan-counters';
 	import {
-		queryDirectoryDescription,
 		queryComposition,
 		queryDirDateStats,
 		exportCsv,
 		selectExportPath,
 		generateId,
-		type DirectoryDescription,
 		type DirDateStats,
 		type CompositionEntry
 	} from '$lib/tauri';
+	import { rootSummary } from '$lib/llm-describe';
 	import { _, locale } from '$lib/i18n';
 	import { fmtBytes, fmtNum, fmtDate } from '$lib/format';
 	import { getFileType, type FileType } from '$lib/file-types';
@@ -48,8 +48,6 @@
 	// The root node is the current selection; its aggregates come straight from it post-scan.
 	let root = $derived($selectedItem);
 
-	let aiDescription = $state<DirectoryDescription | null>(null);
-	let isLoadingDescription = $state(false);
 	let composition = $state<CompositionEntry[] | null>(null);
 	let dateStats = $state<DirDateStats | null>(null);
 
@@ -77,18 +75,9 @@
 	let archiveEntries = $derived($activeScan?.scanResult.archiveEntries ?? 0);
 	let compReady = $derived(!scanning ? composition != null : structureReady && composition != null);
 
-	// The AI summary loads early — during a scan the describe extension falls back to a live
-	// filesystem listing, so a real résumé appears from the start. Reload on db change.
-	$effect(() => {
-		const db = $activeScan?.dbName;
-		void db;
-		untrack(() => void loadDescription());
-	});
-	async function loadDescription() {
-		isLoadingDescription = true;
-		aiDescription = await queryDirectoryDescription('');
-		isLoadingDescription = false;
-	}
+	// The root summary is DRIVEN ELSEWHERE: $lib/llm-describe owns the state machine (declarative
+	// rules over scan state × host state, per-db summaries, preemptible auto generations). This
+	// component only renders `$rootSummary` — no latches, no edges, nothing to swallow.
 
 	// Size/counts/dates/composition need a fully-ingested DB — (re)load once the structure is
 	// ready (walk done → hashing), and again if the db changes. Keyed so hashing's steady
@@ -178,26 +167,39 @@
 		</Breadcrumb.List>
 	</Breadcrumb.Root>
 
-	<!-- Résumé — centré et contenu à une largeur de prose (mx-auto) -->
-	{#if aiDescription?.description}
+	<!-- Résumé — centré et contenu à une largeur de prose (mx-auto). Pure render of the
+	     coordinator's state: text (final or mid-scan partial), error, live stream, or an
+	     HONEST waiting state (model loading / queued behind another summary). -->
+	{#if $rootSummary.text}
 		<div class="mx-auto max-w-prose text-center">
-			<p class="text-base leading-relaxed text-foreground">{aiDescription.description}</p>
-			{#if aiDescription.model}
+			<p class="text-base leading-relaxed text-foreground">{$rootSummary.text}</p>
+			{#if $rootSummary.model}
 				<p class="mt-2 text-xs text-muted-foreground/60">
-					{$_('root.summarizedBy')}
-					{aiDescription.model}{aiDescription.cached ? ' · ' + $_('details.cached') : ''}
+					{$_($aiMode === 'external' ? 'details.summarizedExternal' : 'details.summarizedLocally')}
+					· {$rootSummary.model}{$rootSummary.cached ? ' · ' + $_('details.cached') : ''}
 				</p>
 			{/if}
 		</div>
-	{:else if aiDescription?.error}
+	{:else if $rootSummary.status === 'error'}
 		<p class="mx-auto max-w-prose text-center text-sm italic text-muted-foreground/60">
-			{aiDescription.error}
+			{$_('details.summaryUnavailable')}
 		</p>
-	{:else if isLoadingDescription}
+	{:else if $rootSummary.status === 'generating' && $rootSummary.streamingText}
+		<div class="mx-auto max-w-prose text-center">
+			<p class="text-base leading-relaxed text-foreground">
+				{$rootSummary.streamingText}<span class="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-foreground/50"></span>
+			</p>
+		</div>
+	{:else if $rootSummary.status === 'generating'}
 		<div class="mx-auto flex max-w-prose flex-col items-center gap-2">
 			<Skeleton class="h-4 w-[92%]" />
 			<Skeleton class="h-4 w-full" />
 			<Skeleton class="h-4 w-[85%]" />
+			{#if $rootSummary.modelLoading}
+				<p class="text-xs italic text-muted-foreground/60">{$_('details.modelLoading')}</p>
+			{:else if $rootSummary.waiting}
+				<p class="text-xs italic text-muted-foreground/60">{$_('details.waitingTurn')}</p>
+			{/if}
 		</div>
 	{/if}
 

@@ -64,10 +64,10 @@ export default class Sbom extends Command {
     // Try to find embedded SBOM in multiple locations
     const possiblePaths = [
       // Embedded during build process
-      join(process.cwd(), 'dist', 'sbom', `archifiltre-5.0.0-dev.spdx3.yaml`),
+      join(process.cwd(), 'dist', 'sbom', `archifiltre-5.0.0-alpha.3.spdx3.yaml`),
       join(process.cwd(), 'archifiltre.sbom'),
       // Development paths
-      join(__dirname, '..', '..', '..', 'dist', 'sbom', `archifiltre-5.0.0-dev.spdx3.yaml`),
+      join(__dirname, '..', '..', '..', 'dist', 'sbom', `archifiltre-5.0.0-alpha.3.spdx3.yaml`),
     ];
 
     for (const path of possiblePaths) {

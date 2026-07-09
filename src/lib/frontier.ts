@@ -109,6 +109,25 @@ export class Frontier {
   }
 
   /**
+   * Account for children that will NEVER commit — quarantined by batch salvage (a poison row we
+   * chose to skip rather than let it strand the whole batch). They count toward the parent's
+   * completion exactly like a commit: the parent HAS been fully enumerated, one child was
+   * unwritable and is recorded as skipped elsewhere, so the parent can stamp and the scan
+   * finalize. Unlike {@link rowsCommitted} this deliberately does NOT `selfCommit` a skipped
+   * unit-own-row — that row does not exist in the DB, so it can't be the target of a stamp UPDATE
+   * (path sanitization prevents this for the common corrupt-name case; a residual such unit stays
+   * on the frontier and re-walks, which is the safe fallback).
+   */
+  rowsResolved(rows: Array<{ path: string; archive_parent_path?: string | null }>): void {
+    for (const row of rows) {
+      const unit = unitOf(row);
+      if (unit === '') continue;
+      this.committed.set(unit, (this.committed.get(unit) ?? 0) + 1);
+      this.maybeReady(unit);
+    }
+  }
+
+  /**
    * Drain the units now fully committed and not yet stamped, for the caller to stamp
    * (DB UPDATE) in a txn AFTER the commit that made them ready. They are NOT marked here:
    * the caller `confirm`s them once the stamp UPDATE commits, or `requeue`s them on failure

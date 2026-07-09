@@ -1,6 +1,6 @@
 {
   "name": "archifiltre",
-  "version": "5.0.0-dev",
+  "version": "5.0.0-alpha.3",
   "description": "Privacy-friendly, 100% offline desktop tool for inventorying large file trees",
   "type": "module",
   "bin": {
@@ -14,13 +14,13 @@
     "expose-db:port": "bun run scripts/expose-db.ts --port=5433",
     "expose-db:help": "bun run scripts/expose-db.ts --help",
     "prebuild": "mkdir -p dist && bun run copy-wasm && bun run sbom",
-    "build": "bun run prebuild && bun build src/main.ts --compile --outfile dist/archifiltre --minify-syntax --minify-whitespace",
-    "build:cli": "bun run prebuild && bun build src/main.ts --compile --outfile dist/archifiltre --minify-syntax --minify-whitespace",
+    "build": "bun run prebuild && bun build src/main.ts --compile --external node-llama-cpp --external '@node-llama-cpp/*' --outfile dist/archifiltre --minify-syntax --minify-whitespace",
+    "build:cli": "bun run prebuild && bun build src/main.ts --compile --external node-llama-cpp --external '@node-llama-cpp/*' --outfile dist/archifiltre --minify-syntax --minify-whitespace",
     "build:release": "bun run build && cp dist/sbom/archifiltre-*.spdx3.yaml ./archifiltre.sbom",
-    "build:windows": "bun build src/main.ts --compile --target=bun-windows-x64 --outfile dist/archifiltre-x86_64-pc-windows-msvc.exe --minify-syntax --minify-whitespace",
-    "build:macos": "bun build src/main.ts --compile --target=bun-darwin-x64 --outfile dist/archifiltre-x86_64-apple-darwin --minify-syntax --minify-whitespace",
-    "build:macos-arm": "bun build src/main.ts --compile --target=bun-darwin-arm64 --outfile dist/archifiltre-aarch64-apple-darwin --minify-syntax --minify-whitespace",
-    "build:linux": "bun build src/main.ts --compile --target=bun-linux-x64 --outfile dist/archifiltre-x86_64-unknown-linux-gnu --minify-syntax --minify-whitespace",
+    "build:windows": "bun build src/main.ts --compile --external node-llama-cpp --external '@node-llama-cpp/*' --target=bun-windows-x64 --outfile dist/archifiltre-x86_64-pc-windows-msvc.exe --minify-syntax --minify-whitespace",
+    "build:macos": "bun build src/main.ts --compile --external node-llama-cpp --external '@node-llama-cpp/*' --target=bun-darwin-x64 --outfile dist/archifiltre-x86_64-apple-darwin --minify-syntax --minify-whitespace",
+    "build:macos-arm": "bun build src/main.ts --compile --external node-llama-cpp --external '@node-llama-cpp/*' --target=bun-darwin-arm64 --outfile dist/archifiltre-aarch64-apple-darwin --minify-syntax --minify-whitespace",
+    "build:linux": "bun build src/main.ts --compile --external node-llama-cpp --external '@node-llama-cpp/*' --target=bun-linux-x64 --outfile dist/archifiltre-x86_64-unknown-linux-gnu --minify-syntax --minify-whitespace",
     "build:all": "bun run prebuild && bun run build:linux && bun run build:windows && bun run build:macos && bun run build:macos-arm",
     "package:dmg": "scripts/create-dmg.sh",
     "smoke:cli": "bun run scripts/smoke-test.ts",
@@ -88,11 +88,17 @@
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.4.6",
+    "@node-llama-cpp/linux-x64": "^3.19.0",
+    "@node-llama-cpp/linux-x64-vulkan": "^3.19.0",
+    "@node-llama-cpp/win-x64": "^3.19.0",
+    "@node-llama-cpp/win-x64-vulkan": "^3.19.0",
     "@oclif/core": "^4.11.4",
     "docx": "^9.7.1",
     "drizzle-orm": "^0.45.2",
     "exceljs": "^4.4.0",
     "fflate": "^0.8.3",
+    "hash-wasm": "^4.12.0",
+    "node-llama-cpp": "^3.19.0",
     "rxjs": "^7.8.2",
     "smol-toml": "^1.6.1",
     "streamarchive": "^0.1.0",
@@ -126,5 +132,8 @@
   "funding": {
     "type": "government",
     "url": "https://www.programmevitam.fr/"
-  }
+  },
+  "trustedDependencies": [
+    "node-llama-cpp"
+  ]
 }

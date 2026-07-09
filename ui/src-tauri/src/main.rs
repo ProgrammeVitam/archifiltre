@@ -12,7 +12,9 @@ use tauri::Emitter;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
+mod llm_host;
 mod owner;
+use llm_host::LlmHost;
 use owner::{EventSink, Owner};
 
 // ============================================================================
@@ -178,6 +180,9 @@ pub struct AppState {
     /// NEW scan claims it and re-targets it via switch_db (~0.5 s) instead of paying
     /// the ~1 s WASM compile of a cold spawn; a replacement is warmed in the background.
     pub warm_spare: Mutex<Option<Arc<Owner>>>,
+    /// THE app-global LLM host: one `llm-helper` process (one warm model) shared by every
+    /// scan and by Settings — never coupled to a scan session. Killed on app exit.
+    pub llm: LlmHost,
 }
 
 impl Default for AppState {
@@ -187,6 +192,7 @@ impl Default for AppState {
             running_jobs: Mutex::new(HashMap::new()),
             owners: Mutex::new(HashMap::new()),
             warm_spare: Mutex::new(None),
+            llm: LlmHost::default(),
         }
     }
 }
@@ -981,6 +987,46 @@ async fn is_session_active(
 }
 
 // ============================================================================
+// Commands - App-global LLM host (one llm-helper process, one warm model)
+// ============================================================================
+
+/// Route one request to THE LLM host: `{type:'load'|'generate'|'model_status'|'download_model', …}`.
+/// Streamed intermediates (`describe:token`, `model:download`) are emitted on the job-update
+/// channel — the same event lines the UI already listens to. Returns a business envelope
+/// `{ok, data|error}`; only transport failures (host unspawnable) reject, so the UI can fall
+/// back to the legacy in-owner path when the host itself is unavailable.
+#[tauri::command]
+async fn llm_request(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+    req: Value,
+) -> Result<Value, String> {
+    let binary_path = find_sidecar_path(&app)?;
+    let sink: llm_host::LlmEventSink = {
+        let app = app.clone();
+        Arc::new(move |line: String| {
+            // No job id — the UI's describe:token / model:download listeners route by
+            // streamId / model inside the line, never by jobId.
+            let _ = app.emit(
+                "job-update",
+                JobUpdateEvent {
+                    job_id: String::new(),
+                    line,
+                },
+            );
+        })
+    };
+    // Per-type budgets: a model load can read >1 GB from a cold disk; a download can run
+    // for hours (its own stall watchdog aborts dead connections long before this cap).
+    let timeout = match req.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+        "download_model" => std::time::Duration::from_secs(24 * 3600),
+        "load" | "generate" => std::time::Duration::from_secs(300),
+        _ => std::time::Duration::from_secs(20),
+    };
+    state.llm.request(&binary_path, req, sink, timeout).await
+}
+
+// ============================================================================
 // Commands - Path Validation
 // ============================================================================
 
@@ -1129,11 +1175,25 @@ fn main() {
             session_request,
             stop_session,
             is_session_active,
+            // App-global LLM host
+            llm_request,
             // Path Validation
             validate_path,
             // Window Management
             create_window,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // App exit: reap THE llm-helper (it holds the ~1 GB model). Owners have their own
+            // teardown (stop_session); the host is Rust-owned, so Rust must kill it — this is
+            // what closes the old "orphaned inference process on quit" hole.
+            if let tauri::RunEvent::Exit = event {
+                use tauri::Manager;
+                let state = app_handle.state::<Arc<AppState>>().inner().clone();
+                tauri::async_runtime::block_on(async move {
+                    state.llm.kill().await;
+                });
+            }
+        });
 }

@@ -34,6 +34,8 @@ import type { ProvisionalDir, ScanCounts } from '@lib/job-context.ts';
 import {
   cleanDatabase,
   insertFileBatch,
+  type BatchInsertResult,
+  sanitizeDbText,
   rollupDirStatsBatch,
   populateDirStats,
   markEnumerated,
@@ -512,6 +514,9 @@ export interface ScanResult {
   phase: 'complete';
   filesDiscovered: number;
   filesIngested: number;
+  /** Rows that could not be written even individually (poison data), quarantined so they never
+   *  strand the scan. Normally 0; >0 means "analysis finished, but N items couldn't be saved." */
+  filesSkipped: number;
   duplicateGroups: number;
 }
 
@@ -565,6 +570,9 @@ export function scanDirectory(
 ): Observable<ScanResult> {
   let filesDiscovered = 0;
   let filesIngested = 0;
+  // Rows a batch insert could not accept even one-by-one (poison: NUL/invalid-UTF-8 name, etc.),
+  // quarantined so they can't strand the batch/frontier. Surfaced at completion — honest status.
+  let filesSkipped = 0;
   let duplicateGroups = 0;
   let duplicateSizesCount = 0;
   // Canonical committed-so-far counts (DB-true) — the numbers every surface shows. Folded
@@ -876,13 +884,16 @@ export function scanDirectory(
         mergeMap(
           batch =>
             insertFileBatch(connection, batch).pipe(
-              tap(inserted => {
-                filesIngested += inserted;
-                // Partition the just-committed batch into the canonical counts, so the
-                // live number is the DB-true committed count (not the walker's guess).
-                tallyCommitted(batch);
+              tap(result => {
+                filesIngested += result.committed.length;
+                filesSkipped += result.skipped.length;
+                // Partition ONLY the durably-committed rows into the canonical counts, so the
+                // live number is the DB-true committed count (not the walker's guess, and not
+                // rows a salvage quarantined).
+                tallyCommitted(result.committed);
                 logger.debug('Batch insertion completed', {
-                  inserted,
+                  inserted: result.committed.length,
+                  skipped: result.skipped.length,
                   totalIngested: filesIngested,
                   runId: config.runId,
                 });
@@ -896,42 +907,44 @@ export function scanDirectory(
               // (no one-shot populateDirStats spike). Own catchError so a rollup hiccup
               // never fails the batch. O(batch) — independent of table size.
               incrementalRollup
-                ? mergeMap((inserted: number) =>
-                    from(rollupDirStatsBatch(connection, config.runId, batch)).pipe(
-                      map(() => inserted),
+                ? mergeMap((result: BatchInsertResult) =>
+                    from(rollupDirStatsBatch(connection, config.runId, result.committed)).pipe(
+                      map(() => result),
                       catchError(err => {
                         logger.warn('dir_stats rollup failed for batch', {
                           runId: config.runId,
                           error: (err as Error).message,
                         });
-                        return of(inserted);
+                        return of(result);
                       })
                     )
                   )
                 : tap(),
-              // Frontier: stamp every unit whose children are now ALL committed, in a txn
-              // AFTER this (successful) insert. A failed batch emits 0 → we skip tallying
-              // and stamping, so its units stay on the frontier and replay.
+              // Frontier: stamp every unit whose children are now ALL accounted for, in a txn
+              // AFTER this insert. Children count via `rowsCommitted` (durably written) OR
+              // `rowsResolved` (quarantined by salvage — permanently skipped, but the parent IS
+              // fully enumerated, so it must still be able to stamp, else it re-walks forever).
               //
-              // Deliberately a SEPARATE txn from the insert, not folded in: `rowsCommitted`
-              // tallies committed children, and it must run only AFTER the insert COMMITS —
-              // folding the stamp into the insert txn would force tallying before commit
-              // confirmation and leave the in-memory frontier inconsistent on a rollback.
-              // Strictly-after is safe (children are durable before the stamp); the worst a
-              // crash in the gap costs is re-walking a handful of dirs on resume.
+              // Deliberately a SEPARATE txn from the insert, not folded in: the tally must run
+              // only AFTER the insert COMMITS — folding the stamp into the insert txn would force
+              // tallying before commit confirmation and leave the in-memory frontier inconsistent
+              // on a rollback. Strictly-after is safe (children are durable before the stamp); the
+              // worst a crash in the gap costs is re-walking a handful of dirs on resume.
               //
-              // Marks are confirmed only once the stamp UPDATE itself commits; on failure
-              // they're requeued so the next drain retries (no silent re-walk on next resume).
+              // Marks are confirmed only once the stamp UPDATE itself commits; on failure they're
+              // requeued so the next drain retries (no silent re-walk on next resume).
               frontier
-                ? mergeMap((inserted: number) => {
-                    if (inserted <= 0) return of(inserted);
-                    frontier.rowsCommitted(batch);
+                ? mergeMap((result: BatchInsertResult) => {
+                    if (!result.committed.length && !result.skipped.length) return of(result);
+                    frontier.rowsCommitted(result.committed);
+                    if (result.skipped.length)
+                      frontier.rowsResolved(result.skipped.map(s => s.row));
                     const marks = frontier.takeReady();
-                    if (!marks.length) return of(inserted);
+                    if (!marks.length) return of(result);
                     return from(markEnumerated(connection, config.runId, marks)).pipe(
                       map(() => {
                         frontier.confirm(marks);
-                        return inserted;
+                        return result;
                       }),
                       catchError(err => {
                         frontier.requeue(marks);
@@ -939,7 +952,7 @@ export function scanDirectory(
                           runId: config.runId,
                           error: (err as Error).message,
                         });
-                        return of(inserted);
+                        return of(result);
                       })
                     );
                   })
@@ -949,10 +962,12 @@ export function scanDirectory(
                   runId: config.runId,
                   batchSize: batch.length,
                 });
-                return from([0]); // Continue processing
+                return from([{ committed: [], skipped: [] } as BatchInsertResult]); // Continue
               }),
               config.betweenBatches
-                ? mergeMap((n: number) => from(config.betweenBatches!()).pipe(map(() => n)))
+                ? mergeMap((result: BatchInsertResult) =>
+                    from(config.betweenBatches!()).pipe(map(() => result))
+                  )
                 : tap()
             ),
           // Frontier mode REQUIRES concurrency 1: the reconciler's `rowsCommitted` tally is
@@ -1055,10 +1070,20 @@ export function scanDirectory(
         duplicateSizes: duplicateSizesCount,
       });
     }),
+    tap(() => {
+      if (filesSkipped > 0) {
+        logger.warn('scan finished with quarantined items (could not be saved)', {
+          runId: config.runId,
+          filesSkipped,
+          filesIngested,
+        });
+      }
+    }),
     map(() => ({
       phase: 'complete' as const,
       filesDiscovered,
       filesIngested,
+      filesSkipped,
       duplicateGroups,
     })),
 
@@ -1362,9 +1387,11 @@ function walkFilesConcurrent(
  * Convert FileEntry to database row format
  */
 function toFileRow(runId: string, entry: FileEntry): FileRow {
+  // Sanitize every text field: names read from truncated/corrupt archives can carry NUL bytes or
+  // lone surrogates that Postgres text rejects, which would otherwise fail the whole batch insert.
   return {
     run_id: runId,
-    path: entry.path,
+    path: sanitizeDbText(entry.path),
     physical_size: entry.physical_size,
     content_size: entry.content_size,
     mtime: entry.mtime,
@@ -1373,10 +1400,10 @@ function toFileRow(runId: string, entry: FileEntry): FileRow {
     is_system: entry.isSystem,
     hash: null, // Hash calculated later if needed
     is_archive_container: entry.isArchiveContainer,
-    archive_parent_path: entry.archiveParentPath,
+    archive_parent_path: sanitizeDbText(entry.archiveParentPath),
     archive_depth: entry.archiveDepth,
-    archive_format: entry.archiveFormat,
-    extraction_error: entry.extractionError,
+    archive_format: sanitizeDbText(entry.archiveFormat),
+    extraction_error: sanitizeDbText(entry.extractionError),
   };
 }
 

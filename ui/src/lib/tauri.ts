@@ -7,6 +7,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+export type { UnlistenFn };
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 
 // ================================
@@ -204,7 +205,7 @@ export async function scanDirectory(options: ScanOptions): Promise<CommandResult
 	// owners keep running → concurrent scans), point queries at it, fire the scan (acks
 	// immediately, streams job:progress/resource events), and resolve on job:complete /
 	// job:error — same canonical vocabulary as the scan command.
-	await invoke('start_session', { dbName: options.dbName });
+	await ensureSession(options.dbName); // seed the gate: the scan IS this db's owner
 	setActiveQueryDb(options.dbName);
 	const jobId = options.jobId || options.scanId;
 	const done = new Promise<CommandResult>((resolve) => {
@@ -428,6 +429,48 @@ export function setActiveQueryDb(dbName: string | undefined): void {
 	activeQueryDb = dbName;
 }
 
+// ── Session-readiness gate (ONE ordering point for every consumer) ──
+// The owner session is a shared prerequisite for every DB read (queryTree, describe_prepare,
+// hover stats, …). It's created by scanDirectory (during a scan) or startQuerySession (on
+// reopen/pause) — and consumers used to fire independently of whoever created it, so one could
+// hit the owner registry before it was registered → "No active session for this db" (e.g. a
+// reopened scan's root summary racing startQuerySession). Every consumer funnels through
+// sendQuery, so we gate THERE: sendQuery awaits ensureSession(db). start_session is idempotent
+// on the Rust side (holds the owners lock, reuses a live owner, respawns a dead one), so this
+// memoized promise is purely an await-point + de-dup — it can never open a second opener.
+const TRANSIENT_SESSION_ERROR =
+	/session closed before responding|session not alive|No active session|request timed out|session did not respond/i;
+
+/** True for the recoverable owner-handoff errors: the owner isn't up yet / just died / is
+ *  respawning. These must be retried (or awaited), never surfaced as a terminal failure. */
+export function isTransientSessionError(e: unknown): boolean {
+	return TRANSIENT_SESSION_ERROR.test(String((e as { message?: unknown })?.message ?? e));
+}
+
+const sessionReady = new Map<string, Promise<string>>();
+
+/** Ensure this db's owner is up (or coming up) and resolve once it's ready. Idempotent:
+ *  concurrent callers share ONE start_session — whoever asks first triggers it, the rest await
+ *  the same promise, so no consumer can run before the owner is registered. Owner-mode only. */
+export function ensureSession(dbName?: string): Promise<string> {
+	const db = dbName ?? activeQueryDb ?? 'main';
+	let p = sessionReady.get(db);
+	if (!p) {
+		p = invoke<string>('start_session', { dbName: db }).catch((e) => {
+			sessionReady.delete(db); // failed to establish → let a later call retry cleanly
+			throw e;
+		});
+		sessionReady.set(db, p);
+	}
+	return p;
+}
+
+/** Forget a db's session (owner died / stopped / db deleted) so the next consumer re-establishes it. */
+export function invalidateSession(dbName?: string): void {
+	const db = dbName ?? activeQueryDb;
+	if (db) sessionReady.delete(db);
+}
+
 /**
  * Start a query session for interactive database access.
  * @param dbName - Optional database name (defaults to 'main')
@@ -436,7 +479,9 @@ export function setActiveQueryDb(dbName: string | undefined): void {
 export async function startQuerySession(dbName?: string): Promise<string> {
 	if (useOwnerDb()) {
 		activeQueryDb = dbName;
-		return await invoke<string>('start_session', { dbName });
+		// Go through the gate so this shares the SAME start_session as any consumer (e.g. the
+		// describe engine) that raced ahead — one owner, one promise, no double-establish.
+		return await ensureSession(dbName);
 	}
 	return await invoke<string>('start_query_session', { dbName });
 }
@@ -446,6 +491,7 @@ export async function startQuerySession(dbName?: string): Promise<string> {
  */
 export async function stopQuerySession(): Promise<void> {
 	if (useOwnerDb()) {
+		invalidateSession(activeQueryDb); // owner is going away → next consumer re-establishes
 		await invoke('stop_session', { dbName: activeQueryDb });
 		return;
 	}
@@ -459,7 +505,11 @@ export async function stopQuerySession(): Promise<void> {
  * and a query carrying the wrong db reads the other owner (e.g. unmaterialized data
  * mid-scan → empty tree). Omitting it falls back to the active tab's pointer.
  */
-export async function sendQuery(request: QueryRequest, dbName?: string): Promise<QueryResponse> {
+export async function sendQuery(
+	request: QueryRequest,
+	dbName?: string,
+	timeoutMs?: number
+): Promise<QueryResponse> {
 	// Guarantee a UNIQUE wire id. Callers build ids as `${action}_${Date.now()}`, which
 	// collides when two of the same request fire in the same millisecond — e.g. get_tree is
 	// double-fired at scan completion (once from the job:complete handler, once from the
@@ -469,11 +519,34 @@ export async function sendQuery(request: QueryRequest, dbName?: string): Promise
 	// keeping the readable action prefix. Correlation is internal (callers await the response,
 	// not the id), so rewriting the id here is safe.
 	const uniqueRequest = { ...request, id: `${request.id}_${_ownerReqCounter++}` };
-	if (useOwnerDb())
-		return await invoke<QueryResponse>('session_request', {
-			dbName: dbName ?? activeQueryDb,
-			request: uniqueRequest
-		});
+	if (useOwnerDb()) {
+		const db = dbName ?? activeQueryDb;
+		// THE GATE: never touch the owner before it's registered. This is what removes the
+		// reopen/pause "No active session for this db" race for EVERY consumer at once — the
+		// describe engine no longer needs special handling, its describe_prepare simply waits.
+		await ensureSession(db);
+		const fire = (req: QueryRequest) =>
+			invoke<QueryResponse>('session_request', {
+				dbName: db,
+				request: req,
+				// The owner replies to some requests only after a long job (e.g. a model
+				// download finishes). Callers pass a generous timeout so those don't hit the
+				// default 15 s cap and surface as a spurious "session did not respond" error.
+				...(timeoutMs != null ? { timeoutMs } : {})
+			});
+		try {
+			return await fire(uniqueRequest);
+		} catch (e) {
+			// Owner died between ensure and use (crash / respawn) → re-establish once and retry
+			// with a fresh id. A single retry, never a loop: a second failure propagates.
+			if (isTransientSessionError(e)) {
+				invalidateSession(db);
+				await ensureSession(db);
+				return await fire({ ...request, id: `${request.id}_${_ownerReqCounter++}` });
+			}
+			throw e;
+		}
+	}
 	return await invoke<QueryResponse>('send_query', { request: uniqueRequest });
 }
 
@@ -514,11 +587,12 @@ export async function deleteDatabase(dbName: string): Promise<void> {
 		// leaving the datadir on disk for startup reconciliation to resurrect ("removed but
 		// comes back"). start_session get-or-spawns the owner (reusing the warm spare), so the
 		// delete always reaches a live process that closes PGlite and removes the datadir.
-		await invoke('start_session', { dbName });
+		await ensureSession(dbName);
 		await sendQuery({ id: `delete_${Date.now()}`, action: 'delete_db' }, dbName);
 	} catch {
 		/* owner exiting after its ack */
 	}
+	invalidateSession(dbName); // db is gone → forget its session so a re-scan re-establishes cleanly
 	try {
 		await invoke('stop_session', { dbName });
 	} catch {
@@ -729,6 +803,10 @@ export interface DirectoryDescription {
 	model?: string;
 	cached?: boolean;
 	error?: string;
+	/** Mid-scan only: the summary was built from the on-disk fallback (walker hadn't inserted
+	 *  children yet), so it is provisional and should be regenerated from the full tree at
+	 *  completion. Absent/false → authoritative: the engine keeps it and just persists it. */
+	provisional?: boolean;
 }
 
 /**
@@ -737,36 +815,268 @@ export interface DirectoryDescription {
  * Results are cached in the database.
  * Requires an active query session.
  */
-export async function queryDirectoryDescription(
-	dirPath: string = ''
-): Promise<DirectoryDescription | null> {
+/** Active UI language ('en' | 'fr' | 'de'), mirroring i18n's resolveLocale without importing it. */
+export function currentUiLang(): string {
+	const supported = ['en', 'fr', 'de'];
 	try {
-		// AI can be turned off in Settings › AI. Only the `external` provider is wired for
-		// now (webllm is planned), so anything other than external means "don't call".
-		try {
-			const mode = localStorage.getItem('archifiltre-ai-mode');
-			if (mode && mode !== 'external') return { description: null, error: 'AI disabled' };
-		} catch {
-			/* no localStorage → default (external) */
-		}
-		// LLM credentials from Settings › AI (localStorage). Sent with the request; the
-		// sidecar falls back to its LLM_* env vars when these are empty.
-		let llm: { baseUrl: string; apiKey: string; model: string } | undefined;
-		try {
-			const raw = localStorage.getItem('archifiltre-llm-config');
-			if (raw) {
-				const c = JSON.parse(raw);
-				if (c && (c.baseUrl || c.apiKey || c.model)) llm = c;
-			}
-		} catch {
-			/* no/bad config → undefined → env fallback */
-		}
-		const response = await sendQuery({
-			id: `describe_directory_${Date.now()}`,
-			action: 'describe_directory',
+		const pref = localStorage.getItem('archifiltre-locale');
+		const raw = pref && pref !== 'system' ? pref : (navigator.language || 'en');
+		const l = raw.slice(0, 2).toLowerCase();
+		return supported.includes(l) ? l : 'en';
+	} catch {
+		return 'en';
+	}
+}
+
+// ── App-global LLM host (ONE Rust-owned llm-helper; one warm model for every scan + Settings) ──
+
+interface LlmEnvelope {
+	ok: boolean;
+	data?: Record<string, unknown>;
+	error?: string;
+}
+
+/**
+ * One request to THE app-global LLM host. Throws ONLY on transport failure (host unspawnable /
+ * non-Tauri env like the Chromium bridge) — business failures come back as `{ok:false, error}`.
+ * Callers use the throw to fall back to the legacy in-owner path, keeping CLI/bridge working.
+ */
+async function llmRequest(req: Record<string, unknown>): Promise<LlmEnvelope> {
+	return (await invoke('llm_request', { req })) as LlmEnvelope;
+}
+
+/** Options for a describe: who asked (user click vs auto rule — autos are preemptible on
+ *  the host), a stable clientId for cancellation/queue-tracking, and an explicit db so the
+ *  coordinator's requests never retarget when the active tab changes mid-flight. */
+export interface DescribeOpts {
+	kind?: 'user' | 'auto';
+	clientId?: string;
+	dbName?: string;
+}
+
+/** Cancel a describe by its clientId — drops it from the host queue, or aborts the running
+ *  generation. Fire-and-forget: used when the user clicks another folder, so abandoned
+ *  generations no longer hog the engine. */
+export function cancelDescribe(clientId: string): void {
+	void llmRequest({ type: 'cancel', clientId }).catch(() => {});
+}
+
+/**
+ * The 3-leg local describe on the app-global host:
+ *   leg 1 (owner)  describe_prepare  — cache hit / mid-scan gate / prompt build (DB work)
+ *   leg 2 (host)   generate          — THE warm model, tokens streamed via job-update
+ *   leg 3 (owner)  store_description — persist for future cache hits (when cacheable)
+ * Throws only when the HOST transport is unavailable (caller falls back to legacy).
+ */
+async function describeViaHost(
+	dirPath: string,
+	model: string,
+	lang: string,
+	onToken?: (delta: string) => void,
+	opts?: DescribeOpts
+): Promise<DirectoryDescription> {
+	const prep = await sendQuery(
+		{
+			id: `describe_prepare_${Date.now()}`,
+			action: 'describe_prepare',
 			path: dirPath,
-			...(llm ? { llm } : {})
+			llm: { provider: 'local', lang }
+		},
+		opts?.dbName,
+		30_000
+	);
+	if (!prep.ok) return { description: null, error: prep.error };
+	const p = prep.data as {
+		cached?: { description: string; model: string };
+		system?: string;
+		prompt?: string;
+		cacheable?: boolean;
+		provisional?: boolean;
+		error?: string;
+	};
+	if (p.error) return { description: null, error: p.error }; // e.g. scan-in-progress
+	if (p.cached) return { description: p.cached.description, model: p.cached.model, cached: true };
+
+	const streamId = onToken ? `desc_${Date.now()}_${Math.floor(Math.random() * 1e6)}` : undefined;
+	let unlisten: UnlistenFn | null = null;
+	try {
+		if (streamId && onToken) {
+			unlisten = await onJobUpdate((e) => {
+				try {
+					const msg = JSON.parse(e.line);
+					if (msg.event === 'describe:token' && msg.streamId === streamId && msg.delta)
+						onToken(msg.delta as string);
+				} catch {
+					/* not our event */
+				}
+			});
+		}
+		const gen = await llmRequest({
+			type: 'generate',
+			model,
+			system: p.system,
+			prompt: p.prompt,
+			maxTokens: 256,
+			...(streamId ? { streamId } : {}),
+			...(opts?.clientId ? { clientId: opts.clientId } : {}),
+			...(opts?.kind ? { kind: opts.kind } : {})
 		});
+		if (!gen.ok) return { description: null, error: gen.error ?? 'AI runtime not available' };
+		const text = ((gen.data?.text as string) ?? '').trim();
+		if (!text) return { description: null, error: 'AI runtime returned no text' };
+		// Persist for cache hits — fire-and-forget; a failed cache write must not hide the summary.
+		if (p.cacheable) {
+			void sendQuery(
+				{
+					id: `store_description_${Date.now()}`,
+					action: 'store_description',
+					path: dirPath,
+					description: text,
+					model,
+					lang
+				},
+				opts?.dbName
+			).catch(() => {});
+		}
+		return { description: text, model, cached: false, provisional: p.provisional };
+	} finally {
+		try {
+			await Promise.resolve(unlisten?.()).catch(() => {});
+		} catch {
+			/* ignore */
+		}
+	}
+}
+
+/**
+ * Persist an already-generated summary for future cache hits WITHOUT regenerating it — the
+ * "promote" path. The engine calls this at scan completion for an authoritative mid-scan
+ * summary (built from the full tree, so no need to regenerate): it was left uncached while
+ * scanning, and this stamps it into the DB so re-opening the scan is instant. Fire-and-forget;
+ * a failed cache write must never disturb the on-screen summary.
+ */
+export function persistDescription(
+	dirPath: string,
+	description: string,
+	model: string,
+	dbName?: string
+): void {
+	void sendQuery(
+		{
+			id: `store_description_${Date.now()}`,
+			action: 'store_description',
+			path: dirPath,
+			description,
+			model,
+			lang: currentUiLang()
+		},
+		dbName
+	).catch(() => {});
+}
+
+export async function queryDirectoryDescription(
+	dirPath: string = '',
+	onToken?: (delta: string) => void,
+	opts?: DescribeOpts
+): Promise<DirectoryDescription | null> {
+	let unlistenTokens: UnlistenFn | null = null;
+	try {
+		// LLM provider from Settings › LLM. `off` → don't call. `local` → on-device Qwen via
+		// the sidecar's llama-server. `external` → the configured OpenAI-compatible endpoint.
+		// Default (no value) is `local`.
+		let mode = 'local';
+		try {
+			const m = localStorage.getItem('archifiltre-ai-mode');
+			if (m) mode = m;
+		} catch {
+			/* no localStorage → default (local) */
+		}
+		if (mode === 'off') return { description: null, error: 'LLM disabled' };
+
+		// Summarize in the user's UI language (resolves 'system' → OS locale → en).
+		const lang = currentUiLang();
+
+		// A per-request id so streamed token events reach only this call (survives folder
+		// switches — tokens for an abandoned stream simply don't match).
+		const streamId = onToken ? `desc_${Date.now()}_${_ownerReqCounter}` : undefined;
+
+		let llm:
+			| {
+					provider?: 'local' | 'external';
+					baseUrl?: string;
+					apiKey?: string;
+					model?: string;
+					lang?: string;
+					streamId?: string;
+			  }
+			| undefined;
+		if (mode === 'local') {
+			let model = 'qwen2.5-1.5b';
+			try {
+				const m = localStorage.getItem('archifiltre-local-model');
+				if (m) model = m;
+			} catch {
+				/* default model */
+			}
+			// Preferred path: the app-global LLM host (ONE warm model, scan-independent).
+			// Transport failure only (bridge env / host unspawnable) falls through to the
+			// legacy in-owner path below — business errors return as-is (never retried).
+			try {
+				return await describeViaHost(dirPath, model, lang, onToken, opts);
+			} catch (hostErr) {
+				// A TRANSIENT session error must NOT cascade into the legacy in-owner describe
+				// (which would load a SECOND model in the owner). Re-raise it as a transient result
+				// so the engine's bounded retry handles it on the host path — never a second load.
+				if (isTransientSessionError(hostErr)) {
+					return { description: null, error: String((hostErr as { message?: unknown })?.message ?? hostErr) };
+				}
+				console.warn('LLM host unavailable — legacy in-owner describe:', hostErr);
+			}
+			llm = { provider: 'local', model, lang };
+		} else {
+			// LLM credentials from Settings › LLM (localStorage). Sent with the request; the
+			// sidecar falls back to its LLM_* env vars when these are empty.
+			try {
+				const raw = localStorage.getItem('archifiltre-llm-config');
+				if (raw) {
+					const c = JSON.parse(raw);
+					if (c && (c.baseUrl || c.apiKey || c.model))
+						llm = { provider: 'external', ...c, lang };
+				}
+			} catch {
+				/* no/bad config → undefined → env fallback */
+			}
+			if (!llm) llm = { provider: 'external', lang };
+		}
+		if (llm && streamId) llm.streamId = streamId;
+
+		// Subscribe to streamed token events for this request (cache hits emit none).
+		if (streamId && onToken) {
+			unlistenTokens = await onJobUpdate((e) => {
+				try {
+					const msg = JSON.parse(e.line);
+					if (msg.event === 'describe:token' && msg.streamId === streamId && msg.delta)
+						onToken(msg.delta as string);
+				} catch {
+					/* not our event */
+				}
+			});
+		}
+
+		// A cold local describe must spawn llama-server and load the model (1–5 GB) before
+		// generating, which easily exceeds the default 15 s request cap — give it room so it
+		// doesn't error out as "no description". External calls keep the default.
+		const timeoutMs = mode === 'local' ? 180_000 : undefined;
+		const response = await sendQuery(
+			{
+				id: `describe_directory_${Date.now()}`,
+				action: 'describe_directory',
+				path: dirPath,
+				...(llm ? { llm } : {})
+			},
+			undefined,
+			timeoutMs
+		);
 
 		if (!response.ok) {
 			console.error('Failed to get directory description:', response.error);
@@ -776,7 +1086,145 @@ export async function queryDirectoryDescription(
 		return response.data as DirectoryDescription;
 	} catch (error) {
 		console.error('Error querying directory description:', error);
+		// Never a silent null: the panel must always have SOMETHING to render (status principle).
+		return {
+			description: null,
+			error: String((error as Error)?.message ?? error) || 'AI runtime not available'
+		};
+	} finally {
+		try {
+			await Promise.resolve(unlistenTokens?.()).catch(() => {});
+		} catch {
+			/* ignore */
+		}
+	}
+}
+
+/** A local model the sidecar can run, and whether it's already on disk. */
+export interface LocalModelStatus {
+	id: string;
+	label: string;
+	family: string;
+	tier: 'fast' | 'balanced' | 'best';
+	note: string;
+	size: number;
+	license: string;
+	downloaded: boolean;
+}
+
+/** Ask which local models exist on disk (for the Settings › LLM picker). Preferred: the
+ *  app-global LLM host — works with ZERO scans open (Settings is no longer coupled to a scan
+ *  session). Falls back to the legacy per-scan action for the bridge/CLI environments. */
+export async function getLocalModelStatus(): Promise<{
+	models: LocalModelStatus[];
+	default: string;
+} | null> {
+	try {
+		const r = await llmRequest({ type: 'model_status' });
+		if (r.ok) return r.data as unknown as { models: LocalModelStatus[]; default: string };
+	} catch {
+		/* host transport unavailable → legacy below */
+	}
+	try {
+		const response = await sendQuery({ id: `model_status_${Date.now()}`, action: 'model_status' });
+		if (!response.ok) return null;
+		return response.data as { models: LocalModelStatus[]; default: string };
+	} catch (error) {
+		console.error('Error querying model status:', error);
 		return null;
+	}
+}
+
+/**
+ * Pre-load the model on THE app-global LLM host so the first folder summary is warm (~1 s)
+ * instead of a cold ~10 s model load. Fired at app launch (and on model change) when local AI
+ * is on — completely decoupled from scans, so it can never contend with a describe or ride a
+ * scan session. Best-effort: warming is a pure optimization, never surfaces an error.
+ */
+export async function warmLocalModel(model: string): Promise<boolean> {
+	try {
+		const r = await llmRequest({ type: 'load', model });
+		return r.ok;
+	} catch {
+		/* non-Tauri env (bridge) or host unavailable — warming is optional */
+		return false;
+	}
+}
+
+export interface ModelDownloadProgress {
+	model: string;
+	received: number;
+	total: number;
+	file: string;
+	done?: boolean;
+	/** Present only on the terminal failure event: why the download stopped. */
+	error?: { category: string; message?: string };
+}
+
+/** Outcome of a model download: `ok`, or a machine-legible failure `category` the UI maps to a
+ *  localized reason (`tls-cert` / `dns` / `connect-timeout` / `proxy-auth` / `http-status` / `disk`). */
+export interface ModelDownloadResult {
+	ok: boolean;
+	errorCategory?: string;
+}
+
+/**
+ * Download a local model to `~/.archifiltre/models/`. Progress streams back on the
+ * job-update channel as `model:download` events; `onProgress` is invoked for each.
+ * Resolves once the sidecar confirms the file is fully on disk.
+ *
+ * `sizeBytes` (the model's total size) sets a generous request timeout — the sidecar
+ * only replies when the whole download finishes, which far exceeds the default 15 s cap.
+ */
+export async function downloadLocalModel(
+	id: string,
+	onProgress?: (p: ModelDownloadProgress) => void,
+	sizeBytes = 0
+): Promise<ModelDownloadResult> {
+	// The sidecar emits a terminal `model:download` event carrying `error.category` when a
+	// download fails (cert / dns / firewall / proxy / disk). Capture it here so the caller can
+	// show *why* instead of a bar silently stuck at 0.
+	let errorCategory: string | undefined;
+	const unlisten: UnlistenFn = await onJobUpdate((e) => {
+		try {
+			const msg = JSON.parse(e.line);
+			if (msg.event !== 'model:download' || msg.model !== id) return;
+			if (msg.error) errorCategory = msg.error.category ?? 'unknown';
+			else onProgress?.(msg as ModelDownloadProgress);
+		} catch {
+			/* not our event */
+		}
+	});
+	// Preferred: THE app-global LLM host — the download belongs to the app, not to a scan, so
+	// closing/deleting a scan tab can no longer kill it (and it works with zero scans open).
+	// Progress arrives on the same job-update events either way.
+	try {
+		const r = await llmRequest({ type: 'download_model', model: id });
+		return { ok: r.ok, errorCategory: r.ok ? undefined : (errorCategory ?? 'unknown') };
+	} catch {
+		/* host transport unavailable (bridge/CLI env) → legacy per-scan path below */
+	}
+	// Budget ~1 MB/s as a very conservative floor, plus a 60 s cushion, min 5 min. (The sidecar's
+	// own ~30 s stall watchdog fails a dead connection far sooner than this outer cap.)
+	const timeoutMs = Math.max(300_000, Math.ceil(sizeBytes / 1_000_000) * 1000 + 60_000);
+	try {
+		const response = await sendQuery(
+			{ id: `download_model_${Date.now()}`, action: 'download_model', model: id },
+			undefined,
+			timeoutMs
+		);
+		return { ok: response.ok, errorCategory: response.ok ? undefined : errorCategory };
+	} catch {
+		// The action rejected (the sidecar threw). Prefer the categorized reason from the event;
+		// fall back to a generic connection category if the request itself timed out.
+		return { ok: false, errorCategory: errorCategory ?? 'connect-timeout' };
+	} finally {
+		// Detaching the listener must never surface as an unhandled rejection.
+		try {
+			await Promise.resolve(unlisten?.()).catch(() => {});
+		} catch {
+			/* ignore */
+		}
 	}
 }
 
@@ -1175,12 +1623,31 @@ export async function exportCsv(options: ExportOptions): Promise<CommandResult> 
 export async function selectExportPath(
 	type: string = 'export',
 	extension: string = 'csv',
-	filterName: string = 'CSV'
+	filterName: string = 'CSV',
+	baseDir?: string
 ): Promise<string | null> {
 	const { save } = await import('@tauri-apps/plugin-dialog');
+	// Human-readable local date-time in the name (YYYY-MM-DD_HH-MM-SS) — readable at a glance and
+	// still unique per export, instead of a raw epoch number.
+	const d = new Date();
+	const p = (n: number) => String(n).padStart(2, '0');
+	const stamp = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
+	const fileName = `archifiltre-${type}-${stamp}.${extension}`;
+	// When a base directory is given (the logs export anchors at Downloads), pre-fill the FULL
+	// path so the Save-As dialog opens there every time — instead of the OS's last-used location.
+	// Other exports pass no baseDir, so their behaviour is unchanged (filename only).
+	let defaultPath = fileName;
+	if (baseDir) {
+		try {
+			const { join } = await import('@tauri-apps/api/path');
+			defaultPath = await join(baseDir, fileName);
+		} catch {
+			/* couldn't resolve → fall back to filename-only (OS default location) */
+		}
+	}
 	const result = await save({
 		title: 'Export scan results',
-		defaultPath: `archifiltre-${type}-${Date.now()}.${extension}`,
+		defaultPath,
 		filters: [{ name: filterName, extensions: [extension] }]
 	});
 	return result;

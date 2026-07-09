@@ -165,6 +165,7 @@ export default class Scan extends BaseCommand {
       phase: 'complete',
       filesDiscovered: 0,
       filesIngested: 0,
+      filesSkipped: 0,
       duplicateGroups: 0,
     };
 

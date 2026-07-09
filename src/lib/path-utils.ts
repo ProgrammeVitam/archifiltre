@@ -153,29 +153,40 @@ export function normalizeWindowsDrive(filePath: string): string {
   return normalizePath(filePath);
 }
 
+// Windows MAX_PATH is 260. We only reach for the extended-length prefix when a LOCAL path
+// actually approaches it — leaving headroom for the child segments the walker appends.
+const WIN_MAX_PATH_SAFE = 240;
+
 /**
- * Prefix an absolute path with the Windows extended-length path prefix (\\?\)
- * so that the Win32 API accepts paths longer than MAX_PATH (260 characters).
+ * Prefix a LOCAL absolute path with the Windows extended-length prefix (\\?\) when it
+ * approaches MAX_PATH (260), so the Win32 API still accepts it. Short paths and every
+ * non-Windows path are returned unchanged.
  *
- * No-op on non-Windows platforms and on paths that are already prefixed.
- * UNC paths (\\server\share) are mapped to \\?\UNC\server\share as required.
+ * IMPORTANT — network / UNC shares (\\server\share) are passed through VERBATIM, never mapped
+ * to \\?\UNC\. The extended-length form disables the DFS/MUP redirector resolution (and Bun's
+ * `readdir` mishandles it), so a perfectly reachable share enumerates as ENOENT — which is
+ * exactly the "network folder shows no files" bug. Bun's fs + the Windows redirector resolve
+ * the plain UNC path correctly. (A >260-char path *under* a share is an unsupported edge; the
+ * walker would then log "Cannot access directory", so it stays diagnosable.)
  *
- * The prefix disables Win32 path parsing (no relative segments, no forward
- * slashes), so this must only be called on fully-resolved absolute paths.
+ * The prefix disables Win32 path parsing (no relative segments, no forward slashes), so this
+ * must only be called on fully-resolved absolute paths.
  *
- * @param filePath - Absolute path to prefix
- * @returns Path safe for filesystem calls on Windows regardless of length
+ * @param filePath - Absolute path to (possibly) prefix
+ * @returns Path safe for filesystem calls on Windows
  *
  * @example
- * toLongPath('C:\\very\\long\\path') → '\\\\?\\C:\\very\\long\\path'
- * toLongPath('\\\\server\\share\\file') → '\\\\?\\UNC\\server\\share\\file'
+ * toLongPath('C:\\short\\path')                    → 'C:\\short\\path'         (unchanged)
+ * toLongPath('C:\\very\\…\\>240-char\\path')        → '\\\\?\\C:\\very\\…\\path' (prefixed)
+ * toLongPath('\\\\server\\share\\file')            → '\\\\server\\share\\file'  (verbatim UNC)
  */
 export function toLongPath(filePath: string): string {
   if (process.platform !== 'win32') return filePath;
   if (filePath.startsWith('\\\\?\\')) return filePath;
   const backslashed = filePath.replace(/\//g, '\\');
-  if (backslashed.startsWith('\\\\')) {
-    return `\\\\?\\UNC\\${backslashed.slice(2)}`;
-  }
+  // Network / UNC share → verbatim (never \\?\UNC\; that breaks DFS/redirector resolution).
+  if (backslashed.startsWith('\\\\')) return backslashed;
+  // Local drive path → only add the extended-length prefix when we actually near MAX_PATH.
+  if (backslashed.length < WIN_MAX_PATH_SAFE) return backslashed;
   return `\\\\?\\${backslashed}`;
 }

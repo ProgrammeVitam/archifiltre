@@ -758,6 +758,7 @@ function persistedLensMode() {
 }
 export const lensMode = persistedLensMode();
 
+
 /** Icicle vertical sizing (Settings → Appearance). All three fill the height by sharing it
  *  across the levels, clamped between a 6px floor and a per-mode cap — they differ only in
  *  the cap, so rows shrink toward the floor as a tree gets deeper (more folders):
@@ -824,11 +825,12 @@ export const llmConfig = persistedJson<LlmConfig>('archifiltre-llm-config', {
 	model: ''
 });
 
-/** How AI (directory summaries) is provided. `off` disables it entirely; `external` uses
- *  the credentials in {@link llmConfig} (or the LLM_* env fallback); `webllm` (in-browser,
- *  no server) is planned but disabled for now. Defaults to `external` to preserve the
- *  existing env-configured behaviour. */
-export type AiMode = 'off' | 'webllm' | 'external';
+/** How LLM directory summaries are provided. `off` disables it entirely; `local` runs a
+ *  Qwen model on this machine via a sidecar-spawned llama-server (private, no network — the
+ *  user downloads the model from Settings); `external` uses the credentials in
+ *  {@link llmConfig} (or the LLM_* env fallback). Defaults to `local` — private summaries
+ *  out of the box. */
+export type AiMode = 'off' | 'local' | 'external';
 function persistedStr<T extends string>(key: string, def: T) {
 	let initial = def;
 	try {
@@ -847,7 +849,17 @@ function persistedStr<T extends string>(key: string, def: T) {
 	});
 	return store;
 }
-export const aiMode = persistedStr<AiMode>('archifiltre-ai-mode', 'external');
+export const aiMode = persistedStr<AiMode>('archifiltre-ai-mode', 'local');
+
+/** Which local (Qwen) model the `local` AI mode uses. Must be one of the ids the sidecar
+ *  advertises via the `model_status` query (see local-llm.ts). Defaults to the balanced
+ *  1.5B. The model file is downloaded on demand from Settings › AI. */
+export const localModel = persistedStr<string>('archifiltre-local-model', 'qwen2.5-1.5b');
+
+/** The app-global LLM host's model state — set ONLY from the host's own `llm:state`
+ *  events (mirrored by $lib/llm-describe), never guessed UI-side: 'loading' while the
+ *  one-time load runs, 'ready' once resident, 'idle' when unknown. Session-only. */
+export const llmModelState = writable<'idle' | 'loading' | 'ready'>('idle');
 
 // ================================
 // Scan Actions

@@ -4,27 +4,25 @@
  * The "External" LLM provider ({@link ./llm-client.ts}) posts to a remote
  * OpenAI-compatible endpoint. This module gives the same feature *local and
  * private*: the user downloads a Qwen2.5 GGUF to `~/.archifiltre/models/`, and
- * inference runs IN-PROCESS via a private stdio helper — NO server, NO port
- * (see {@link ./local-engine.ts}). This file owns the model catalogue, the
- * download, the on-device backend preference, and fetching the `af-infer`
- * inference-helper bundle.
+ * inference runs IN-PROCESS via a private stdio helper — NO server, NO port,
+ * NO separate Node runtime (see {@link ./local-engine.ts} + the `llm-helper`
+ * command). This file owns the model catalogue, the download, and the on-device
+ * backend preference.
  *
  * Design notes:
  *   - The big model file is only ever fetched by an explicit user action
  *     ({@link downloadModel}); describing a folder never silently pulls GBs.
- *   - The `af-infer` helper bundle (portable node + node-llama-cpp) is fetched
- *     lazily on first use ({@link ensureInferenceHelper}) and extracted with
- *     fflate — no system `unzip`/`tar`.
+ *   - The inference runtime (node-llama-cpp) is bundled next to the sidecar at
+ *     install (like the sidecar itself) and runs under Bun — nothing fetched.
  *   - Diagnostics log to the FILE logger (never stdout — the sidecar's stdout
  *     is the JSON-lines protocol; a stray line breaks the transport).
  */
 
 import { createWriteStream } from 'node:fs';
 import { mkdir, rename, stat, readdir, chmod, rm, writeFile } from 'node:fs/promises';
-import { readFileSync, existsSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { platform, arch } from 'node:os';
-import { unzipSync } from 'fflate';
 import { getGlobalConfigManager } from '@lib/config.ts';
 import { logger } from '@lib/logging.ts';
 
@@ -408,90 +406,4 @@ export async function rememberBackend(backend: Backend): Promise<void> {
 export function localBackendIsGpu(): boolean {
   const b = readBackendPref();
   return b === 'vulkan' || b === 'metal';
-}
-
-// === Local inference helper bundle ===
-// The on-device model no longer runs as a `llama-server` on a TCP port. Inference now happens
-// IN-PROCESS via a private stdio helper — see `local-engine.ts` (`generateLocal`). No server, no
-// listening socket. The helper needs a real Node runtime (Bun segfaults on node-llama-cpp's N-API
-// addon), so it ships as a self-contained `af-infer` bundle (portable node + node_modules + the
-// helper script), JIT-fetched to `~/.archifiltre/bin/` and extracted with fflate — NO system
-// `unzip`/`tar` (which aren't guaranteed on Windows).
-
-/** Bump deliberately (a reviewed change), like the llama.cpp tag — the asset below must exist. */
-const INFER_HELPER_VERSION = 'v1';
-const INFER_HELPER_HOST = 'https://REDACTED';
-
-function inferAssetName(): string {
-  const os = platform() === 'win32' ? 'win' : platform() === 'darwin' ? 'macos' : 'linux';
-  return `af-infer-${os}-${arch()}-${INFER_HELPER_VERSION}`;
-}
-
-/** Where the extracted `af-infer` bundle lives. `AF_INFER_DIR` overrides it (dev / a pre-placed bundle). */
-export function inferenceHelperDir(): string {
-  return process.env.AF_INFER_DIR || join(binDir(), inferAssetName());
-}
-
-/**
- * Ensure the `af-infer` bundle (portable node + node_modules + `helper.mjs`) is on disk, fetching
- * + extracting it on first use. Returns the node binary + helper script paths.
- * @throws {DownloadError} on a network failure (categorized, like model downloads).
- */
-export async function ensureInferenceHelper(): Promise<{ node: string; script: string; dir: string }> {
-  const dir = inferenceHelperDir();
-  const nodeBin = join(dir, platform() === 'win32' ? 'node.exe' : 'node');
-  const script = join(dir, 'helper.mjs');
-  if (existsSync(nodeBin) && existsSync(script)) return { node: nodeBin, script, dir };
-  if (process.env.AF_INFER_DIR) {
-    throw new Error(`Inference helper bundle incomplete at AF_INFER_DIR=${dir} (need node + helper.mjs).`);
-  }
-
-  const url = `${INFER_HELPER_HOST}/${inferAssetName()}.zip`;
-  logger.info('inference helper: fetching', { url });
-  await mkdir(dir, { recursive: true });
-
-  // Fetch with the stall watchdog + categorized errors (same plumbing as model downloads).
-  const guard = stallGuard();
-  guard.arm();
-  let res: Response;
-  try {
-    res = await fetch(url, { signal: guard.signal });
-  } catch (err) {
-    guard.clear();
-    throw failDownload('inference helper download', { url }, err);
-  }
-  if (!res.ok || !res.body) {
-    guard.clear();
-    const category: DownloadErrorCategory = res.status === 407 ? 'proxy-auth' : 'http-status';
-    throw failDownload('inference helper download', { url, status: res.status }, new DownloadError(`HTTP ${res.status}`, category, res.status));
-  }
-  const chunks: Uint8Array[] = [];
-  try {
-    for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
-      chunks.push(chunk);
-      guard.arm();
-    }
-  } catch (err) {
-    guard.clear();
-    throw failDownload('inference helper download', { url }, err);
-  }
-  guard.clear();
-
-  // Extract with fflate — pure JS, bundles into the compiled sidecar, no system unzip/tar.
-  const zipBytes = Buffer.concat(chunks);
-  logger.info('inference helper: extracting', { bytes: zipBytes.length });
-  const files = unzipSync(new Uint8Array(zipBytes));
-  for (const [name, data] of Object.entries(files)) {
-    if (name.endsWith('/')) continue;
-    const dest = join(dir, name);
-    await mkdir(dirname(dest), { recursive: true });
-    await writeFile(dest, data);
-  }
-  if (platform() !== 'win32') await chmod(nodeBin, 0o755).catch(() => {});
-
-  if (!existsSync(nodeBin) || !existsSync(script)) {
-    throw new Error('inference helper bundle incomplete after extraction.');
-  }
-  logger.info('inference helper: ready', { dir });
-  return { node: nodeBin, script, dir };
 }

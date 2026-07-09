@@ -25,8 +25,11 @@
 		setProvisionalTree,
 		clearProvisionalTree,
 		resourceStats,
-		isDiscovering
+		isDiscovering,
+		aiMode,
+		localModel
 	} from '$lib/stores';
+	import { initLlmDescribe } from '$lib/llm-describe';
 	import {
 		healthCheck,
 		getVersion,
@@ -43,6 +46,8 @@
 		formatBytes,
 		useOwnerDb,
 		validatePath,
+		warmLocalModel,
+		isTransientSessionError,
 		type TreeData,
 		type ScanStats
 	} from '$lib/tauri';
@@ -90,8 +95,22 @@
 	// Initialization
 	// ================================
 
+	// Eager warm of THE app-global LLM host: load the on-device model at launch (and re-load on
+	// model change) when local AI is on, so the FIRST summary of the session is already warm
+	// (~1 s to first word) instead of a ~10 s cold model load. This only REQUESTS the load —
+	// the truthful state (loading/ready + the queue) is emitted by the host itself and mirrored
+	// by $lib/llm-describe, never guessed here.
+	$effect(() => {
+		const mode = $aiMode;
+		const model = $localModel;
+		if (mode === 'local' && model) void warmLocalModel(model);
+	});
+
 	onMount(async () => {
 		try {
+			// The summary subsystem's state owner: mirrors the host's llm:state events and runs
+			// the declarative root-summary rules (see $lib/llm-describe).
+			unlisteners.push(await initLlmDescribe());
 			// Single job-update listener handles scan, checksum, and export events
 			unlisteners.push(
 				await onJobUpdate((event) => {
@@ -273,8 +292,6 @@
 	// to one load, and auto-retry the transient owner-handoff errors that a manual Retry
 	// clears — belt-and-suspenders behind the real fix (unique request ids in sendQuery).
 	let vizLoadInFlight: string | null = null;
-	const TRANSIENT_VIZ_ERROR =
-		/session closed before responding|session not alive|No active session|request timed out/i;
 
 	async function loadVisualizationData(dbName: string, scanId: string): Promise<void> {
 		if (vizLoadInFlight === scanId) return; // a load for this scan is already running
@@ -356,7 +373,7 @@
 			}
 			// Transient owner-handoff errors self-heal on retry (exactly what the manual Retry
 			// does). Retry a few times with a short backoff before surfacing the error banner.
-			if (TRANSIENT_VIZ_ERROR.test(String(error)) && attempt < 3 && loadedForScanId === scanId) {
+			if (isTransientSessionError(error) && attempt < 3 && loadedForScanId === scanId) {
 				await new Promise((r) => setTimeout(r, 150 * (attempt + 1)));
 				if (loadedForScanId === scanId)
 					return await loadVisualizationAttempt(dbName, scanId, attempt + 1);
@@ -447,6 +464,15 @@
 		useOwnerDb() ? (liveTreeDb === activeScanDb ? liveTree : null) : $activeProvisionalTree
 	);
 
+	// The tree the chart shows, spanning scanning → complete as ONE stream: prefer the settled
+	// tree, fall back to the live scanning tree. This lets a SINGLE StalactiteChart instance live
+	// across the completion transition — the same instance that already absorbs each live poll
+	// tick just absorbs the final tree as one more data change, so completion no longer tears the
+	// chart down and remounts it (which flashed a skeleton + replayed its entry animation). The
+	// live tree stays on screen through the brief settled-load, so there is never a blank gap.
+	let vizScanning = $derived($activeScan?.state === 'scanning');
+	let displayTree = $derived(treeData ?? scanningTree);
+
 	// Poll get_tree for the ACTIVE scanning tab. Guards against stale results: a poll
 	// that was in flight for a tab we've since left (or that has finished) is DISCARDED,
 	// so switching between two live scans never blinks the previous tab's graph in.
@@ -476,8 +502,11 @@
 	$effect(() => {
 		const db = activeScanDb; // re-run on tab switch
 		if (!ownerScanning || !db) {
-			liveTree = null;
-			liveTreeDb = undefined;
+			// Stop polling, but do NOT clear the last live tree: on scan COMPLETION it stays on
+			// screen as the bridge (displayTree = treeData ?? scanningTree) until the settled tree
+			// loads, so the chart never blanks between the two. Cross-tab staleness is already
+			// prevented by scanningTree's `liveTreeDb === activeScanDb` guard — a left-behind tree
+			// is never shown for a different tab.
 			return;
 		}
 		void pollLiveTree();
@@ -752,52 +781,46 @@
 		<div class="flex h-full items-center justify-center p-8">
 			<DropZone onStartAnalysis={handleStartAnalysis} disabled={false} class="max-w-3xl" />
 		</div>
-	{:else if $activeScan?.state === 'scanning'}
-		<!-- Scanning: the icicle grows live from streamed directory aggregates and is
-		     navigable as it builds; an always-present details panel (auto-opened on the
-		     scan root) fills the bottom so there's never an empty void. The panel shows
-		     the stream-known fields (size/counts, live) and skeletons everything that
-		     needs the DB until completion. Until the first snapshot arrives, a chart-area
-		     skeleton stands in (no blocking splash). Progress is in the status bar. -->
-		{#if scanningTree}
-			<div class="flex h-full flex-col">
+	{:else if $activeScan?.state === 'scanning' || $activeScan?.state === 'complete' || $activeScan?.state === 'paused'}
+		<!-- Scanning, complete and paused share ONE chart instance (see displayTree): the icicle
+		     grows live during the scan and then, at completion, just absorbs the settled tree as
+		     one more data change — no teardown, no skeleton flash, no re-animation. The Tree/Flat
+		     lenses eager-load files per directory and aren't built for data that churns mid-scan,
+		     so they stay gated to the stalactite while scanning; the view toggle applies once the
+		     tree is stable (paused/complete). Progress is in the status bar. -->
+		<div class="flex h-full flex-col">
+			{#if displayTree}
 				<div
-					class="flex min-h-0 flex-col overflow-hidden p-4 pb-0"
+					class="flex min-h-0 flex-col overflow-hidden pb-0 {vizScanning || $viewMode === 'stalactite'
+						? 'p-4'
+						: 'px-4 pt-0'}"
 					class:animate-pulse={$isDiscovering}
 					style:flex={$selectedItem || $hoveredItem ? '0 0 38.2%' : '1 1 0%'}
 				>
-					<!-- The icicle is the LIVE lens: it absorbs the partial tree growing every
-					     poll tick gracefully. The Tree/Flat lenses eager-load files per directory
-					     and aren't built for data that churns mid-scan, so they stay gated until
-					     the tree is stable (paused/complete) — see the colour/view toggles. -->
-					<StalactiteChart
-						data={scanningTree}
-						provisional={!useOwnerDb()}
-						onGoHome={selectScanningRoot}
-						class="h-full w-full"
-					/>
+					{#if vizScanning || $viewMode === 'stalactite'}
+						<StalactiteChart
+							data={displayTree}
+							provisional={vizScanning && !useOwnerDb()}
+							onGoHome={vizScanning ? selectScanningRoot : selectRoot}
+							class="h-full w-full"
+						/>
+					{:else if $viewMode === 'tree'}
+						<ListView data={displayTree} class="h-full w-full" />
+					{:else}
+						<ListView data={displayTree} class="h-full w-full" />
+					{/if}
 				</div>
+
+				<!-- File/Folder Details Panel. Owner mode reads live DB data even mid-scan. -->
 				{#if $selectedItem || $hoveredItem}
-					<!-- Owner mode: the DB is live-readable during the scan, so the panel
-					     queries real data instead of skeletons. -->
-					<FileDetailsPanel onGoHome={selectScanningRoot} onNavigate={navigateToPath} rootName={scanRootName} />
+					<FileDetailsPanel
+						onGoHome={vizScanning ? selectScanningRoot : selectRoot}
+						onNavigate={navigateToPath}
+						rootName={vizScanning ? scanRootName : rootDisplayName}
+					/>
 				{/if}
-			</div>
-		{:else}
-			<SkeletonIcicle class="h-full" />
-		{/if}
-	{:else if $activeScan?.state === 'complete' || $activeScan?.state === 'paused'}
-		<!-- Complete OR paused: both show the (full / partial) visualization from the DB.
-		     A paused scan's tree is the frozen partial — browseable, with Continue in the
-		     status bar resuming the un-enumerated remainder. -->
-		<!-- Analysis Complete State with Visualization -->
-		<div class="flex h-full flex-col">
-			{#if isLoadingVisualization}
-				<!-- Same skeleton as the scanning chart — consistent loading affordance
-				     everywhere, never a separate spinner. -->
-				<SkeletonIcicle class="h-full" />
-			{:else if visualizationError}
-				<!-- Visualization error -->
+			{:else if !vizScanning && visualizationError}
+				<!-- Settled load failed and there's no live tree to keep showing → recoverable error. -->
 				<div class="flex h-full flex-col items-center justify-center gap-6 p-8">
 					<div
 						class="flex h-24 w-24 items-center justify-center rounded-full bg-yellow-500/20 text-yellow-500"
@@ -823,30 +846,10 @@
 						</Button>
 					</div>
 				</div>
-			{:else if treeData}
-				<!-- Visualization + details, split top-to-bottom. The chart is the finder,
-				     the panel the workspace, so when the panel is open the split follows the
-				     golden ratio: chart ~38.2% (top), panel ~61.8% (bottom). With no selection
-				     the chart fills the height. -->
-				<div
-					class="flex min-h-0 flex-col overflow-hidden pb-0 {$viewMode === 'stalactite'
-						? 'p-4'
-						: 'px-4 pt-0'}"
-					style:flex={$selectedItem || $hoveredItem ? '0 0 38.2%' : '1 1 0%'}
-				>
-					{#if $viewMode === 'stalactite'}
-						<StalactiteChart data={treeData} onGoHome={selectRoot} class="h-full w-full" />
-					{:else if $viewMode === 'tree'}
-						<ListView data={treeData} class="h-full w-full" />
-					{:else}
-						<ListView data={treeData} class="h-full w-full" />
-					{/if}
-				</div>
-
-				<!-- File/Folder Details Panel with Picker -->
-				{#if $selectedItem || $hoveredItem}
-					<FileDetailsPanel onGoHome={selectRoot} onNavigate={navigateToPath} rootName={rootDisplayName} />
-				{/if}
+			{:else}
+				<!-- No tree yet (before the first live snapshot, or a fresh settled load with no
+				     live tree in hand) — the same skeleton everywhere, never a separate spinner. -->
+				<SkeletonIcicle class="h-full" />
 			{/if}
 		</div>
 	{:else if $activeScan?.state === 'error'}

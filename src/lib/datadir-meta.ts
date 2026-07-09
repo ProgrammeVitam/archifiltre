@@ -45,18 +45,34 @@ export async function writeDatadirMeta(meta: Omit<DatadirMeta, 'version' | 'upda
   const dest = datadirMetaPath(meta.dbName);
   const full: DatadirMeta = { version: META_VERSION, updatedAt: Math.floor(Date.now() / 1000), ...meta };
   const tmp = `${dest}.tmp`;
+  const body = JSON.stringify(full, null, 2);
   try {
     await fs.mkdir(path.dirname(dest), { recursive: true });
     const fh = await fs.open(tmp, 'w');
     try {
-      await fh.writeFile(JSON.stringify(full, null, 2));
+      await fh.writeFile(body);
       await fh.sync();
     } finally {
       await fh.close();
     }
     await fs.rename(tmp, dest);
   } catch (error) {
-    logger.warn('Datadir meta write failed', { dbName: meta.dbName, error: (error as Error).message });
+    // The tmp→rename dance can fail on locked-down Windows boxes — e.g. antivirus briefly
+    // locks or removes the freshly written .tmp, so the rename hits ENOENT (seen in the field).
+    // Fall back to a direct, non-atomic write so the meta still lands for reconciliation.
+    try {
+      await fs.writeFile(dest, body);
+      await fs.rm(tmp, { force: true }).catch(() => {});
+    } catch (fallbackError) {
+      // Truly can't write (e.g. the datadir was concurrently discarded) — best-effort, so we
+      // only warn, never throw. Include the errno codes so it stays diagnosable.
+      logger.warn('Datadir meta write failed', {
+        dbName: meta.dbName,
+        code: (error as NodeJS.ErrnoException).code,
+        error: (error as Error).message,
+        fallbackError: (fallbackError as Error).message,
+      });
+    }
   }
 }
 

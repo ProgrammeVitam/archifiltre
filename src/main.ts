@@ -25,6 +25,7 @@ import Logs from './commands/logs.ts';
 import Query from './commands/query.ts';
 import Session from './commands/session.ts';
 import Datadirs from './commands/datadirs.ts';
+import LlmHelper from './commands/llm-helper.ts';
 import { getAppDataDir } from '@lib/platform-paths.ts';
 
 // Import extension-declared commands
@@ -41,6 +42,7 @@ const CORE_COMMANDS: Record<string, typeof Command> = {
   query: Query,
   session: Session,
   datadirs: Datadirs,
+  'llm-helper': LlmHelper,
 };
 
 // Merged command registry: core + extension-declared commands
@@ -102,7 +104,7 @@ class StandaloneConfig extends Config {
 
     // Configure oclif paths to use our app data directory structure
     Object.defineProperty(this, 'name', { value: 'archifiltre', writable: false });
-    Object.defineProperty(this, 'version', { value: '5.0.0-dev', writable: false });
+    Object.defineProperty(this, 'version', { value: '5.0.0-alpha.3', writable: false });
     Object.defineProperty(this, 'bin', { value: 'archifiltre', writable: false });
     Object.defineProperty(this, 'root', { value: appDataDir, writable: false });
     Object.defineProperty(this, 'dataDir', { value: dataPath, writable: false });
@@ -120,7 +122,7 @@ class StandaloneConfig extends Config {
     Object.defineProperty(this, 'pjson', {
       value: {
         name: 'archifiltre',
-        version: '5.0.0-dev',
+        version: '5.0.0-alpha.3',
         description:
           'Privacy-friendly, 100% offline desktop tool for inventorying large file trees',
         oclif: {
@@ -218,7 +220,7 @@ function showHelp(commandName?: string) {
       }
     }
   } else {
-    console.log(`Archifiltre v5.0.0-dev
+    console.log(`Archifiltre v5.0.0-alpha.3
 Privacy-friendly, 100% offline file tree inventory tool
 
 USAGE
@@ -293,6 +295,23 @@ function parseArgs(argv: string[]) {
  * Main entry point
  */
 async function main() {
+  // node-llama-cpp validates a prebuilt binary by fork()-ing THIS executable to run its
+  // `testBindingBinary.js` helper (marked by env TEST_BINDING_CP=true, module path in argv[1],
+  // IPC on process.send). In the compiled sidecar there is no `node <file>` — argv[1] would be
+  // parsed as an unknown CLI command and the test would "fail", making nlc fall back to compiling
+  // llama.cpp from source. Instead, import that helper so its self-exec IPC guard runs and the
+  // test genuinely passes (letting the prebuilt load, with GPU where available).
+  if (process.env.TEST_BINDING_CP === 'true') {
+    // In a compiled binary the embedded entry is argv[1]; the forked module path is the first user
+    // arg (argv[2]+). Import the file nlc handed us (its testBindingBinary.js) so its IPC guard runs.
+    const mod = process.argv.slice(1).find((a) => /\.(mjs|cjs|js)$/i.test(a) && fs.existsSync(a));
+    if (mod) {
+      const { pathToFileURL } = await import('node:url');
+      await import(pathToFileURL(mod).href);
+    }
+    return; // the helper's guard drives IPC and calls process.exit itself
+  }
+
   try {
     const { command, args, globalFlags, isHelp, isVersion } = parseArgs(process.argv.slice(2));
 

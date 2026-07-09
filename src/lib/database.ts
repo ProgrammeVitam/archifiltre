@@ -857,31 +857,121 @@ export function cleanDatabase(
 }
 
 /**
- * Insert batch of files
+ * Make a string safe for a Postgres `text` column: Postgres text cannot hold a NUL byte, and
+ * a lone/unpaired UTF-16 surrogate encodes to invalid UTF-8 and is rejected on the wire. Both
+ * occur in the wild in archive-entry names read from truncated/corrupt archives — and a single
+ * such value would otherwise reject the whole multi-row insert. Replace with U+FFFD rather than
+ * drop, so the row still lands (a mangled name beats a stranded scan). No-op for clean strings.
+ */
+export function sanitizeDbText<T extends string | null | undefined>(s: T): T {
+  if (s == null || (typeof s === 'string' && s.length === 0)) return s;
+  let out = s as string;
+  if (out.indexOf('\x00') >= 0) out = out.replace(/\x00/g, '�');
+  // Unpaired high or low surrogate → invalid UTF-8 on encode.
+  if (/[\uD800-\uDFFF]/.test(out)) {
+    out = out.replace(
+      /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+      '�'
+    );
+  }
+  return out as T;
+}
+
+/** Pull the REAL cause out of a Drizzle/PGlite error (the underlying Postgres message —
+ *  `invalid byte sequence…`, `value too long…`), not Drizzle's giant `Failed query: <SQL>`
+ *  wrapper. Trimmed so a 2 MB SQL dump never lands in the logs. */
+function pgCause(err: unknown): string {
+  const e = err as { cause?: unknown; message?: string } | undefined;
+  const c = e?.cause as { message?: string } | string | undefined;
+  const msg = (typeof c === 'string' ? c : c?.message) ?? e?.message ?? String(err);
+  return msg.length > 300 ? msg.slice(0, 300) + '…' : msg;
+}
+
+/** Outcome of a (possibly-salvaged) batch insert: which rows durably committed, and which were
+ *  quarantined (a poison row we chose to skip rather than let it strand the whole batch). */
+export interface BatchInsertResult {
+  committed: FileRow[];
+  skipped: Array<{ row: FileRow; cause: string }>;
+}
+
+/**
+ * Insert `rows` in ONE transaction; on a deterministic failure, bisect and retry each half so a
+ * single poison row can't reject hundreds of good ones. Each level retries once first to ride out
+ * a transient blip (PGlite is in-process, so failures are almost always deterministic data). A
+ * single row that still fails is quarantined (recorded, not written). Recursion depth is O(log n).
+ */
+async function insertRowsSalvaging(
+  connection: DatabaseConnection,
+  rows: FileRow[]
+): Promise<BatchInsertResult> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await connection.db.transaction(async tx => {
+        await tx.insert(files).values(rows).onConflictDoNothing();
+      });
+      return { committed: rows, skipped: [] };
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  const cause = pgCause(lastErr);
+  if (rows.length === 1) {
+    logger.warn('row quarantined: insert failed (unsalvageable single row)', {
+      cause,
+      path: rows[0].path,
+      isDir: rows[0].is_directory,
+      isArchiveContainer: rows[0].is_archive_container ?? false,
+    });
+    return { committed: [], skipped: [{ row: rows[0], cause }] };
+  }
+  logger.warn('batch insert failed; bisecting to salvage good rows', {
+    cause,
+    size: rows.length,
+    firstPath: rows[0].path,
+    lastPath: rows[rows.length - 1].path,
+  });
+  const mid = rows.length >> 1;
+  const a = await insertRowsSalvaging(connection, rows.slice(0, mid));
+  const b = await insertRowsSalvaging(connection, rows.slice(mid));
+  return { committed: [...a.committed, ...b.committed], skipped: [...a.skipped, ...b.skipped] };
+}
+
+/**
+ * Insert a batch of files, salvaging good rows around any poison ones (see
+ * {@link insertRowsSalvaging}). Returns which rows committed vs. were skipped so the caller can
+ * keep its counts + frontier accounting exact — a failed row is skipped, never a stranded scan.
  */
 export function insertFileBatch(
   connection: DatabaseConnection,
   fileRows: FileRow[]
-): Observable<number> {
-  if (!fileRows.length) return of(0);
+): Observable<BatchInsertResult> {
+  if (!fileRows.length) return of({ committed: [], skipped: [] });
 
   return defer(() => {
     logger.debug('Inserting file batch', { count: fileRows.length });
-
-    return from(
-      connection.db.transaction(async tx => {
-        // Insert the batch
-        await tx.insert(files).values(fileRows).onConflictDoNothing();
-
-        // Since onConflictDoNothing doesn't return meaningful rowCount,
-        // we return the batch size as approximation (like ArchiScan does)
-        return fileRows.length;
-      })
-    ).pipe(
-      tap(inserted => logger.debug('Files inserted', { inserted, attempted: fileRows.length })),
+    return from(insertRowsSalvaging(connection, fileRows)).pipe(
+      tap(r => {
+        if (r.skipped.length) {
+          logger.warn('batch salvage: rows quarantined', {
+            committed: r.committed.length,
+            skipped: r.skipped.length,
+          });
+        } else {
+          logger.debug('Files inserted', { inserted: r.committed.length });
+        }
+      }),
       catchError(error => {
-        logger.error('Failed to insert file batch', error as Error, { count: fileRows.length });
-        return of(0);
+        // insertRowsSalvaging catches per-row; reaching here means the recursion itself threw
+        // unexpectedly. Treat the whole batch as skipped so the pipeline continues, never crashes.
+        logger.error('Failed to insert file batch (salvage threw)', error as Error, {
+          count: fileRows.length,
+          cause: pgCause(error),
+        });
+        return of<BatchInsertResult>({
+          committed: [],
+          skipped: fileRows.map(row => ({ row, cause: pgCause(error) })),
+        });
       })
     );
   });

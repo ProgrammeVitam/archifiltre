@@ -30,6 +30,26 @@ export type {
   DirectoryDescriptionSelect,
 } from '@extensions/ai-describe/schema.ts';
 
+// === The describe gate — ONE policy, called by every path ===
+//
+// Both the in-owner engine (CLI/external/bridge) and the split host path (leg 1) apply the
+// SAME two rules; they used to carry copy-pasted `if (scanning && ...)` checks. Centralised
+// here so the policy lives in one testable place (the frontend engine reads the same intent
+// via the host's backend flag).
+
+/** Mid-scan, on-device inference on a CPU starves the walk/hash (they fight for cores) — so a
+ *  local summary is deferred to scan-complete UNLESS a GPU backend is proven (GPU work leaves
+ *  the CPU free). External is a cheap network call, always allowed. */
+export function shouldDeferMidScan(scanning: boolean, provider?: 'local' | 'external'): boolean {
+  return scanning && provider === 'local' && !localBackendIsGpu();
+}
+
+/** A summary is cached only when it came from the fully-ingested DB after the scan: a mid-scan
+ *  or filesystem-fallback prompt is a partial view, so it must regenerate (and cache) post-scan. */
+export function isCacheable(fromFilesystem: boolean, scanning: boolean): boolean {
+  return !fromFilesystem && !scanning;
+}
+
 // === Table Initialization ===
 
 /**
@@ -161,12 +181,9 @@ export async function handleDescribeDirectory(
       return { description: cached.description, model: cached.model, cached: true };
     }
 
-    // 2b. Running the on-device model on the CPU during a scan starves the walk/hash (they
-    //     fight for cores) — that once killed the scan. So mid-scan we only run local inference
-    //     when a GPU backend is proven: GPU work doesn't touch the CPU the scan needs, so the
-    //     summary streams in alongside the walk (via the filesystem-fallback prompt below).
-    //     No GPU → defer to scan-complete; external is a cheap network call and always allowed.
-    if (scanning && override?.provider === 'local' && !localBackendIsGpu()) {
+    // 2b. Mid-scan gate (see shouldDeferMidScan): CPU inference during a scan starves the walk,
+    //     so a local summary defers to scan-complete unless a GPU backend is proven.
+    if (shouldDeferMidScan(scanning, override?.provider)) {
       return { description: null, error: 'scan-in-progress' };
     }
 
@@ -240,7 +257,7 @@ export async function handleDescribeDirectory(
     // 8. Persist for future cache hits — but NEVER a mid-scan summary (whether it came from the
     //    filesystem fallback or a still-partial DB tree): leave it uncached so the post-scan pass
     //    regenerates it from the full tree (real subtree sizes/dates) and caches that instead.
-    if (!fromFilesystem && !scanning) {
+    if (isCacheable(fromFilesystem, scanning)) {
       await saveDescription(db, runId, dirPath, aiResult.description, aiResult.model, override?.lang);
     }
 
@@ -250,6 +267,94 @@ export async function handleDescribeDirectory(
     const message = error instanceof Error ? error.message : String(error);
     return { description: null, error: message };
   }
+}
+
+// === Split describe (app-global LLM host) ===
+//
+// The app runs inference in ONE Rust-owned `llm-helper` process shared by every scan (warm model,
+// no per-owner reload). The owner keeps the DB-side halves as two thin actions:
+//   describe_prepare  → cache check + mid-scan gate + prompt build   (leg 1)
+//   (the app then generates on the host — leg 2)
+//   store_description → persist the generated text for cache hits    (leg 3)
+// `handleDescribeDirectory` above stays intact for the CLI/bridge (standalone, in-owner engine)
+// and for the external provider path.
+
+export interface DescribePrepared {
+  /** Cache hit — the summary, done (no generation needed). */
+  cached?: { description: string; model: string };
+  /** Cache miss — generate with these. */
+  system?: string;
+  prompt?: string;
+  /** Whether the app may store the generated result (false mid-scan / FS-fallback prompts —
+   *  those must regenerate post-scan from the full tree, never be cached). */
+  cacheable?: boolean;
+  /** The prompt was built from an incomplete source (the on-disk readdir fallback, used when
+   *  the walker hasn't inserted this folder's children yet) — so the summary is provisional
+   *  and must be regenerated from the full tree at completion. When false, a mid-scan summary
+   *  is already authoritative: the app can keep it as-is and just persist it (no regenerate). */
+  provisional?: boolean;
+  /** Deferred (mid-scan on a CPU backend) — retry at scan completion, as today. */
+  error?: string;
+}
+
+/**
+ * Leg 1 of the split describe: cache lookup, the mid-scan gate, and prompt building.
+ * Mirrors steps 1–4 of {@link handleDescribeDirectory} exactly.
+ */
+export async function handleDescribePrepare(
+  db: DatabaseConnection,
+  runId: string,
+  dirPath: string,
+  override?: { provider?: 'local' | 'external'; lang?: string },
+  scanning = false
+): Promise<DescribePrepared> {
+  await ensureDescriptionTable(db);
+
+  const cached = await getCachedDescription(db, runId, dirPath, override?.lang);
+  if (cached) return { cached };
+
+  // Same gate as handleDescribeDirectory (see shouldDeferMidScan).
+  if (shouldDeferMidScan(scanning, override?.provider)) {
+    return { error: 'scan-in-progress' };
+  }
+
+  let treeString: string | undefined;
+  let statsBlock: string | undefined;
+  let fromFilesystem = false;
+  if (scanning && (await queryDirectChildren(db, runId, dirPath)).length === 0) {
+    const rootPath = await getScanRootPath(db, runId);
+    if (rootPath) {
+      treeString = await buildTreeStringFromFs(rootPath, dirPath);
+      statsBlock = await buildStatsBlockFromFs(rootPath, dirPath);
+      fromFilesystem = true;
+    }
+  }
+  if (!fromFilesystem) {
+    treeString = await buildTreeString(db, runId, dirPath);
+    statsBlock = await buildStatsBlock(db, runId, dirPath);
+  }
+
+  return {
+    system: systemPromptForLang(override?.lang),
+    prompt: buildPrompt(treeString!, statsBlock!, override?.lang),
+    cacheable: isCacheable(fromFilesystem, scanning),
+    provisional: fromFilesystem,
+  };
+}
+
+/**
+ * Leg 3 of the split describe: persist a host-generated summary for future cache hits.
+ * The app only calls this when leg 1 said `cacheable` (mid-scan results stay uncached).
+ */
+export async function handleStoreDescription(
+  db: DatabaseConnection,
+  runId: string,
+  dirPath: string,
+  body: { description: string; model: string; lang?: string }
+): Promise<{ stored: boolean }> {
+  await ensureDescriptionTable(db);
+  await saveDescription(db, runId, dirPath, body.description, body.model, body.lang);
+  return { stored: true };
 }
 
 /** The scanned root's absolute path (files are stored relative to it), or null if the

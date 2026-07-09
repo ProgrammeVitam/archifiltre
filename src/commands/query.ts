@@ -31,7 +31,20 @@ import {
   type ScanStats,
 } from '@lib/database.ts';
 import { eq, and, like, isNotNull, sql, desc, gt, asc } from 'drizzle-orm';
-import { handleDescribeDirectory } from '@extensions/ai-describe/index.ts';
+import {
+  handleDescribeDirectory,
+  handleDescribePrepare,
+  handleStoreDescription,
+} from '@extensions/ai-describe/index.ts';
+import { warmLocal } from '@extensions/ai-describe/local-engine.ts';
+import {
+  LOCAL_MODELS,
+  DEFAULT_LOCAL_MODEL,
+  isModelDownloaded,
+  downloadModel,
+  getLocalModel,
+  DownloadError,
+} from '@extensions/ai-describe/local-llm.ts';
 import { handleGetThumbnail, handleStoreThumbnail } from '@extensions/file-thumbnails/index.ts';
 import {
   handleSetDeleteTag,
@@ -781,6 +794,64 @@ async function handleGetComposition(
  * the single-owner `session` sidecar so both expose exactly the same read/enrich
  * surface over one connection.
  */
+/** Report which local (Qwen) models exist on disk, for the Settings picker. */
+async function handleModelStatus(): Promise<unknown> {
+  const models = await Promise.all(
+    LOCAL_MODELS.map(async (m) => ({
+      id: m.id,
+      label: m.label,
+      family: m.family,
+      tier: m.tier,
+      note: m.note,
+      size: m.size,
+      license: m.license,
+      downloaded: await isModelDownloaded(m.id),
+    }))
+  );
+  return { models, default: DEFAULT_LOCAL_MODEL };
+}
+
+/**
+ * Download a local model to `~/.archifiltre/models/`, streaming progress to the
+ * UI as `model:download` event lines (forwarded via the job-update channel).
+ * Resolves with the on-disk path when complete.
+ */
+async function handleDownloadModel(id: string): Promise<unknown> {
+  if (!getLocalModel(id)) throw new Error(`Unknown local model: ${id}`);
+  let lastEmit = 0;
+  try {
+    const path = await downloadModel(id, (p) => {
+      // Throttle to ~10/s so we don't flood the protocol channel.
+      const now = Date.now();
+      if (now - lastEmit < 100 && p.received < p.total) return;
+      lastEmit = now;
+      process.stdout.write(
+        `${JSON.stringify({ event: 'model:download', model: id, received: p.received, total: p.total, file: p.file })}\n`
+      );
+    });
+    process.stdout.write(
+      `${JSON.stringify({ event: 'model:download', model: id, received: 1, total: 1, file: 'done', done: true })}\n`
+    );
+    return { id, path, downloaded: true };
+  } catch (err) {
+    // Emit a final error event so the UI can show *why* (cert / dns / firewall / proxy / disk)
+    // instead of a bar silently stuck at 0. The categorized detail is already in the file log.
+    const category = err instanceof DownloadError ? err.category : 'unknown';
+    process.stdout.write(
+      `${JSON.stringify({ event: 'model:download', model: id, error: { category, message: (err as Error).message } })}\n`
+    );
+    throw err;
+  }
+}
+
+/**
+ * Pre-load the local model so the first describe is warm (~0.7 s) not cold (~9 s). Fired by the UI
+ * when local-AI mode is active (e.g. on scan start) — cheap and idempotent; loads in the background.
+ */
+async function handleWarmModel(id: string): Promise<unknown> {
+  return warmLocal(id || DEFAULT_LOCAL_MODEL);
+}
+
 export async function dispatchQuery(
   database: DatabaseConnection,
   runId: string,
@@ -843,9 +914,40 @@ export async function dispatchQuery(
         database,
         runId,
         (request.path as string) ?? '',
-        request.llm as { baseUrl?: string; apiKey?: string; model?: string } | undefined,
+        request.llm as
+          | {
+              provider?: 'local' | 'external';
+              baseUrl?: string;
+              apiKey?: string;
+              model?: string;
+              lang?: string;
+              streamId?: string;
+            }
+          | undefined,
         scanning
       );
+    // Split describe for the app-global LLM host: the owner does the DB halves (cache +
+    // gate + prompt, then the cache write); generation runs on the host (Rust-owned).
+    case 'describe_prepare':
+      return await handleDescribePrepare(
+        database,
+        runId,
+        (request.path as string) ?? '',
+        request.llm as { provider?: 'local' | 'external'; lang?: string } | undefined,
+        scanning
+      );
+    case 'store_description':
+      return await handleStoreDescription(database, runId, (request.path as string) ?? '', {
+        description: (request.description as string) ?? '',
+        model: (request.model as string) ?? 'unknown',
+        lang: request.lang as string | undefined,
+      });
+    case 'model_status':
+      return await handleModelStatus();
+    case 'warm_model':
+      return await handleWarmModel((request.model as string) ?? '');
+    case 'download_model':
+      return await handleDownloadModel((request.model as string) ?? '');
     case 'get_thumbnail':
       return await handleGetThumbnail(database, runId, (request.path as string) ?? '');
     case 'store_thumbnail':

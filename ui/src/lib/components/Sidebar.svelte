@@ -34,16 +34,22 @@
 		class?: string;
 	} = $props();
 
+	// Scans whose delete is in flight — the row stays visible with a "Removing…" state until
+	// the datadir is actually gone, so a slow/failed delete doesn't silently reappear later.
+	let deletingIds = $state(new Set<string>());
+
 	function handleNewScan() {
 		scansStore.addScan();
 	}
 
 	function handleSelectScan(scanId: string) {
+		if (deletingIds.has(scanId)) return; // don't select a row that's being removed
 		scansStore.setActiveScan(scanId);
 	}
 
-	function handleDeleteScan(e: MouseEvent, scan: Scan) {
+	async function handleDeleteScan(e: MouseEvent, scan: Scan) {
 		e.stopPropagation();
+		if (deletingIds.has(scan.id)) return;
 
 		if (scan.state === 'scanning' || scan.state === 'paused') {
 			if (!confirm('A scan is in progress. Closing it stops the scan and deletes it. Continue?')) {
@@ -55,10 +61,18 @@
 			}
 		}
 
-		// Close = discard: stop the owner's scan AND delete its datadir so closed scans
-		// don't orphan databases on disk. Fire-and-forget; the tab is removed immediately.
-		if (scan.path && scan.dbName) void deleteDatabase(scan.dbName);
-		scansStore.closeScan(scan.id);
+		// Close = discard: stop the owner's scan AND delete its datadir. Keep the row (showing
+		// "Removing…") until the delete round-trip returns, THEN drop it — so a slow delete gives
+		// feedback and the datadir is gone before the tab disappears (no silent resurrection).
+		deletingIds = new Set(deletingIds).add(scan.id);
+		try {
+			if (scan.path && scan.dbName) await deleteDatabase(scan.dbName);
+		} finally {
+			scansStore.closeScan(scan.id);
+			const next = new Set(deletingIds);
+			next.delete(scan.id);
+			deletingIds = next;
+		}
 	}
 
 	// Tab status icon doubles as a resume control: hovering the paused ⏸ flips to ▶.
@@ -152,9 +166,11 @@
 			{@const Icon = getStateIcon(scan.state)}
 			{@const stateClass = getStateClass(scan.state)}
 			{@const iconClass = getStateIconClass(scan.state)}
+			{@const deleting = deletingIds.has(scan.id)}
 			<div
 				class="scan-item"
 				class:active={scan.id === $activeScanId}
+				class:deleting
 				onclick={() => handleSelectScan(scan.id)}
 				onkeydown={(e) => e.key === 'Enter' && handleSelectScan(scan.id)}
 				role="button"
@@ -175,10 +191,16 @@
 						<Icon size={16} class={iconClass} />
 					</span>
 				{/if}
-				<span class="scan-name">{scan.name}</span>
-				<button class="delete-btn" onclick={(e) => handleDeleteScan(e, scan)} title={$_('common.deleteScan')}>
-					<Trash2Icon size={14} />
-				</button>
+				<span class="scan-name">{deleting ? $_('common.removingScan') : scan.name}</span>
+				{#if deleting}
+					<span class="delete-btn" title={$_('common.removingScan')}>
+						<Loader2Icon size={14} class="animate-spin" />
+					</span>
+				{:else}
+					<button class="delete-btn" onclick={(e) => handleDeleteScan(e, scan)} title={$_('common.deleteScan')}>
+						<Trash2Icon size={14} />
+					</button>
+				{/if}
 			</div>
 		{/each}
 	</div>
@@ -361,6 +383,12 @@
 		margin-bottom: 4px;
 	}
 
+	.scan-item.deleting {
+		opacity: 0.55;
+		pointer-events: none;
+		font-style: italic;
+	}
+
 	.scan-item:hover {
 		background-color: var(--background);
 	}
@@ -421,6 +449,11 @@
 
 	.scan-item:hover .delete-btn {
 		opacity: 0.6;
+	}
+
+	/* The "Removing…" spinner must stay visible even though the row has pointer-events: none. */
+	.scan-item.deleting .delete-btn {
+		opacity: 0.9;
 	}
 
 	.delete-btn:hover {

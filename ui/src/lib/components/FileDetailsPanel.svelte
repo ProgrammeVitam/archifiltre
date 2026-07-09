@@ -10,17 +10,17 @@
 		scanPhase,
 		isDiscovering,
 		activeScan,
-		panelTab
+		panelTab,
+		aiMode
 	} from '$lib/stores';
+	import { selectedSummary } from '$lib/llm-describe';
 	import * as Tabs from '$lib/components/ui/tabs';
 	import { Skeleton } from '$lib/components/ui/skeleton';
 	import { _, locale } from '$lib/i18n';
 	import { fmtBytes, fmtNum, fmtDate } from '$lib/format';
 	import {
-		queryDirectoryDescription,
 		queryDirDateStats,
 		queryComposition,
-		type DirectoryDescription,
 		type DirDateStats,
 		type CompositionEntry,
 		setDeleteTag,
@@ -71,10 +71,9 @@
 	import FilePreview from './FilePreview.svelte';
 	import RootSummary from './RootSummary.svelte';
 
-	// AI description state
-	let aiDescription: DirectoryDescription | null = $state(null);
-	let isLoadingDescription = $state(false);
-	let lastDescribedPath: string | null = $state(null);
+	// The folder summary is DRIVEN ELSEWHERE: $lib/llm-describe is the sole describe engine
+	// (proactive root + reactive selection, per-target state, host-queued). This panel only
+	// renders `$selectedSummary` for the selected sub-folder — no describe call of its own.
 
 	// Directory date stats state
 	let dirDateStats: DirDateStats | null = $state(null);
@@ -385,26 +384,6 @@
 		return crumbs;
 	});
 
-	// Fetch AI description when a directory is selected
-	$effect(() => {
-		const item = $selectedItem;
-		if (item && item.type === 'directory' && item.path !== lastDescribedPath) {
-			lastDescribedPath = item.path;
-			isLoadingDescription = true;
-			aiDescription = null;
-			queryDirectoryDescription(item.path).then((result) => {
-				if (lastDescribedPath === item.path) {
-					aiDescription = result;
-					isLoadingDescription = false;
-				}
-			});
-		} else if (!item || item.type !== 'directory') {
-			aiDescription = null;
-			isLoadingDescription = false;
-			lastDescribedPath = null;
-		}
-	});
-
 	// Fetch date stats + subtree aggregate (size/counts) for the displayed directory (hover
 	// preview included). Skipped while the walk is still ingesting — the aggregate would be
 	// partial — and re-fetched the instant the structure is ready (reads `structureReady`, so
@@ -691,31 +670,47 @@
 				{:else if displayItem.type === 'directory'}
 					<!-- Directory: AI description -->
 					<div class="flex w-1/2 shrink-0 flex-col border-r border-border bg-muted/20 p-6">
-						{#if lastDescribedPath !== displayItem.path}
-							<!-- Hover preview: the AI summary stays load-on-select (no LLM call
-							     per hover), so show a hint rather than another item's summary. -->
+						{#if isPreview}
+							<!-- Hover preview: the summary is load-on-select (no LLM call per hover),
+							     so show a hint rather than the selected folder's summary. -->
 							<p class="flex-1 text-sm text-muted-foreground/40 italic">
 								{$_('details.selectFolderHint')}
 							</p>
-						{:else if isLoadingDescription}
+						{:else if $selectedSummary.streamingText}
+							<!-- Tokens streaming in from the on-device model (via the describe engine) -->
+							<p class="flex-1 leading-relaxed text-foreground">
+								{$selectedSummary.streamingText}<span class="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-foreground/50"></span>
+							</p>
+						{:else if $selectedSummary.status === 'generating'}
 							<div class="flex flex-1 items-center gap-2 text-sm text-muted-foreground">
 								<LoaderCircleIcon class="h-4 w-4 animate-spin" />
-								<span>{$_('details.analyzing')}</span>
+								<!-- Honest wait states: model loading (one-time), queued behind another
+								     summary, or genuinely analyzing. Never an anonymous spinner. -->
+								<span>
+									{$_(
+										$selectedSummary.modelLoading
+											? 'details.modelLoading'
+											: $selectedSummary.waiting
+												? 'details.waitingTurn'
+												: 'details.analyzing'
+									)}
+								</span>
 							</div>
-						{:else if aiDescription?.description}
+						{:else if $selectedSummary.text}
 							<div class="flex flex-1 flex-col">
 								<p class="leading-relaxed text-foreground">
-									{aiDescription.description}
+									{$selectedSummary.text}
 								</p>
-								{#if aiDescription.model}
+								{#if $selectedSummary.model}
 									<p class="mt-auto pt-4 text-xs text-muted-foreground/60">
-										{$_('root.summarizedBy')}
-										{aiDescription.model}{aiDescription.cached ? ' · ' + $_('details.cached') : ''}
+										{$_($aiMode === 'external' ? 'details.summarizedExternal' : 'details.summarizedLocally')}
+									·
+										{$selectedSummary.model}{$selectedSummary.cached ? ' · ' + $_('details.cached') : ''}
 									</p>
 								{/if}
 							</div>
-						{:else if aiDescription?.error}
-							<p class="text-sm text-muted-foreground/60 italic">{aiDescription.error}</p>
+						{:else if $selectedSummary.status === 'error'}
+							<p class="text-sm text-muted-foreground/60 italic">{$_('details.summaryUnavailable')}</p>
 						{:else}
 							<p class="text-sm text-muted-foreground/40 italic">{$_('details.noDescription')}</p>
 						{/if}

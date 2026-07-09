@@ -1,7 +1,7 @@
 {
 	"$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
 	"productName": "Archifiltre",
-	"version": "5.0.0",
+	"version": "5.0.0-alpha.3",
 	"identifier": "fr.gouv.culture.archifiltre",
 	"build": {
 		"frontendDist": "../build",

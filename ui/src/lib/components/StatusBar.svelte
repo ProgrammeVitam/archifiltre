@@ -8,7 +8,8 @@
 		isDiscovering,
 		resourceStats,
 		resumeScanningScan,
-		requestPauseScanningScan
+		requestPauseScanningScan,
+		aiMode
 	} from '$lib/stores';
 	import { smoothFilesDiscovered, smoothFilesHashed } from '$lib/scan-counters';
 	import { pauseScan, resumeScan, useOwnerDb } from '$lib/tauri';
@@ -20,8 +21,15 @@
 		CircleAlertIcon,
 		CpuIcon,
 		PauseIcon,
-		PlayIcon
+		PlayIcon,
+		ShieldCheckIcon,
+		GlobeIcon
 	} from '@lucide/svelte';
+
+	// Privacy provenance for the whole session. The scan + all analysis is on-device; the LLM
+	// summary is the one thing that leaves the machine — and only when the provider is External.
+	// So the chip is mode-aware: it never claims "nothing leaves" while External is selected.
+	let external = $derived($aiMode === 'external');
 
 	// Completed-scan stats are computed in +page.svelte (it has the query stats),
 	// so they're passed in; everything else comes from the stores.
@@ -195,20 +203,34 @@
 		<span class="whitespace-nowrap">{$fmtBytes(totalSize)}</span>
 	{/if}
 
-	<!-- Live resource telemetry from the single-owner session (owner mode), right-
-	     aligned. Shows the scan's CPU/mem and whether the governor is throttling. -->
-	{#if $resourceStats && $resourceStats.scanning}
-		<span class="ml-auto flex items-center gap-1.5 whitespace-nowrap tabular-nums">
-			<CpuIcon class="h-3 w-3" />
-			<span>{$resourceStats.cpuPct}%</span>
-			<span class="text-[8px] opacity-40">{sep}</span>
-			<span>{$resourceStats.rssMB} MB</span>
-			{#if $resourceStats.budget < 1}
+	<!-- Right side: live scan telemetry (owner mode, while scanning) + the persistent privacy
+	     chip. Grouped so the privacy chip stays pinned right in every state. -->
+	<div class="ml-auto flex items-center gap-2">
+		{#if $resourceStats && $resourceStats.scanning}
+			<span class="flex items-center gap-1.5 whitespace-nowrap tabular-nums">
+				<CpuIcon class="h-3 w-3" />
+				<span>{$resourceStats.cpuPct}%</span>
 				<span class="text-[8px] opacity-40">{sep}</span>
-				<span class="text-[var(--color-warning,#d97706)]"
-					>{$_('status.throttled')} {Math.round($resourceStats.budget * 100)}%</span
-				>
-			{/if}
-		</span>
-	{/if}
+				<span>{$resourceStats.rssMB} MB</span>
+				{#if $resourceStats.budget < 1}
+					<span class="text-[8px] opacity-40">{sep}</span>
+					<span class="text-[var(--color-warning,#d97706)]"
+						>{$_('status.throttled')} {Math.round($resourceStats.budget * 100)}%</span
+					>
+				{/if}
+			</span>
+			<span class="text-[8px] opacity-40">{sep}</span>
+		{/if}
+		{#if external}
+			<span class="flex items-center gap-1.5 whitespace-nowrap" title={$_('status.privacyExternalHint')}>
+				<GlobeIcon class="h-3 w-3" />
+				<span>{$_('status.privacyExternal')}</span>
+			</span>
+		{:else}
+			<span class="flex items-center gap-1.5 whitespace-nowrap" title={$_('status.privacyOnDeviceHint')}>
+				<ShieldCheckIcon class="h-3 w-3" />
+				<span>{$_('status.privacyOnDevice')}</span>
+			</span>
+		{/if}
+	</div>
 </div>

@@ -36,8 +36,10 @@ import { findDuplicateSizes, files } from '@lib/database.ts';
 import type { PipelineContext } from '@lib/pipeline-context.ts';
 import { eq, and, count, isNull, inArray, sql } from 'drizzle-orm';
 
-import { readFileContent, type FileEntry } from '@lib/file-reader.ts';
+import { createFileStream, type FileEntry } from '@lib/file-reader.ts';
 import { pausable } from '@lib/pausable.ts';
+import { createXXHash64 } from 'hash-wasm';
+import type { Readable } from 'node:stream';
 
 // Hash calculation configuration
 export interface HashConfig {
@@ -83,15 +85,31 @@ export const DEFAULT_HASH_CONFIG: Required<
 };
 
 /**
- * Calculate xxhash64 for a buffer
- * Uses @node-rs/xxhash for optimal performance with buffer-based hashing
+ * Stream a file's bytes through incremental, standard xxHash64 (hash-wasm).
+ *
+ * Only the hasher's small internal state plus the current chunk are held in memory,
+ * so peak RAM is O(chunk) regardless of file size. This is what prevents the whole-file
+ * buffering (`fs.readFile` of every candidate) that used to OOM the duplicate-detection
+ * phase on multi-GB files. hash-wasm inlines its WASM as base64, so it bundles cleanly
+ * under `bun build --compile` on every target — no external .wasm to ship.
+ *
+ * Note: seed 0 yields the STANDARD XXH64 value (portable across tools/machines), unlike
+ * the previous `Bun.hash(buffer, 'xxhash64')` which silently computed one-shot wyhash.
  */
-function calculateBufferHash(buffer: Uint8Array): string {
-  // Use Bun's native xxh64 - fastest and cross-platform!
-  // Cast to work around Bun's incomplete type definitions
-  const hash = Bun.hash(buffer, 'xxhash64' as unknown as undefined);
-  // Convert BigInt to hex string with consistent 16-character padding
-  return hash.toString(16).padStart(16, '0');
+async function hashStream(stream: Readable): Promise<string> {
+  const hasher = await createXXHash64();
+  hasher.init();
+  try {
+    for await (const chunk of stream) {
+      hasher.update(chunk as Uint8Array);
+    }
+  } finally {
+    // Release the fd promptly on the error path (for-await consumes it on success);
+    // under concurrency a leaked descriptor per failed file adds up.
+    const s = stream as Readable & { destroyed?: boolean };
+    if (!s.destroyed) s.destroy();
+  }
+  return hasher.digest('hex'); // 16-char hex, matches the DB `hash` column
 }
 
 /**
@@ -115,8 +133,11 @@ function hashSingleFile(rootPath: string, fileEntry: FileHashEntry): Observable<
         });
       }
 
-      const buffer = await readFileContent(rootPath, entry);
-      const hash = calculateBufferHash(buffer);
+      // Stream the bytes through the hasher — never materialise the whole file.
+      // createFileStream gives a native fs stream for regular files (the OOM path)
+      // and a bounded, already-extracted buffer stream for archive entries.
+      const stream = await createFileStream(rootPath, entry);
+      const hash = await hashStream(stream);
 
       return {
         path: fileEntry.path,

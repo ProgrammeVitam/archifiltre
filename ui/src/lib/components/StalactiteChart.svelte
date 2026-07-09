@@ -168,6 +168,7 @@
 		untrack(() => {
 			// leaving 'aggregate' (or turning the lens off) drops any engaged lens
 			if ($lensMode !== 'aggregate') lensEngaged = false;
+			if (lensFocusX !== null) ensureLensRaf(); // ease out if the lens just stopped being live
 			if (!ctx || canvasWidth === 0 || !data) return;
 			computeLayout();
 			updateCanvasHeight();
@@ -272,12 +273,12 @@
 	const MIN_REVEAL_PX = 3;
 
 	// ── Magnification lens ──────────────────────────────────────────────────────
-	// A horizontal fisheye centred on the cursor: it expands the region under the
-	// pointer (compressing the rest) so a dense folder's long tail of tiny items
-	// becomes readable/clickable — and, because the fold decision below uses the
-	// LENS-magnified on-screen width, aggregates unfold live as you sweep across
-	// them. It's a display-space transform (screen px → screen px), independent of
-	// zoom/pan, so it composes with both. Toggleable in Settings → Appearance.
+	// A horizontal Gaussian fisheye centred on the cursor that expands the region you point at
+	// (compressing the rest) so a dense folder's long tail of tiny items becomes
+	// readable/clickable — and, because the fold decision below uses the LENS-magnified
+	// on-screen width, aggregates unfold live as you sweep across them. It's a display-space
+	// transform (screen px → screen px), independent of zoom/pan, so it composes with both.
+	// Toggleable in Settings → Appearance.
 	//
 	// `lensFocusX` is the cursor's x in canvas CSS px, or null when the lens is
 	// inactive (pointer outside, dragging a pan, or the setting is off) — in which
@@ -290,6 +291,15 @@
 	// True when the lens should currently distort: 'always' whenever the cursor is on the
 	// chart, 'aggregate' only while engaged, never when 'off'.
 	let lensLive = $derived($lensMode === 'always' || ($lensMode === 'aggregate' && lensEngaged));
+	// Whenever the lens stops being live (mode change, Esc, a zoom dropping the engaged group),
+	// kick the tick so `lensT` eases back to 0 and the magnification melts out — no matter which
+	// site flipped it off.
+	$effect(() => {
+		lensLive;
+		untrack(() => {
+			if (!lensLive && lensFocusX !== null) ensureLensRaf();
+		});
+	});
 	// Canvas cursor: grabbing while panning; a magnifier over a folded "+N" in 'aggregate'
 	// mode (so it reads as "click to open"); otherwise grab/default per pannability.
 	let canvasCursor = $derived.by(() => {
@@ -303,8 +313,13 @@
 	// (below) give a strong, localised bump that can push sub-pixel items past the
 	// MIN_REVEAL floor so a hovered aggregate actually unfolds under the cursor.
 	const LENS_AMPLITUDE = 12;
+	// Engagement 0→1, eased every frame so the lens melts in on enter and
+	// smoothly relaxes back to the true proportional row on leave (see lensTick). Blended
+	// into the map so `t·kernel + (1-t)·identity`; a plain `let` (not $state) because the tick
+	// loop drives computeLayout/render manually.
+	let lensT = 0;
 	// Cache the built map: rebuilding the Gaussian integral every mousemove is cheap,
-	// but the map only changes when the focus or viewport width changes.
+	// but the map only changes when the focus, viewport width, style or engagement changes.
 	let _lensKey = '';
 	let _lensMap: (x: number) => number = (x) => x;
 	let _lensInv: (x: number) => number = (x) => x;
@@ -326,13 +341,19 @@
 
 	/** Rebuild (if needed) and return the current lens as {map, inv}. The fisheye acts only
 	 *  within [lo, hi] (the focused folder's span) and is the identity outside it — so the
-	 *  zoomed folder's borders are fixed points and just its interior magnifies. */
+	 *  zoomed folder's borders are fixed points and just its interior magnifies. The built map
+	 *  is blended with the identity by the eased engagement `lensT`, so it melts in/out. */
 	function getLens(): { map: (x: number) => number; inv: (x: number) => number } {
 		const dpr = window.devicePixelRatio || 1;
 		const vw = canvasWidth / dpr;
-		const active = lensLive && lensFocusX !== null && !dragged && vw > 0;
+		// Stay active while easing out (lensT > 0) even after the pointer left, so the relaxation
+		// animates rather than snapping.
+		const active = lensFocusX !== null && lensT > 0.001 && !dragged && vw > 0;
 		const [lo, hi] = active ? lensDomain(vw) : [0, vw];
-		const key = active ? `${Math.round(lensFocusX!)}|${Math.round(lo)}|${Math.round(hi)}` : 'off';
+		const e = active ? lensT * lensT * (3 - 2 * lensT) : 0; // smoothstep ease
+		const key = active
+			? `${Math.round(lensFocusX!)}|${Math.round(lo)}|${Math.round(hi)}|${Math.round(e * 60)}`
+			: 'off';
 		if (key === _lensKey) return { map: _lensMap, inv: _lensInv };
 		_lensKey = key;
 		if (!active) {
@@ -340,38 +361,35 @@
 			_lensInv = (x) => x;
 			return { map: _lensMap, inv: _lensInv };
 		}
-		// Gaussian density g(x) = 1 + amp·exp(-(x-focus)²/2σ²); the displayed position is its
-		// normalised cumulative integral over [lo, hi], so the axis stretches near the focus
-		// and compresses away from it while the span's width is preserved (monotonic,
-		// invertible, endpoints pinned to lo/hi).
 		const span = hi - lo;
-		const focus = Math.max(lo, Math.min(hi, lensFocusX!)); // pin the bump inside the span
-		// A tight bump (relative to the span) keeps the peak magnification high after
-		// normalisation, so the lens core reads as a real magnifier rather than a gentle swell.
-		const sigma = Math.min(120, Math.max(38, span * 0.05));
+
+		// Width-preserving Gaussian fisheye centred on the cursor (direct, single-pass).
 		const S = 512;
 		const dx = span / S;
 		const xs = new Float64Array(S + 1);
 		const M = new Float64Array(S + 1);
+		for (let i = 0; i <= S; i++) xs[i] = lo + i * dx;
+		const focus = Math.max(lo, Math.min(hi, lensFocusX!));
+		const sigma = Math.min(120, Math.max(38, span * 0.05));
 		const g = (x: number) => 1 + LENS_AMPLITUDE * Math.exp(-((x - focus) ** 2) / (2 * sigma * sigma));
 		let acc = 0;
 		let prev = g(lo);
-		xs[0] = lo;
 		M[0] = 0;
 		for (let i = 1; i <= S; i++) {
-			const x = lo + i * dx;
-			const gx = g(x);
+			const gx = g(xs[i]);
 			acc += ((gx + prev) * 0.5) * dx;
 			prev = gx;
-			xs[i] = x;
 			M[i] = acc;
 		}
 		const total = acc || 1;
-		for (let i = 0; i <= S; i++) M[i] = lo + (M[i] / total) * span; // maps [lo,hi] → [lo,hi]
+		for (let i = 0; i <= S; i++) M[i] = lo + (M[i] / total) * span;
+		// blend toward identity by the eased engagement, so it melts in and out
+		if (e < 1) for (let i = 0; i <= S; i++) M[i] = xs[i] + (M[i] - xs[i]) * e;
+
 		_lensMap = (x: number) => {
-			if (x <= lo || x >= hi) return x; // identity outside the focused folder's frame
+			if (x <= lo || x >= hi) return x;
 			const t = (x - lo) / dx;
-			const i = Math.floor(t);
+			const i = Math.min(S - 1, Math.floor(t));
 			return M[i] + (M[i + 1] - M[i]) * (t - i);
 		};
 		_lensInv = (y: number) => {
@@ -1539,7 +1557,7 @@
 			const r = canvas.getBoundingClientRect();
 			lensFocusX = e.clientX - r.left;
 			pendingHover = e;
-			if (lensRaf === null) lensRaf = requestAnimationFrame(lensFrame);
+			ensureLensRaf();
 			return;
 		}
 
@@ -1570,19 +1588,46 @@
 
 	let lensRaf: number | null = null;
 	let pendingHover: PointerEvent | null = null;
-	function lensFrame() {
+	function ensureLensRaf() {
+		if (lensRaf === null) lensRaf = requestAnimationFrame(lensTick);
+	}
+	// One coalesced frame: ease the engagement `lensT` toward its target, apply any pending
+	// cursor move, re-fold under the (blended) lens and hit-test the fresh layout. Self-
+	// reschedules until the engagement settles — so entering melts the lens in and leaving
+	// smoothly relaxes it back to the true proportional row, rather than snapping.
+	function lensTick() {
 		lensRaf = null;
+		if (!canvas) {
+			lensT = 0;
+			return;
+		}
+		const target = lensLive && lensFocusX !== null && pointerInside && !dragged ? 1 : 0;
+		lensT += (target - lensT) * (target > lensT ? 0.28 : 0.16); // in a touch faster than out
+		const settled = Math.abs(lensT - target) < 0.004;
+		if (settled) lensT = target;
+
 		const e = pendingHover;
-		if (!e || !canvas) return;
-		// Re-fold under the lens, then hit-test against the fresh layout so hover lands on
-		// the block actually under the cursor (which may have just unfolded).
+		pendingHover = null;
 		computeLayout();
-		const { x, y } = toContent(e);
-		const hit = findRectAt(x, y);
-		const changed = hoverKey(hit) !== hoverKey(hoveredRect);
-		hoveredRect = hit;
-		render();
-		if (changed) emitHover(hit);
+		if (e) {
+			// Re-fold under the lens, then hit-test the fresh layout so hover lands on the block
+			// actually under the cursor (which may have just unfolded).
+			const { x, y } = toContent(e);
+			const hit = findRectAt(x, y);
+			const changed = hoverKey(hit) !== hoverKey(hoveredRect);
+			hoveredRect = hit;
+			render();
+			if (changed) emitHover(hit);
+		} else {
+			render();
+		}
+
+		if (!settled) ensureLensRaf();
+		else if (target === 0) {
+			lensFocusX = null; // fully relaxed → drop the focus so the map is a clean identity
+			computeLayout();
+			render();
+		}
 	}
 
 	// ── 'aggregate' lens mode: click a folded "+N" to engage the (folder-scoped) lens
@@ -1590,18 +1635,12 @@
 	function engageLens(rect: LayoutRect) {
 		lensFocusX = (rect.x + rect.width / 2) * zoom + panX; // centre the bump on the group
 		lensEngaged = true;
-		computeLayout(); // unfold it right away
-		render();
+		ensureLensRaf(); // ease the lens in and unfold under it
 	}
 	function releaseLens() {
 		if (!lensEngaged) return;
 		lensEngaged = false;
-		if (lensRaf !== null) {
-			cancelAnimationFrame(lensRaf);
-			lensRaf = null;
-		}
-		computeLayout(); // re-fold to the plain layout
-		render();
+		ensureLensRaf(); // ease smoothly back to the plain layout
 	}
 
 	function handlePointerUp(e: PointerEvent) {
@@ -1664,17 +1703,11 @@
 		pointerInside = false;
 		hoveredRect = null;
 		clearHoveredItem();
-		if (lensRaf !== null) {
-			cancelAnimationFrame(lensRaf);
-			lensRaf = null;
-		}
-		// Relax the magnification: drop the focus, release any engaged lens, and re-fold to
-		// the resting layout.
+		// Relax the magnification: release any engaged lens and let the tick ease `lensT` back
+		// to 0 (which then drops the focus), so the row melts back to true proportions rather
+		// than snapping.
 		lensEngaged = false;
-		if (lensFocusX !== null) {
-			lensFocusX = null;
-			computeLayout();
-		}
+		if (lensFocusX !== null) ensureLensRaf();
 		render();
 	}
 

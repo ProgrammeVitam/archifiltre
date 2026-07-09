@@ -8,7 +8,8 @@
 	import { Button } from '$lib/components/ui/button/index.js';
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu/index.js';
 	import { extensionRegistry } from '$lib/extensions/registry';
-	import { settingsOpen, windowEffect, lensMode, type LensMode, icicleHeight, type IcicleHeight, llmConfig, type LlmConfig, aiMode, type AiMode } from '$lib/stores';
+	import { settingsOpen, windowEffect, lensMode, type LensMode, icicleHeight, type IcicleHeight, llmConfig, type LlmConfig, aiMode, type AiMode, localModel } from '$lib/stores';
+	import { getLocalModelStatus, downloadLocalModel, type LocalModelStatus } from '$lib/tauri';
 	import { exportLogsFlow } from '$lib/log-export';
 	import { _ } from '$lib/i18n';
 	import {
@@ -64,12 +65,96 @@
 	function updateLlm(field: keyof LlmConfig, value: string) {
 		llmConfig.update((c) => ({ ...c, [field]: value }));
 	}
-	// WebLLM (in-browser) is planned but disabled for now.
-	const aiModes: { id: AiMode; labelKey: string; disabled?: boolean }[] = [
+	// Local (on-device Qwen) is the default.
+	const aiModes: { id: AiMode; labelKey: string }[] = [
 		{ id: 'off', labelKey: 'settings.aiOff' },
-		{ id: 'webllm', labelKey: 'settings.aiWebllm', disabled: true },
+		{ id: 'local', labelKey: 'settings.aiLocal' },
 		{ id: 'external', labelKey: 'settings.aiExternal' }
 	];
+
+	// ── Local (Qwen): model catalogue + on-demand download ──
+	let localModels = $state<LocalModelStatus[]>([]);
+	let modelsLoaded = $state(false);
+	let downloading = $state<string | null>(null);
+	let downloadPct = $state(0);
+	let downloadError = $state<string | null>(null);
+	let defaultModel = $state('');
+
+	async function refreshLocalModels() {
+		const status = await getLocalModelStatus();
+		if (status) {
+			localModels = status.models;
+			defaultModel = status.default;
+			// Keep the chosen model valid; fall back to the sidecar's default.
+			if (!localModels.some((m) => m.id === $localModel)) localModel.set(status.default);
+		}
+		modelsLoaded = true;
+	}
+
+	// Load the catalogue the first time the LLM section is opened.
+	$effect(() => {
+		if (active === 'ai' && $aiMode === 'local' && !modelsLoaded) void refreshLocalModels();
+	});
+
+	function fmtSize(bytes: number): string {
+		return bytes >= 1e9 ? `${(bytes / 1e9).toFixed(1)} GB` : `${Math.round(bytes / 1e6)} MB`;
+	}
+
+	// The sidecar's model `note` is English-only; render a localized one keyed by the model's
+	// speed/quality tier, falling back to whatever the sidecar sent.
+	const TIER_NOTE_KEYS: Record<string, string> = {
+		fast: 'settings.aiNoteFast',
+		balanced: 'settings.aiNoteBalanced',
+		best: 'settings.aiNoteBest'
+	};
+	function modelNote(m: LocalModelStatus): string {
+		const key = TIER_NOTE_KEYS[m.tier];
+		return key ? $_(key) : m.note;
+	}
+
+	async function startDownload(id: string) {
+		downloading = id;
+		downloadPct = 0;
+		downloadError = null;
+		try {
+			const size = localModels.find((m) => m.id === id)?.size ?? 0;
+			const result = await downloadLocalModel(
+				id,
+				(p) => {
+					downloadPct = p.done ? 100 : Math.floor((p.received / p.total) * 100);
+				},
+				size
+			);
+			if (result.ok) {
+				localModel.set(id);
+				await refreshLocalModels();
+			} else {
+				downloadError = result.errorCategory ?? 'unknown';
+			}
+		} catch {
+			downloadError = 'unknown';
+		} finally {
+			downloading = null;
+		}
+	}
+
+	// Map a download-failure category to a specific, localized reason (falls back to generic).
+	const DL_ERROR_KEYS: Record<string, string> = {
+		'tls-cert': 'settings.aiDlErrTlsCert',
+		dns: 'settings.aiDlErrDns',
+		'connect-timeout': 'settings.aiDlErrConnect',
+		'proxy-auth': 'settings.aiDlErrProxy',
+		'http-status': 'settings.aiDlErrHttp',
+		disk: 'settings.aiDlErrDisk'
+	};
+	function downloadErrorMessage(cat: string | null): string {
+		const key = cat ? DL_ERROR_KEYS[cat] : null;
+		return key ? $_(key) : $_('settings.aiLocalDownloadError');
+	}
+	// Network-side failures share one "corporate network?" hint; disk/http/unknown don't.
+	function isNetworkError(cat: string | null): boolean {
+		return cat === 'tls-cert' || cat === 'dns' || cat === 'connect-timeout' || cat === 'proxy-auth';
+	}
 
 	const lensModes: { id: LensMode; labelKey: string; hintKey: string }[] = [
 		{ id: 'off', labelKey: 'settings.lensOff', hintKey: 'settings.lensOffHint' },
@@ -241,21 +326,17 @@
 							</div>
 						</div>
 					{:else if active === 'ai'}
-						<!-- Provider mode: Off / WebLLM (disabled) / External -->
+						<!-- Provider mode: Off / Local / External -->
 						<div class="flex items-center justify-between gap-4 rounded-lg border px-4 py-3">
 							<Label class="text-sm font-medium">{$_('settings.aiProvider')}</Label>
 							<div class="flex items-center gap-1 rounded-lg bg-muted p-0.5">
 								{#each aiModes as m (m.id)}
 									<button
 										type="button"
-										disabled={m.disabled}
-										title={m.disabled ? $_('settings.aiWebllmSoon') : ''}
-										onclick={() => !m.disabled && aiMode.set(m.id)}
+										onclick={() => aiMode.set(m.id)}
 										class="rounded-md px-2.5 py-1 text-xs transition-colors {$aiMode === m.id
 											? 'bg-background font-medium text-foreground shadow-sm'
-											: m.disabled
-												? 'cursor-not-allowed text-muted-foreground/40'
-												: 'text-muted-foreground hover:text-foreground'}"
+											: 'text-muted-foreground hover:text-foreground'}"
 									>
 										{$_(m.labelKey)}
 									</button>
@@ -263,7 +344,61 @@
 							</div>
 						</div>
 
-						{#if $aiMode === 'external'}
+						{#if $aiMode === 'local'}
+						<p class="text-xs text-muted-foreground">{$_('settings.aiLocalHint')}</p>
+						<div class="flex flex-col gap-2">
+							{#each localModels as m (m.id)}
+								<div
+									class="flex items-center justify-between gap-3 rounded-lg border px-4 py-3 {$localModel === m.id && m.downloaded ? 'border-primary/50 bg-primary/5' : ''}"
+								>
+									<div class="min-w-0 flex-1">
+										<div class="flex items-center gap-2">
+											<Label class="text-sm font-medium">{m.label}</Label>
+											<span class="text-[11px] text-muted-foreground">{fmtSize(m.size)} · {m.license}</span>
+											{#if m.id === defaultModel}
+												<span class="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">{$_('settings.aiRecommended')}</span>
+											{/if}
+										</div>
+										<p class="text-xs text-muted-foreground">{modelNote(m)}</p>
+									</div>
+									{#if downloading === m.id}
+										<div class="flex w-28 flex-col gap-1">
+											<div class="h-1.5 overflow-hidden rounded-full bg-muted">
+												<div class="h-full bg-primary transition-all" style="width: {downloadPct}%"></div>
+											</div>
+											<span class="text-right text-[11px] text-muted-foreground">{downloadPct}%</span>
+										</div>
+									{:else if m.downloaded}
+										{#if $localModel === m.id}
+											<span class="flex items-center gap-1 text-xs font-medium text-primary"
+												><CheckIcon class="size-3.5" /> {$_('settings.aiLocalActive')}</span
+											>
+										{:else}
+											<Button variant="outline" size="sm" onclick={() => localModel.set(m.id)}
+												>{$_('settings.aiLocalUse')}</Button
+											>
+										{/if}
+									{:else}
+										<Button
+											variant="outline"
+											size="sm"
+											disabled={downloading !== null}
+											onclick={() => startDownload(m.id)}>{$_('settings.aiLocalDownload')}</Button
+										>
+									{/if}
+								</div>
+							{/each}
+							{#if !modelsLoaded}
+								<p class="text-xs text-muted-foreground">{$_('settings.aiLocalLoading')}</p>
+							{/if}
+							{#if downloadError}
+								<p class="text-xs text-destructive">{downloadErrorMessage(downloadError)}</p>
+								{#if isNetworkError(downloadError)}
+									<p class="text-xs text-muted-foreground">{$_('settings.aiDlErrNetworkHint')}</p>
+								{/if}
+							{/if}
+						</div>
+						{:else if $aiMode === 'external'}
 						<p class="text-xs text-muted-foreground">{$_('settings.aiHint')}</p>
 						<div class="flex flex-col gap-4 rounded-lg border px-4 py-4">
 							<div class="flex flex-col gap-1.5">
