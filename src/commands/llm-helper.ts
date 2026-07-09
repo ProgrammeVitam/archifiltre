@@ -38,6 +38,10 @@ import {
   modelPath as localModelPath,
   rememberBackend,
 } from '@extensions/ai-describe/local-llm.ts';
+// The helper's `err()` writes to stderr, which the Rust host spawns with Stdio::null() → discarded.
+// Backend diagnostics must go to the winston FILE logger (console-off for this command, so it can't
+// corrupt the JSON protocol on stdout) to actually land in the exportable logs.
+import { logger as fileLog } from '@lib/logging.ts';
 
 export default class LlmHelper extends Command {
   static override description = 'Internal: on-device inference worker (stdio JSON-lines). Not for direct use.';
@@ -119,8 +123,27 @@ export default class LlmHelper extends Command {
       // `build: 'never'` = only ever load a shipped prebuilt; never invoke cmake/a compiler
       // (gov/offline machines have no toolchain). GPU variants that lack a prebuilt are skipped,
       // gracefully falling through to the CPU prebuilt.
-      llama = llama || (await getLlama({ gpu: g, build: 'never', logLevel: LlamaLogLevel.disabled }));
+      // Forward node-llama-cpp's own warnings to the FILE log so the REASON a GPU backend was
+      // refused (missing prebuilt, driver/init failure, no device…) is visible — previously
+      // logLevel was `disabled`, so a Vulkan→CPU fallback was silent and the CPU regression it
+      // causes was undiagnosable.
+      llama =
+        llama ||
+        (await getLlama({
+          gpu: g,
+          build: 'never',
+          logLevel: LlamaLogLevel.warn,
+          logger: (level: unknown, message: string) =>
+            fileLog.warn(`[node-llama-cpp:${String(level)}] ${message}`),
+        }));
       backend = (llama.gpu ?? false) as string | false;
+      // A GPU backend was requested but the runtime fell back to CPU → say so explicitly; the warnings above
+      // carry the why. This is the line to grep when "everything is slow" = stuck on CPU.
+      if (!backend && g !== false) {
+        fileLog.warn(
+          `GPU unavailable (requested gpu=${JSON.stringify(g)}) — running on CPU; see node-llama-cpp warnings above for the reason`
+        );
+      }
       // Persist the resolved backend so the owners' mid-scan gate (localBackendIsGpu) reads the
       // truth this host actually runs on. Fire-and-forget — never blocks a load.
       void rememberBackend(!backend ? 'cpu' : backend === 'metal' ? 'metal' : 'vulkan').catch(
@@ -129,7 +152,9 @@ export default class LlmHelper extends Command {
       model = await llama.loadModel({ modelPath });
       context = await model.createContext({ contextSize: 2048 });
       loadedPath = modelPath;
-      err(`loaded ${modelPath} in ${((performance.now() - t) / 1000).toFixed(2)}s (backend=${JSON.stringify(backend)})`);
+      const loadedMsg = `loaded ${modelPath} in ${((performance.now() - t) / 1000).toFixed(2)}s (backend=${JSON.stringify(backend)})`;
+      err(loadedMsg);
+      fileLog.info(`[llm-helper] ${loadedMsg}`); // to the FILE log so the resolved backend is diagnosable
     }
 
     /** Resolve a request's model to an on-disk GGUF path: absolute `modelPath` passes through

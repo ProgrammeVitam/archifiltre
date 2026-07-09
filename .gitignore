@@ -105,3 +105,4 @@ testfolder-*
 
 # WASM binaries (copied from node_modules)
 wasm_binaries/
+ai-summaries/

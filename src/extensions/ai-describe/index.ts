@@ -23,6 +23,10 @@ import {
   buildPrompt,
   systemPromptForLang,
 } from '@extensions/ai-describe/prompt.ts';
+import {
+  writeSummarySnapshot,
+  adoptSummaryFromSnapshot,
+} from '@extensions/ai-describe/summary-snapshot.ts';
 
 // Re-export schema types for consumers
 export type {
@@ -72,9 +76,40 @@ export async function ensureDescriptionTable(connection: DatabaseConnection): Pr
   await connection.pg.exec(`
     ALTER TABLE directory_descriptions ADD COLUMN IF NOT EXISTS lang TEXT
   `);
+  // A cheap signature of the folder's content at describe time (files/dirs/bytes). Lets a
+  // summary be safely re-adopted across a rescan/rebuild (new run_id) ONLY when the folder
+  // hasn't changed — the staleness gate for the durable summary snapshot.
+  await connection.pg.exec(`
+    ALTER TABLE directory_descriptions ADD COLUMN IF NOT EXISTS content_sig TEXT
+  `);
   await connection.pg.exec(`
     CREATE INDEX IF NOT EXISTS idx_directory_descriptions_run_id ON directory_descriptions (run_id)
   `);
+}
+
+/** A cheap, content-derived signature of a folder's subtree (files, dirs, total bytes) from the
+ *  files table — changes whenever the folder's content changes, so it gates whether a summary
+ *  from a previous run is still valid. Root ('') covers the whole scan. */
+export async function folderContentSig(
+  connection: DatabaseConnection,
+  runId: string,
+  dirPath: string
+): Promise<string> {
+  const where =
+    dirPath === ''
+      ? 'WHERE run_id = $1'
+      : 'WHERE run_id = $1 AND (path = $2 OR path LIKE $2 || \'/%\')';
+  const params = dirPath === '' ? [runId] : [runId, dirPath];
+  const r = await connection.pg.query<{ files: string; dirs: string; bytes: string }>(
+    `SELECT
+        COUNT(*) FILTER (WHERE is_directory = false) AS files,
+        COUNT(*) FILTER (WHERE is_directory = true)  AS dirs,
+        COALESCE(SUM(physical_size), 0)               AS bytes
+     FROM files ${where}`,
+    params
+  );
+  const row = r.rows[0];
+  return `${Number(row?.files ?? 0)}:${Number(row?.dirs ?? 0)}:${Number(row?.bytes ?? 0)}`;
 }
 
 // === Cache Operations ===
@@ -127,16 +162,21 @@ export async function saveDescription(
   lang?: string
 ): Promise<void> {
   const now = Math.floor(Date.now() / 1000);
+  const sig = await folderContentSig(db, runId, dirPath); // gate for cross-run re-adoption
   await db.pg.query(
-    `INSERT INTO directory_descriptions (run_id, path, description, model, lang, created_at)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO directory_descriptions (run_id, path, description, model, lang, created_at, content_sig)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT (run_id, path) DO UPDATE
        SET description = EXCLUDED.description,
            model       = EXCLUDED.model,
            lang        = EXCLUDED.lang,
-           created_at  = EXCLUDED.created_at`,
-    [runId, dirPath, description, model, (lang ?? 'en').slice(0, 2).toLowerCase(), now]
+           created_at  = EXCLUDED.created_at,
+           content_sig = EXCLUDED.content_sig`,
+    [runId, dirPath, description, model, (lang ?? 'en').slice(0, 2).toLowerCase(), now, sig]
   );
+  // Mirror to the durable, run-independent snapshot so the summary survives a rebuild (which
+  // mints a fresh db + run_id). Fire-and-forget — a snapshot failure never breaks the describe.
+  void writeSummarySnapshot(db, runId).catch(() => {});
 }
 
 // === Main Handler ===
@@ -312,6 +352,17 @@ export async function handleDescribePrepare(
 
   const cached = await getCachedDescription(db, runId, dirPath, override?.lang);
   if (cached) return { cached };
+
+  // Re-adopt a summary preserved across a rescan/rebuild (new run_id), but only if the folder's
+  // content is unchanged (the snapshot's stored signature == the current one). Avoids losing every
+  // summary — and the CPU regeneration cost — after a crash-recovery rebuild. Mid-scan the partial
+  // tree yields a different signature, so a stale summary is never adopted before completion.
+  const adoptRoot = await getScanRootPath(db, runId);
+  if (adoptRoot) {
+    const sig = await folderContentSig(db, runId, dirPath);
+    const adopted = await adoptSummaryFromSnapshot(db, runId, adoptRoot, dirPath, override?.lang, sig);
+    if (adopted) return { cached: adopted };
+  }
 
   // Same gate as handleDescribeDirectory (see shouldDeferMidScan).
   if (shouldDeferMidScan(scanning, override?.provider)) {
