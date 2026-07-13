@@ -1,59 +1,55 @@
-//! App-global LLM host — ONE `llm-helper` process for the whole app, with an EXPLICIT,
-//! OBSERVABLE state machine.
+//! App-global LLM host — ONE `llm-helper` process for the whole app, driven by a single
+//! SINGLE-OWNER WORKER ACTOR with an EXPLICIT, OBSERVABLE state machine.
 //!
 //! The on-device model (node-llama-cpp, in-process in the helper) costs ~10 s to load; the
 //! old per-owner engines each paid it. Owning a single helper here restores one-load-per-
 //! launch warmth — with no listening port and no orphan (killed on app exit).
 //!
-//! The state-machine part (why this file is more than a proxy): the host owns THE ONLY
-//! truthful picture of the summary subsystem — which model is resident, what is generating,
-//! what waits in line. It emits that picture as `llm:state` event lines on the UI's
-//! job-update stream at EVERY transition, so the UI renders state instead of guessing it
-//! (no more edge-triggered latches, silent queues, or lying "model loading" hints):
+//! Concurrency model (why this is an actor, not a shared-lock queue): every request is a
+//! message to ONE worker task that exclusively owns the helper process, the model state, and
+//! the queue. Serialization is therefore STRUCTURAL — there is no shared `Mutex<queue>` +
+//! `Notify` turn-arbitration to get wrong (an earlier version hand-rolled that and hit the
+//! classic lost-wakeup: a `notify_waiters()` firing between a waiter releasing the queue lock
+//! and registering its `notified()` future left the request parked until its 300 s deadline).
+//! The worker never blocks on inference — each generate runs in its own spawned task and
+//! reports back via a `Done` message — so a `cancel` is always processed promptly, even mid
+//! generation. State is emitted as `llm:state` event lines on the UI's job-update stream at
+//! every transition, so the UI renders state instead of guessing it:
 //!
 //!   model: unloaded → loading(id) → ready(id, backend)     (driven by helper replies)
 //!   queue: [{clientId, kind: user-describe|auto-describe|load, state: queued|active}]
 //!
-//! Scheduling rules:
-//!   • load/generate serialize on the queue (one context, one GPU); status/download bypass.
-//!   • A user describe PREEMPTS auto describes: it enters the line ahead of queued autos,
-//!     and an actively-generating auto is aborted (the helper's cancel path) — the UI's
-//!     declarative rules simply re-enqueue the auto later. The user never waits behind
-//!     background work.
-//!   • `{type:'cancel', clientId}` drops a queued request or aborts an active one — used
-//!     when the user clicks another folder (abandoned generations no longer hog the engine).
+//! Scheduling rules (enforced by the single worker):
+//!   • load/generate serialize (one context, one GPU); status/download/ping bypass the queue
+//!     and run concurrently (a long download must never block a describe).
+//!   • A user describe PREEMPTS auto describes: it enters ahead of queued autos, and an
+//!     actively-generating auto is cancelled on the helper — the UI's declarative rules
+//!     re-enqueue it. The user never waits behind background work.
+//!   • `{type:'cancel', clientId}` drops a queued request or cancels an active one on the
+//!     helper (its request then resolves `{ok:false, cancelled:true}`).
 //!
 //! Shape mirrors `owner.rs`: a background reader demuxes helper stdout to pending requests;
 //! streamed intermediates (`token`, `download`) forward to the job-update stream as the same
 //! event lines the owners used to emit. Tauri-agnostic (sink = closure) for unit tests.
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 /// Receives raw event-line JSON for the UI stream (same sink shape as `owner.rs`).
 pub type LlmEventSink = Arc<dyn Fn(String) + Send + Sync>;
 
+/// The live helper process + the reader that demuxes its stdout to pending requests.
 struct HostProc {
     stdin: Mutex<tokio::process::ChildStdin>,
     child: Mutex<tokio::process::Child>,
     pending: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Value>>>>,
     alive: Arc<AtomicBool>,
-}
-
-/// One request in the serialized lane. `queue[0]` with `active=true` is the one running.
-#[derive(Clone)]
-struct QEntry {
-    id: u64,
-    client_id: String,
-    kind: String, // "user-describe" | "auto-describe" | "load"
-    active: bool,
-    cancelled: bool,
 }
 
 #[derive(Clone)]
@@ -63,27 +59,67 @@ struct ModelInfo {
     backend: Option<Value>,
 }
 
+impl ModelInfo {
+    fn unloaded() -> Self {
+        ModelInfo {
+            state: "unloaded".into(),
+            id: None,
+            backend: None,
+        }
+    }
+}
+
+/// A serialized (load/generate) request waiting for its turn on the worker.
+struct Job {
+    id: u64,
+    client_id: String,
+    kind: String, // "user-describe" | "auto-describe" | "load"
+    sidecar: PathBuf,
+    req: Value,
+    sink: LlmEventSink,
+    timeout: Duration,
+    target_model: Option<String>,
+}
+
+/// The one currently-running serialized job.
+struct ActiveJob {
+    id: u64,
+    client_id: String,
+    kind: String,
+}
+
+/// Messages the worker actor processes on its single loop.
+enum Msg {
+    /// A frontend request routed in.
+    Request {
+        sidecar: PathBuf,
+        req: Value,
+        sink: LlmEventSink,
+        timeout: Duration,
+        reply: oneshot::Sender<Result<Value, String>>,
+    },
+    /// A spawned serialized job finished (the worker owns the reply + state transition).
+    Done {
+        id: u64,
+        result: Result<Value, String>,
+        target_model: Option<String>,
+        set_loading: bool,
+    },
+    /// Kill the helper and stop the worker.
+    Kill {
+        reply: oneshot::Sender<()>,
+    },
+}
+
+/// The public handle. Holds only a channel to the worker; the worker owns all the state.
 pub struct LlmHost {
-    proc: Mutex<Option<Arc<HostProc>>>,
-    queue: Arc<Mutex<Vec<QEntry>>>,
-    /// Woken on every queue mutation so waiting requests re-check their turn.
-    turn: Arc<Notify>,
-    model: Arc<Mutex<ModelInfo>>,
-    next_id: AtomicU64,
+    tx: Mutex<Option<mpsc::UnboundedSender<Msg>>>,
 }
 
 impl Default for LlmHost {
     fn default() -> Self {
         Self {
-            proc: Mutex::new(None),
-            queue: Arc::new(Mutex::new(Vec::new())),
-            turn: Arc::new(Notify::new()),
-            model: Arc::new(Mutex::new(ModelInfo {
-                state: "unloaded".into(),
-                id: None,
-                backend: None,
-            })),
-            next_id: AtomicU64::new(1),
+            tx: Mutex::new(None),
         }
     }
 }
@@ -101,10 +137,344 @@ fn llm_runtime_dir(sidecar: &Path) -> Option<PathBuf> {
 }
 
 impl LlmHost {
-    /// Spawn the helper if none is running (or the previous one died). Idempotent.
-    async fn ensure_proc(&self, sidecar: &Path) -> Result<Arc<HostProc>, String> {
-        let mut guard = self.proc.lock().await;
-        if let Some(p) = guard.as_ref() {
+    /// Get the worker's sender, spawning the worker if none is running (or the last died).
+    async fn sender(&self) -> mpsc::UnboundedSender<Msg> {
+        let mut guard = self.tx.lock().await;
+        if let Some(tx) = guard.as_ref() {
+            if !tx.is_closed() {
+                return tx.clone();
+            }
+        }
+        let (tx, rx) = mpsc::unbounded_channel::<Msg>();
+        let worker = Worker::new(rx, tx.clone());
+        tokio::spawn(worker.run());
+        *guard = Some(tx.clone());
+        tx
+    }
+
+    /// Send one request and await its resolution. Streamed intermediates (`token`, `download`)
+    /// go to `sink` as UI event lines; the terminal message resolves the call. Returns a
+    /// business envelope `{ok, data|error}` — only a dead worker is an `Err`.
+    pub async fn request(
+        &self,
+        sidecar: &Path,
+        req: Value,
+        sink: LlmEventSink,
+        timeout: Duration,
+    ) -> Result<Value, String> {
+        let tx = self.sender().await;
+        let (reply, reply_rx) = oneshot::channel();
+        tx.send(Msg::Request {
+            sidecar: sidecar.to_path_buf(),
+            req,
+            sink,
+            timeout,
+            reply,
+        })
+        .map_err(|_| "llm host worker unavailable".to_string())?;
+        reply_rx
+            .await
+            .map_err(|_| "llm host dropped the request".to_string())?
+    }
+
+    /// Kill the helper (frees the ~1 GB model). Called on app exit; safe anytime.
+    pub async fn kill(&self) {
+        let tx = { self.tx.lock().await.clone() };
+        if let Some(tx) = tx {
+            let (reply, reply_rx) = oneshot::channel();
+            if tx.send(Msg::Kill { reply }).is_ok() {
+                let _ = reply_rx.await;
+            }
+        }
+        *self.tx.lock().await = None;
+    }
+}
+
+/// The single owner of the helper, the model state, and the queue. Runs on one task; all its
+/// fields are touched only from `run()`, so there is no shared-state race by construction.
+struct Worker {
+    rx: mpsc::UnboundedReceiver<Msg>,
+    tx: mpsc::UnboundedSender<Msg>,
+    proc: Option<Arc<HostProc>>,
+    model: ModelInfo,
+    queue: VecDeque<Job>,
+    active: Option<ActiveJob>,
+    /// Replies for serialized jobs, sent when their `Done` arrives (or on cancel).
+    replies: HashMap<u64, oneshot::Sender<Result<Value, String>>>,
+    next_id: u64,
+    last_sink: Option<LlmEventSink>,
+}
+
+impl Worker {
+    fn new(rx: mpsc::UnboundedReceiver<Msg>, tx: mpsc::UnboundedSender<Msg>) -> Self {
+        Worker {
+            rx,
+            tx,
+            proc: None,
+            model: ModelInfo::unloaded(),
+            queue: VecDeque::new(),
+            active: None,
+            replies: HashMap::new(),
+            next_id: 1,
+            last_sink: None,
+        }
+    }
+
+    async fn run(mut self) {
+        while let Some(msg) = self.rx.recv().await {
+            match msg {
+                Msg::Request {
+                    sidecar,
+                    req,
+                    sink,
+                    timeout,
+                    reply,
+                } => self.on_request(sidecar, req, sink, timeout, reply).await,
+                Msg::Done {
+                    id,
+                    result,
+                    target_model,
+                    set_loading,
+                } => self.on_done(id, result, target_model, set_loading).await,
+                Msg::Kill { reply } => {
+                    self.on_kill().await;
+                    let _ = reply.send(());
+                    return;
+                }
+            }
+        }
+        self.on_kill().await;
+    }
+
+    async fn on_request(
+        &mut self,
+        sidecar: PathBuf,
+        req: Value,
+        sink: LlmEventSink,
+        timeout: Duration,
+        reply: oneshot::Sender<Result<Value, String>>,
+    ) {
+        self.last_sink = Some(sink.clone());
+        let req_type = req
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // ── cancel: out-of-band, never queued ──
+        if req_type == "cancel" {
+            let client_id = req
+                .get("clientId")
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            self.cancel(&client_id, &sink).await;
+            let _ = reply.send(Ok(json!({"ok": true, "data": {"cancelled": true}})));
+            return;
+        }
+
+        // ── model_status / download_model / ping: bypass the queue, run concurrently ──
+        let serialized = req_type == "load" || req_type == "generate";
+        if !serialized {
+            let proc = match self.ensure_proc(&sidecar).await {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                    return;
+                }
+            };
+            let id = self.next_id;
+            self.next_id += 1;
+            tokio::spawn(async move {
+                let r = run_on_helper(proc, req, &sink, timeout, id).await;
+                let _ = reply.send(r);
+            });
+            return;
+        }
+
+        // ── serialized lane: assign id, enter the queue ──
+        let id = self.next_id;
+        self.next_id += 1;
+        let client_id = req
+            .get("clientId")
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("req-{}", id));
+        let kind = if req_type == "load" {
+            "load".to_string()
+        } else if req.get("kind").and_then(|k| k.as_str()) == Some("auto") {
+            "auto-describe".to_string()
+        } else {
+            "user-describe".to_string()
+        };
+        let target_model = req.get("model").and_then(|m| m.as_str()).map(String::from);
+
+        // Preempt: a user describe cancels an actively-generating auto on the helper — its
+        // `Done` (cancelled) frees the slot and the user's job (queued ahead) runs next.
+        if kind == "user-describe" {
+            if let Some(a) = &self.active {
+                if a.kind == "auto-describe" {
+                    self.write_cancel(a.id).await;
+                }
+            }
+        }
+
+        self.replies.insert(id, reply);
+        let job = Job {
+            id,
+            client_id,
+            kind: kind.clone(),
+            sidecar,
+            req,
+            sink: sink.clone(),
+            timeout,
+            target_model,
+        };
+        if kind == "user-describe" {
+            // Ahead of every queued auto; behind other user/load work (FIFO among peers).
+            let pos = self
+                .queue
+                .iter()
+                .position(|j| j.kind == "auto-describe")
+                .unwrap_or(self.queue.len());
+            self.queue.insert(pos, job);
+        } else {
+            self.queue.push_back(job);
+        }
+        self.emit_state(&sink).await;
+        self.pump().await;
+    }
+
+    /// Start the next serialized job if none is active. One active at a time = serialization.
+    async fn pump(&mut self) {
+        if self.active.is_some() {
+            return;
+        }
+        loop {
+            let Some(job) = self.queue.pop_front() else {
+                return;
+            };
+            let proc = match self.ensure_proc(&job.sidecar).await {
+                Ok(p) => p,
+                Err(e) => {
+                    if let Some(r) = self.replies.remove(&job.id) {
+                        let _ = r.send(Err(e));
+                    }
+                    continue; // try the next queued job
+                }
+            };
+            // Model transition: this job will (re)load if the target differs / nothing resident.
+            let set_loading = self.model.state != "ready"
+                || (job.target_model.is_some() && self.model.id != job.target_model);
+            if set_loading {
+                self.model.state = "loading".into();
+                self.model.id = job.target_model.clone();
+                self.emit_state(&job.sink).await;
+            }
+            self.active = Some(ActiveJob {
+                id: job.id,
+                client_id: job.client_id.clone(),
+                kind: job.kind.clone(),
+            });
+            self.emit_state(&job.sink).await;
+
+            let tx = self.tx.clone();
+            let Job {
+                id,
+                req,
+                sink,
+                timeout,
+                target_model,
+                ..
+            } = job;
+            tokio::spawn(async move {
+                let result = run_on_helper(proc, req, &sink, timeout, id).await;
+                let _ = tx.send(Msg::Done {
+                    id,
+                    result,
+                    target_model,
+                    set_loading,
+                });
+            });
+            return;
+        }
+    }
+
+    async fn on_done(
+        &mut self,
+        id: u64,
+        result: Result<Value, String>,
+        target_model: Option<String>,
+        set_loading: bool,
+    ) {
+        // Truthful model state from the terminal reply.
+        let ok = matches!(&result, Ok(v) if v.get("ok") == Some(&json!(true)));
+        if ok {
+            if let Ok(v) = &result {
+                let backend = v
+                    .get("data")
+                    .and_then(|d| d.get("backend"))
+                    .cloned()
+                    .filter(|b| !b.is_null());
+                self.model.state = "ready".into();
+                self.model.id = target_model;
+                if backend.is_some() {
+                    self.model.backend = backend;
+                }
+            }
+        } else if set_loading && self.model.state == "loading" {
+            // A load we started never became resident (error / cancelled during load).
+            self.model.state = "unloaded".into();
+            self.model.id = None;
+        }
+
+        if self.active.as_ref().map(|a| a.id) == Some(id) {
+            self.active = None;
+        }
+        if let Some(r) = self.replies.remove(&id) {
+            let _ = r.send(result);
+        }
+        if let Some(sink) = self.last_sink.clone() {
+            self.emit_state(&sink).await;
+        }
+        self.pump().await;
+    }
+
+    /// Cancel by clientId: cancel it on the helper if active, else drop it from the queue.
+    async fn cancel(&mut self, client_id: &str, sink: &LlmEventSink) {
+        if let Some(a) = &self.active {
+            if a.client_id == client_id {
+                // Its `Done` (cancelled) will clear `active`, send its reply, and pump next.
+                self.write_cancel(a.id).await;
+                self.emit_state(sink).await;
+                return;
+            }
+        }
+        if let Some(pos) = self.queue.iter().position(|j| j.client_id == client_id) {
+            if let Some(job) = self.queue.remove(pos) {
+                if let Some(r) = self.replies.remove(&job.id) {
+                    let _ = r.send(Ok(json!({"ok": false, "error": "cancelled", "cancelled": true})));
+                }
+            }
+            self.emit_state(sink).await;
+        }
+    }
+
+    /// Tell the helper to cancel the generation for `id` (out-of-band line, never queued).
+    async fn write_cancel(&self, id: u64) {
+        if let Some(p) = &self.proc {
+            let mut stdin = p.stdin.lock().await;
+            let _ = stdin
+                .write_all(format!("{}\n", json!({"type":"cancel","cancelId":id})).as_bytes())
+                .await;
+            let _ = stdin.flush().await;
+        }
+    }
+
+    /// Spawn the helper if none is running (or the previous one died). Resets model state to
+    /// `unloaded` whenever a FRESH helper is spawned (a new process has nothing resident).
+    async fn ensure_proc(&mut self, sidecar: &Path) -> Result<Arc<HostProc>, String> {
+        if let Some(p) = self.proc.as_ref() {
             if p.alive.load(Ordering::SeqCst) {
                 return Ok(p.clone());
             }
@@ -126,11 +496,9 @@ impl LlmHost {
         let pending: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
-
         {
             let pending = pending.clone();
             let alive = alive.clone();
-            let model = self.model.clone();
             tokio::spawn(async move {
                 let mut lines = tokio::io::BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -151,14 +519,9 @@ impl LlmHost {
                         }
                     }
                 }
-                // stdout closed → helper exited: fail all pending, model is gone.
+                // stdout closed → helper exited: mark dead and fail all pending. The worker
+                // learns the model is gone when it next spawns a fresh proc (→ unloaded).
                 alive.store(false, Ordering::SeqCst);
-                {
-                    let mut m = model.lock().await;
-                    m.state = "unloaded".into();
-                    m.id = None;
-                    m.backend = None;
-                }
                 let mut p = pending.lock().await;
                 for (_, tx) in p.drain() {
                     let _ = tx.send(json!({"type":"fatal","message":"AI runtime exited"}));
@@ -172,407 +535,168 @@ impl LlmHost {
             pending,
             alive,
         });
-        *guard = Some(proc.clone());
+        self.proc = Some(proc.clone());
+        self.model = ModelInfo::unloaded();
         Ok(proc)
     }
 
     /// Snapshot the state machine as one `llm:state` event line and emit it.
     async fn emit_state(&self, sink: &LlmEventSink) {
-        let model = self.model.lock().await.clone();
-        let queue = self.queue.lock().await;
-        let q: Vec<Value> = queue
-            .iter()
-            .filter(|e| !e.cancelled)
-            .map(|e| {
-                json!({
-                    "clientId": e.client_id,
-                    "kind": e.kind,
-                    "state": if e.active { "active" } else { "queued" },
-                })
-            })
-            .collect();
-        drop(queue);
+        let mut q: Vec<Value> = Vec::new();
+        if let Some(a) = &self.active {
+            q.push(json!({"clientId": a.client_id, "kind": a.kind, "state": "active"}));
+        }
+        for j in &self.queue {
+            q.push(json!({"clientId": j.client_id, "kind": j.kind, "state": "queued"}));
+        }
         sink(json!({
             "event": "llm:state",
-            "model": {"state": model.state, "id": model.id, "backend": model.backend},
+            "model": {"state": self.model.state, "id": self.model.id, "backend": self.model.backend},
             "queue": q,
         })
         .to_string());
     }
 
-    /// Write a raw line to the helper (used for cancels — never queued).
-    async fn write_line(&self, line: &str) {
-        let proc = { self.proc.lock().await.clone() };
-        if let Some(p) = proc {
-            let mut stdin = p.stdin.lock().await;
-            let _ = stdin.write_all(format!("{}\n", line).as_bytes()).await;
-            let _ = stdin.flush().await;
-        }
-    }
-
-    /// Cancel by clientId: drop it if still queued, abort it on the helper if active.
-    /// The waiting/active request resolves with `{ok:false, cancelled:true}`.
-    async fn cancel(&self, client_id: &str, sink: &LlmEventSink) -> Value {
-        let mut to_abort: Option<u64> = None;
-        {
-            let mut queue = self.queue.lock().await;
-            for e in queue.iter_mut() {
-                if e.client_id == client_id && !e.cancelled {
-                    e.cancelled = true;
-                    if e.active {
-                        to_abort = Some(e.id);
-                    }
-                }
-            }
-        }
-        self.turn.notify_waiters(); // queued entries observe their cancellation
-        if let Some(id) = to_abort {
-            self.write_line(&json!({"type":"cancel","cancelId":id}).to_string())
-                .await;
-        }
-        self.emit_state(sink).await;
-        json!({"ok": true, "data": {"cancelled": true}})
-    }
-
-    /// Send one request and stream its lifecycle: intermediates (`token`, `download`) go to
-    /// `sink` as UI event lines; the terminal message resolves the call. Returns a business
-    /// envelope `{ok, data|error}` — transport failures are the only `Err`, so the UI can
-    /// distinguish "host unreachable" (fall back) from "the model said no".
-    pub async fn request(
-        &self,
-        sidecar: &Path,
-        mut req: Value,
-        sink: LlmEventSink,
-        timeout: Duration,
-    ) -> Result<Value, String> {
-        let req_type = req
-            .get("type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        // ── Out-of-band requests: never queued ──
-        if req_type == "cancel" {
-            let client_id = req
-                .get("clientId")
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            return Ok(self.cancel(&client_id, &sink).await);
-        }
-        let serialized = req_type == "load" || req_type == "generate";
-        if !serialized {
-            // model_status / download_model / ping: straight through (a long download must
-            // never block a describe; they don't touch the inference context).
-            return self.run_on_helper(sidecar, req, &sink, timeout, None).await;
-        }
-
-        // ── Serialized lane: enter the explicit queue ──
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let client_id = req
-            .get("clientId")
-            .and_then(|c| c.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("req-{}", id));
-        let kind = if req_type == "load" {
-            "load".to_string()
-        } else if req.get("kind").and_then(|k| k.as_str()) == Some("auto") {
-            "auto-describe".to_string()
-        } else {
-            "user-describe".to_string()
-        };
-        req["id"] = json!(id);
-
-        {
-            let mut queue = self.queue.lock().await;
-            let entry = QEntry {
-                id,
-                client_id: client_id.clone(),
-                kind: kind.clone(),
-                active: false,
-                cancelled: false,
-            };
-            if kind == "user-describe" {
-                // Preempt: ahead of every QUEUED auto; abort an ACTIVE auto (the UI's rules
-                // will re-enqueue it — the user's click must never wait behind background work).
-                let mut abort: Option<u64> = None;
-                if let Some(head) = queue.first() {
-                    if head.active && head.kind == "auto-describe" && !head.cancelled {
-                        abort = Some(head.id);
-                    }
-                }
-                let pos = queue
-                    .iter()
-                    .position(|e| !e.active && e.kind == "auto-describe" && !e.cancelled)
-                    .unwrap_or(queue.len());
-                queue.insert(pos, entry);
-                drop(queue);
-                if let Some(aid) = abort {
-                    self.write_line(&json!({"type":"cancel","cancelId":aid}).to_string())
-                        .await;
-                }
-            } else {
-                queue.push(entry);
-                drop(queue);
-            }
-        }
-        self.turn.notify_waiters();
-        self.emit_state(&sink).await;
-
-        // Always leave the queue on the way out, whatever happens below.
-        struct Leave {
-            queue: Arc<Mutex<Vec<QEntry>>>,
-            turn: Arc<Notify>,
-            id: u64,
-        }
-        impl Drop for Leave {
-            fn drop(&mut self) {
-                let (q, t, id) = (self.queue.clone(), self.turn.clone(), self.id);
-                tokio::spawn(async move {
-                    q.lock().await.retain(|e| e.id != id);
-                    t.notify_waiters();
-                });
-            }
-        }
-        let _leave = Leave {
-            queue: self.queue.clone(),
-            turn: self.turn.clone(),
-            id,
-        };
-
-        // Wait for our turn (head of queue), observing cancellation and the deadline.
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            {
-                let mut queue = self.queue.lock().await;
-                if let Some(me) = queue.iter().position(|e| e.id == id) {
-                    if queue[me].cancelled {
-                        drop(queue);
-                        self.emit_state(&sink).await;
-                        return Ok(json!({"ok": false, "error": "cancelled", "cancelled": true}));
-                    }
-                    let head_active_elsewhere =
-                        queue.iter().any(|e| e.active && e.id != id && !e.cancelled);
-                    if me == 0 || !head_active_elsewhere {
-                        // Our turn iff nothing else is actively generating and nobody
-                        // non-cancelled is ahead of us.
-                        let nobody_ahead = queue[..me].iter().all(|e| e.cancelled);
-                        if !head_active_elsewhere && nobody_ahead {
-                            queue[me].active = true;
-                            break;
-                        }
-                    }
-                } else {
-                    return Err("request vanished from queue".to_string());
-                }
-            }
-            if tokio::time::timeout_at(deadline, self.turn.notified())
-                .await
-                .is_err()
-            {
-                return Err("llm request timed out waiting for its turn".to_string());
-            }
-        }
-        self.emit_state(&sink).await;
-
-        // Model-state transition: this request will (re)load if the target differs.
-        let target_model = req.get("model").and_then(|m| m.as_str()).map(String::from);
-        {
-            let mut m = self.model.lock().await;
-            if m.state != "ready" || (target_model.is_some() && m.id != target_model) {
-                m.state = "loading".into();
-                m.id = target_model.clone();
-                drop(m);
-                self.emit_state(&sink).await;
-            }
-        }
-
-        let out = self
-            .run_on_helper(sidecar, req, &sink, timeout, Some(id))
-            .await;
-
-        // Truthful model state from the helper's terminal reply.
-        if let Ok(v) = &out {
-            if v.get("ok") == Some(&json!(true)) {
-                let backend = v
-                    .get("data")
-                    .and_then(|d| d.get("backend"))
-                    .cloned()
-                    .filter(|b| !b.is_null());
-                let mut m = self.model.lock().await;
-                m.state = "ready".into();
-                m.id = target_model;
-                if backend.is_some() {
-                    m.backend = backend;
-                }
-            } else {
-                // Business failure (model not downloaded, engine error, cancelled): the model
-                // is whatever it was; a load failure means nothing usable is resident.
-                let mut m = self.model.lock().await;
-                if m.state == "loading" {
-                    m.state = "unloaded".into();
-                    m.id = None;
-                }
-            }
-        }
-        // Queue exit + notify happen in Leave::drop; emit the settled picture.
-        {
-            let mut queue = self.queue.lock().await;
-            queue.retain(|e| e.id != id);
-        }
-        self.turn.notify_waiters();
-        self.emit_state(&sink).await;
-        out
-    }
-
-    /// Low-level: write `req` to the helper and drain its reply stream until terminal.
-    async fn run_on_helper(
-        &self,
-        sidecar: &Path,
-        mut req: Value,
-        sink: &LlmEventSink,
-        timeout: Duration,
-        preassigned_id: Option<u64>,
-    ) -> Result<Value, String> {
-        let req_type = req
-            .get("type")
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-            .to_string();
-        let proc = self.ensure_proc(sidecar).await?;
-        let id = match preassigned_id {
-            Some(i) => i,
-            None => self.next_id.fetch_add(1, Ordering::SeqCst),
-        };
-        req["id"] = json!(id);
-        let stream_id = req
-            .get("streamId")
-            .and_then(|s| s.as_str())
-            .map(|s| s.to_string());
-        let model = req
-            .get("model")
-            .and_then(|m| m.as_str())
-            .map(|m| m.to_string());
-
-        let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
-        proc.pending.lock().await.insert(id, tx);
-        struct Cleanup(Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Value>>>>, u64);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let (p, id) = (self.0.clone(), self.1);
-                tokio::spawn(async move {
-                    p.lock().await.remove(&id);
-                });
-            }
-        }
-        let _cleanup = Cleanup(proc.pending.clone(), id);
-
-        {
-            let mut line = serde_json::to_string(&req).map_err(|e| e.to_string())?;
-            line.push('\n');
-            let mut stdin = proc.stdin.lock().await;
-            stdin
-                .write_all(line.as_bytes())
-                .await
-                .map_err(|e| format!("write to llm-helper failed: {}", e))?;
-            let _ = stdin.flush().await;
-        }
-
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let msg = match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(m)) => m,
-                Ok(None) => return Err("llm-helper channel closed".to_string()),
-                Err(_) => return Err("llm request timed out".to_string()),
-            };
-            match msg.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-                // ── streamed intermediates → UI event lines (identical to the owner-era shapes) ──
-                "token" => {
-                    if let (Some(sid), Some(delta)) =
-                        (stream_id.as_ref(), msg.get("delta").and_then(|d| d.as_str()))
-                    {
-                        sink(json!({"event":"describe:token","streamId":sid,"delta":delta})
-                            .to_string());
-                    }
-                }
-                "download" => {
-                    sink(json!({
-                        "event":"model:download",
-                        "model": msg.get("model").and_then(|m|m.as_str()).or(model.as_deref()),
-                        "received": msg.get("received"),
-                        "total": msg.get("total"),
-                        "file": msg.get("file"),
-                    })
-                    .to_string());
-                }
-                // ── terminals ──
-                "loaded" => {
-                    return Ok(json!({"ok": true, "data": {"backend": msg.get("backend")}}))
-                }
-                "done" => {
-                    return Ok(json!({"ok": true, "data": {
-                        "text": msg.get("text"),
-                        "backend": msg.get("backend"),
-                    }}))
-                }
-                "model_status" => {
-                    return Ok(json!({"ok": true, "data": {
-                        "models": msg.get("models"),
-                        "default": msg.get("default"),
-                    }}))
-                }
-                "download_done" => {
-                    sink(json!({
-                        "event":"model:download",
-                        "model": msg.get("model").and_then(|m|m.as_str()).or(model.as_deref()),
-                        "received": 1, "total": 1, "file": "done", "done": true,
-                    })
-                    .to_string());
-                    return Ok(json!({"ok": true, "data": {"path": msg.get("path")}}));
-                }
-                "pong" => return Ok(json!({"ok": true, "data": {}})),
-                "cancelled" => {
-                    return Ok(json!({"ok": false, "error": "cancelled", "cancelled": true}))
-                }
-                "error" => {
-                    let message = msg
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("inference error")
-                        .to_string();
-                    if req_type == "download_model" {
-                        sink(json!({
-                            "event":"model:download",
-                            "model": msg.get("model").and_then(|m|m.as_str()).or(model.as_deref()),
-                            "error": {"category": msg.get("category").and_then(|c|c.as_str()).unwrap_or("unknown"), "message": message},
-                        })
-                        .to_string());
-                    }
-                    return Ok(json!({"ok": false, "error": message}));
-                }
-                "fatal" => {
-                    let message = msg
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("AI runtime not available")
-                        .to_string();
-                    return Ok(json!({"ok": false, "error": message}));
-                }
-                _ => {} // unknown intermediate — ignore
-            }
-        }
-    }
-
-    /// Kill the helper (frees the ~1 GB model). Called on app exit; safe anytime.
-    pub async fn kill(&self) {
-        let proc = { self.proc.lock().await.take() };
-        if let Some(p) = proc {
+    async fn on_kill(&mut self) {
+        if let Some(p) = self.proc.take() {
             let _ = p.child.lock().await.kill().await;
             p.alive.store(false, Ordering::SeqCst);
         }
-        let mut m = self.model.lock().await;
-        m.state = "unloaded".into();
-        m.id = None;
+        self.model = ModelInfo::unloaded();
+        for (_, r) in self.replies.drain() {
+            let _ = r.send(Err("llm host shutting down".to_string()));
+        }
+        self.queue.clear();
+        self.active = None;
+    }
+}
+
+/// Low-level: write `req` to the helper and drain its reply stream until terminal. A free
+/// function so the worker can run it in a spawned task (keeping the worker responsive to
+/// cancels while a generation streams).
+async fn run_on_helper(
+    proc: Arc<HostProc>,
+    mut req: Value,
+    sink: &LlmEventSink,
+    timeout: Duration,
+    id: u64,
+) -> Result<Value, String> {
+    let req_type = req
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    req["id"] = json!(id);
+    let stream_id = req
+        .get("streamId")
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string());
+    let model = req
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(|m| m.to_string());
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<Value>();
+    proc.pending.lock().await.insert(id, tx);
+    struct Cleanup(Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<Value>>>>, u64);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let (p, id) = (self.0.clone(), self.1);
+            tokio::spawn(async move {
+                p.lock().await.remove(&id);
+            });
+        }
+    }
+    let _cleanup = Cleanup(proc.pending.clone(), id);
+
+    {
+        let mut line = serde_json::to_string(&req).map_err(|e| e.to_string())?;
+        line.push('\n');
+        let mut stdin = proc.stdin.lock().await;
+        stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|e| format!("write to llm-helper failed: {}", e))?;
+        let _ = stdin.flush().await;
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let msg = match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(m)) => m,
+            Ok(None) => return Err("llm-helper channel closed".to_string()),
+            Err(_) => return Err("llm request timed out".to_string()),
+        };
+        match msg.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            // ── streamed intermediates → UI event lines (identical to the owner-era shapes) ──
+            "token" => {
+                if let (Some(sid), Some(delta)) =
+                    (stream_id.as_ref(), msg.get("delta").and_then(|d| d.as_str()))
+                {
+                    sink(json!({"event":"describe:token","streamId":sid,"delta":delta}).to_string());
+                }
+            }
+            "download" => {
+                sink(json!({
+                    "event":"model:download",
+                    "model": msg.get("model").and_then(|m|m.as_str()).or(model.as_deref()),
+                    "received": msg.get("received"),
+                    "total": msg.get("total"),
+                    "file": msg.get("file"),
+                })
+                .to_string());
+            }
+            // ── terminals ──
+            "loaded" => return Ok(json!({"ok": true, "data": {"backend": msg.get("backend")}})),
+            "done" => {
+                return Ok(json!({"ok": true, "data": {
+                    "text": msg.get("text"),
+                    "backend": msg.get("backend"),
+                }}))
+            }
+            "model_status" => {
+                return Ok(json!({"ok": true, "data": {
+                    "models": msg.get("models"),
+                    "default": msg.get("default"),
+                }}))
+            }
+            "download_done" => {
+                sink(json!({
+                    "event":"model:download",
+                    "model": msg.get("model").and_then(|m|m.as_str()).or(model.as_deref()),
+                    "received": 1, "total": 1, "file": "done", "done": true,
+                })
+                .to_string());
+                return Ok(json!({"ok": true, "data": {"path": msg.get("path")}}));
+            }
+            "pong" => return Ok(json!({"ok": true, "data": {}})),
+            "cancelled" => return Ok(json!({"ok": false, "error": "cancelled", "cancelled": true})),
+            "error" => {
+                let message = msg
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("inference error")
+                    .to_string();
+                if req_type == "download_model" {
+                    sink(json!({
+                        "event":"model:download",
+                        "model": msg.get("model").and_then(|m|m.as_str()).or(model.as_deref()),
+                        "error": {"category": msg.get("category").and_then(|c|c.as_str()).unwrap_or("unknown"), "message": message},
+                    })
+                    .to_string());
+                }
+                return Ok(json!({"ok": false, "error": message}));
+            }
+            "fatal" => {
+                let message = msg
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("AI runtime not available")
+                    .to_string();
+                return Ok(json!({"ok": false, "error": message}));
+            }
+            _ => {} // unknown intermediate — ignore
+        }
     }
 }
 
