@@ -100,6 +100,14 @@ export default class Session extends Command {
    *  are served before the next write batch (read priority → responsive UI). */
   private pendingReads = 0;
 
+  /** Run-readiness latch (precondition #2). A query that needs a loaded run AWAITS this
+   *  instead of failing with "No run loaded yet" — a not-yet-loaded run is a WAIT, not an
+   *  error. That string was outside the frontend's transient set, so it surfaced immediately
+   *  as a hard "Summary unavailable" (race R2). Resolved once, when runId is first set
+   *  (reopen resolves it before the `ready` event, so a reopened scan never waits). */
+  private runReady!: Promise<void>;
+  private resolveRunReady: (() => void) | undefined;
+
   // ── Resource governor ────────────────────────────────────────────────────
   /** Target CPU duty cycle for the scan (1 = full speed). The betweenBatches hook
    *  sleeps to keep the scan under this, leaving headroom for the UI (a separate
@@ -172,8 +180,32 @@ export default class Session extends Command {
     timer.unref?.();
   }
 
+  /** Arm a fresh (unresolved) run-readiness latch. Called once at startup. */
+  private armRunReady(): void {
+    this.runReady = new Promise<void>(res => {
+      this.resolveRunReady = res;
+    });
+  }
+  /** Resolve the latch once a run is loaded (idempotent — resolving twice is a no-op). */
+  private markRunLoaded(): void {
+    if (this.runId) this.resolveRunReady?.();
+  }
+  /** Await a loaded run, bounded so a genuinely run-less owner never hangs a query forever.
+   *  20 s stays inside the frontend's 30 s describe timeout, which is the ultimate backstop. */
+  private async awaitRunLoaded(timeoutMs = 20_000): Promise<void> {
+    if (this.runId) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<void>(res => {
+      timer = setTimeout(res, timeoutMs);
+      timer.unref?.();
+    });
+    await Promise.race([this.runReady, timeout]);
+    if (timer) clearTimeout(timer);
+  }
+
   async run(): Promise<void> {
     const { flags } = await this.parse(Session);
+    this.armRunReady();
 
     // Console logging OFF — stdout is the JSON protocol.
     await initializeLogging({
@@ -209,6 +241,7 @@ export default class Session extends Command {
         })) ?? undefined;
     }
 
+    this.markRunLoaded(); // reopen: runId is resolved BEFORE `ready`, so queries never wait
     this.send({ event: 'ready', run_id: this.runId ?? null, pid: process.pid });
     this.startMonitor();
 
@@ -306,6 +339,9 @@ export default class Session extends Command {
         return;
       }
 
+      // Precondition #2 as a WAIT, not a failure: if the run isn't loaded yet, await the
+      // readiness latch (bounded) before deciding it's genuinely absent (race R2).
+      if (!this.runId) await this.awaitRunLoaded();
       if (!this.runId) {
         this.send({ id, ok: false, error: 'No run loaded yet (start a scan first)' });
         return;
@@ -394,6 +430,7 @@ export default class Session extends Command {
       });
       this.database = next;
       this.runId = rid ?? undefined;
+      this.markRunLoaded(); // warm-reuse swap: the new db's run is now loaded
       if (old) {
         // Flush any pending annotation snapshot for the datadir we're leaving before its
         // connection closes (the debounce timer would otherwise fire on a closed handle).
@@ -446,6 +483,7 @@ export default class Session extends Command {
     const resume = req.resume === true;
     const runId = (req.runId as string) || (resume && this.runId ? this.runId : generateRunId());
     this.runId = runId; // queries during the scan target this run
+    this.markRunLoaded(); // fresh scan: unblock any query that arrived before the run loaded
     this.currentJobId = jobId;
     this.scanRootPath = rootPath;
     this.scanning = true;
