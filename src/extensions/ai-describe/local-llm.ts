@@ -18,8 +18,8 @@
  *     is the JSON-lines protocol; a stray line breaks the transport).
  */
 
-import { createWriteStream } from 'node:fs';
-import { mkdir, rename, stat, readdir, chmod, rm, writeFile } from 'node:fs/promises';
+import { createWriteStream, createReadStream } from 'node:fs';
+import { mkdir, rename, stat, readdir, chmod, rm, writeFile, open } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { platform, arch } from 'node:os';
@@ -127,11 +127,29 @@ export const LOCAL_MODELS: LocalModelInfo[] = [
     'bartowski/Mistral-7B-Instruct-v0.3-GGUF', 'Mistral-7B-Instruct-v0.3-Q4_K_M.gguf', 4_372_812_000),
 ];
 
-/** The model used when the user hasn't picked one. */
-export const DEFAULT_LOCAL_MODEL = 'qwen2.5-1.5b';
+/** The model used when the user hasn't picked one. 0.5B is the GPU-safe default: the 1.5B
+ *  model loaded onto a laptop GPU can exhaust VRAM and freeze the desktop (the frontend uses
+ *  the same default + a migration; this keeps the sidecar fallback consistent). */
+export const DEFAULT_LOCAL_MODEL = 'qwen2.5-0.5b';
 
 export function getLocalModel(id: string): LocalModelInfo | undefined {
   return LOCAL_MODELS.find((m) => m.id === id);
+}
+
+// === Custom (user-imported) models ===
+// A user can import their own GGUF; it's copied into the models dir and becomes a first-class
+// model identified by `custom:<filename>`, so model_status lists it and resolveModelPath finds
+// it with no special-casing in the describe flow.
+
+const CUSTOM_PREFIX = 'custom:';
+
+export function isCustomModel(id: string): boolean {
+  return id.startsWith(CUSTOM_PREFIX);
+}
+
+/** The on-disk file name a custom id maps to (the part after `custom:`). */
+function customFileName(id: string): string {
+  return id.slice(CUSTOM_PREFIX.length);
 }
 
 // === Paths ===
@@ -151,6 +169,7 @@ function binDir(): string {
 
 /** On-disk path of a model's first (or only) GGUF shard — what the server loads. */
 export function modelPath(id: string): string {
+  if (isCustomModel(id)) return join(modelsDir(), customFileName(id));
   const info = getLocalModel(id);
   if (!info) throw new Error(`Unknown local model: ${id}`);
   return join(modelsDir(), info.files[0].name);
@@ -166,8 +185,16 @@ async function fileHasSize(path: string, expected: number): Promise<boolean> {
   }
 }
 
-/** True only when every shard of the model is present at its expected size. */
+/** True only when every shard of the model is present at its expected size. A custom model is
+ *  "downloaded" iff its file exists (no expected size to check against). */
 export async function isModelDownloaded(id: string): Promise<boolean> {
+  if (isCustomModel(id)) {
+    try {
+      return (await stat(modelPath(id))).isFile();
+    } catch {
+      return false;
+    }
+  }
   const info = getLocalModel(id);
   if (!info) return false;
   for (const f of info.files) {
@@ -369,6 +396,153 @@ export async function downloadModel(
 
   logger.info('model download complete', { model: id, path: modelPath(id) });
   return modelPath(id);
+}
+
+// === Custom model import / removal ===
+
+/** GGUF files start with the ASCII magic "GGUF" — a cheap validity check before importing. */
+async function isGgufFile(path: string): Promise<boolean> {
+  let fh: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    fh = await open(path, 'r');
+    const buf = Buffer.alloc(4);
+    await fh.read(buf, 0, 4, 0);
+    return buf.toString('latin1') === 'GGUF';
+  } catch {
+    return false;
+  } finally {
+    await fh?.close().catch(() => {});
+  }
+}
+
+/** A filesystem-safe basename for the imported file: strip the directory (both `/` and `\`),
+ *  replace characters that are invalid on Windows, keep the extension. */
+function sanitizeModelFileName(srcPath: string): string {
+  const base = srcPath.replace(/^.*[\\/]/, ''); // basename, handling both separators
+  // eslint-disable-next-line no-control-regex
+  return base.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim() || 'model.gguf';
+}
+
+/** A custom model's metadata, matching the catalogue's `model_status` entry shape. */
+export interface CustomModelEntry {
+  id: string;
+  label: string;
+  family: string;
+  tier: LocalModelInfo['tier'];
+  note: string;
+  size: number;
+  license: string;
+  downloaded: true;
+  custom: true;
+}
+
+/** Import a local `.gguf` into the models dir and return its custom entry. Validates it's a real
+ *  GGUF, copies with progress (atomic `.part`→rename), and refuses to clobber a built-in model. */
+export async function importModel(
+  srcPath: string,
+  onProgress?: (p: DownloadProgress) => void
+): Promise<CustomModelEntry & { path: string }> {
+  const st = await stat(srcPath).catch(() => null);
+  if (!st || !st.isFile()) throw new Error('The selected file does not exist.');
+  if (!srcPath.toLowerCase().endsWith('.gguf')) throw new Error('Please choose a .gguf model file.');
+  if (!(await isGgufFile(srcPath))) throw new Error('That file is not a valid GGUF model.');
+
+  const fileName = sanitizeModelFileName(srcPath);
+  if (LOCAL_MODELS.some((m) => m.files.some((f) => f.name === fileName))) {
+    throw new Error('A built-in model already uses that file name; rename the file and retry.');
+  }
+
+  await mkdir(modelsDir(), { recursive: true });
+  const dest = join(modelsDir(), fileName);
+  const tmp = `${dest}.part`;
+  await rm(tmp, { force: true }).catch(() => {});
+
+  const total = st.size;
+  let received = 0;
+  logger.info('custom model import started', { file: fileName, bytes: total });
+  await new Promise<void>((resolve, reject) => {
+    const rs = createReadStream(srcPath);
+    const ws = createWriteStream(tmp);
+    rs.on('error', reject);
+    ws.on('error', reject);
+    rs.on('data', (chunk: Buffer) => {
+      received += chunk.length;
+      onProgress?.({ received, total, file: fileName });
+    });
+    ws.on('finish', () => resolve());
+    rs.pipe(ws);
+  });
+
+  if (!(await fileHasSize(tmp, total))) {
+    await rm(tmp, { force: true }).catch(() => {});
+    throw new Error('The copy did not complete — please try again.');
+  }
+  await rename(tmp, dest);
+  const id = `${CUSTOM_PREFIX}${fileName}`;
+  logger.info('custom model imported', { id, bytes: total });
+  return {
+    id,
+    label: fileName.replace(/\.gguf$/i, ''),
+    family: 'Custom',
+    tier: 'balanced',
+    note: 'Imported model',
+    size: total,
+    license: 'unknown',
+    downloaded: true,
+    custom: true,
+    path: dest,
+  };
+}
+
+/** Delete a model's file(s) from the models dir — a custom id OR a catalogue id (the latter
+ *  fills the gap that there was no way to remove a downloaded model). */
+export async function removeModel(id: string): Promise<{ removed: boolean }> {
+  if (isCustomModel(id)) {
+    await rm(join(modelsDir(), customFileName(id)), { force: true });
+    logger.info('custom model removed', { id });
+    return { removed: true };
+  }
+  const info = getLocalModel(id);
+  if (!info) throw new Error(`Unknown local model: ${id}`);
+  for (const f of info.files) {
+    await rm(join(modelsDir(), f.name), { force: true }).catch(() => {});
+  }
+  logger.info('downloaded model removed', { id });
+  return { removed: true };
+}
+
+/** Enumerate `.gguf` files in the models dir that aren't part of the catalogue — the user's
+ *  imported models — as `model_status` entries. */
+export async function listCustomModels(): Promise<CustomModelEntry[]> {
+  let names: string[];
+  try {
+    names = await readdir(modelsDir());
+  } catch {
+    return [];
+  }
+  const catalogueFiles = new Set(LOCAL_MODELS.flatMap((m) => m.files.map((f) => f.name)));
+  const out: CustomModelEntry[] = [];
+  for (const name of names) {
+    if (!name.toLowerCase().endsWith('.gguf') || name.endsWith('.part') || catalogueFiles.has(name)) continue;
+    let size = 0;
+    try {
+      size = (await stat(join(modelsDir(), name))).size;
+    } catch {
+      continue;
+    }
+    out.push({
+      id: `${CUSTOM_PREFIX}${name}`,
+      label: name.replace(/\.gguf$/i, ''),
+      family: 'Custom',
+      tier: 'balanced',
+      note: 'Imported model',
+      size,
+      license: 'unknown',
+      downloaded: true,
+      custom: true,
+    });
+  }
+  return out;
 }
 
 // === Inference backend preference ===

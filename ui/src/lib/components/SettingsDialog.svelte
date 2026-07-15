@@ -9,7 +9,14 @@
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu/index.js';
 	import { extensionRegistry } from '$lib/extensions/registry';
 	import { settingsOpen, windowEffect, lensMode, type LensMode, icicleHeight, type IcicleHeight, llmConfig, type LlmConfig, aiMode, type AiMode, localModel } from '$lib/stores';
-	import { getLocalModelStatus, downloadLocalModel, type LocalModelStatus } from '$lib/tauri';
+	import {
+		getLocalModelStatus,
+		downloadLocalModel,
+		importLocalModel,
+		removeLocalModel,
+		type LocalModelStatus
+	} from '$lib/tauri';
+	import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 	import { exportLogsFlow, openLogsFolder } from '$lib/log-export';
 	import { _ } from '$lib/i18n';
 	import {
@@ -25,7 +32,9 @@
 		SparklesIcon,
 		BlocksIcon,
 		ChevronDownIcon,
-		CheckIcon
+		CheckIcon,
+		Trash2Icon,
+		UploadIcon
 	} from '@lucide/svelte';
 
 	/** When false the gear trigger is hidden (opened via the store instead). */
@@ -79,6 +88,11 @@
 	let downloadPct = $state(0);
 	let downloadError = $state<string | null>(null);
 	let defaultModel = $state('');
+	// Import a local .gguf + remove any model (downloaded or custom).
+	let importing = $state(false);
+	let importPct = $state(0);
+	let importError = $state<string | null>(null);
+	let removing = $state<string | null>(null);
 
 	async function refreshLocalModels() {
 		const status = await getLocalModelStatus();
@@ -135,6 +149,48 @@
 			downloadError = 'unknown';
 		} finally {
 			downloading = null;
+		}
+	}
+
+	async function startImport() {
+		importError = null;
+		let selected: string | string[] | null = null;
+		try {
+			selected = await openFileDialog({ multiple: false, filters: [{ name: 'GGUF model', extensions: ['gguf'] }] });
+		} catch {
+			return; // dialog unavailable (non-Tauri env)
+		}
+		const path = typeof selected === 'string' ? selected : null;
+		if (!path) return;
+		importing = true;
+		importPct = 0;
+		try {
+			const r = await importLocalModel(path, (p) => {
+				importPct = p.done ? 100 : Math.floor((p.received / p.total) * 100);
+			});
+			if (r.ok && r.id) {
+				await refreshLocalModels();
+				localModel.set(r.id); // auto-select the freshly imported model
+			} else {
+				importError = r.error ?? 'unknown';
+			}
+		} catch (e) {
+			importError = String((e as { message?: unknown })?.message ?? e);
+		} finally {
+			importing = false;
+		}
+	}
+
+	async function removeModel(id: string) {
+		removing = id;
+		try {
+			const done = await removeLocalModel(id);
+			if (done) {
+				if ($localModel === id) localModel.set(defaultModel || 'qwen2.5-0.5b');
+				await refreshLocalModels();
+			}
+		} finally {
+			removing = null;
 		}
 	}
 
@@ -370,6 +426,9 @@
 											{#if m.id === defaultModel}
 												<span class="rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">{$_('settings.aiRecommended')}</span>
 											{/if}
+											{#if m.custom}
+												<span class="rounded-full bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">{$_('settings.aiCustom')}</span>
+											{/if}
 										</div>
 										<p class="text-xs text-muted-foreground">{modelNote(m)}</p>
 									</div>
@@ -381,15 +440,27 @@
 											<span class="text-right text-[11px] text-muted-foreground">{downloadPct}%</span>
 										</div>
 									{:else if m.downloaded}
-										{#if $localModel === m.id}
-											<span class="flex items-center gap-1 text-xs font-medium text-primary"
-												><CheckIcon class="size-3.5" /> {$_('settings.aiLocalActive')}</span
+										<div class="flex items-center gap-1.5">
+											{#if $localModel === m.id}
+												<span class="flex items-center gap-1 text-xs font-medium text-primary"
+													><CheckIcon class="size-3.5" /> {$_('settings.aiLocalActive')}</span
+												>
+											{:else}
+												<Button variant="outline" size="sm" onclick={() => localModel.set(m.id)}
+													>{$_('settings.aiLocalUse')}</Button
+												>
+											{/if}
+											<Button
+												variant="ghost"
+												size="icon"
+												class="size-8 text-muted-foreground hover:text-destructive"
+												title={$_('settings.aiLocalRemove')}
+												disabled={removing === m.id}
+												onclick={() => removeModel(m.id)}
 											>
-										{:else}
-											<Button variant="outline" size="sm" onclick={() => localModel.set(m.id)}
-												>{$_('settings.aiLocalUse')}</Button
-											>
-										{/if}
+												<Trash2Icon class="size-4" />
+											</Button>
+										</div>
 									{:else}
 										<Button
 											variant="outline"
@@ -402,6 +473,19 @@
 							{/each}
 							{#if !modelsLoaded}
 								<p class="text-xs text-muted-foreground">{$_('settings.aiLocalLoading')}</p>
+							{/if}
+							<button
+								type="button"
+								class="flex items-center justify-center gap-2 rounded-lg border border-dashed px-4 py-3 text-sm text-muted-foreground transition-colors hover:border-primary/50 hover:text-foreground disabled:opacity-50"
+								disabled={importing}
+								onclick={startImport}
+							>
+								<UploadIcon class="size-4" />
+								{importing ? `${$_('settings.aiImporting')} ${importPct}%` : $_('settings.aiImport')}
+							</button>
+							<p class="text-[11px] text-muted-foreground">{$_('settings.aiImportHint')}</p>
+							{#if importError}
+								<p class="text-xs text-destructive">{importError}</p>
 							{/if}
 							{#if downloadError}
 								<p class="text-xs text-destructive">{downloadErrorMessage(downloadError)}</p>

@@ -1057,7 +1057,7 @@ async fn llm_request(
     // Per-type budgets: a model load can read >1 GB from a cold disk; a download can run
     // for hours (its own stall watchdog aborts dead connections long before this cap).
     let timeout = match req.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-        "download_model" => std::time::Duration::from_secs(24 * 3600),
+        "download_model" | "import_model" => std::time::Duration::from_secs(24 * 3600),
         "load" | "generate" => std::time::Duration::from_secs(300),
         _ => std::time::Duration::from_secs(20),
     };

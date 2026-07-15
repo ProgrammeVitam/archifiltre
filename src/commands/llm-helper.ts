@@ -35,6 +35,10 @@ import {
   downloadModel,
   getLocalModel,
   isModelDownloaded,
+  isCustomModel,
+  importModel,
+  removeModel,
+  listCustomModels,
   modelPath as localModelPath,
   rememberBackend,
 } from '@extensions/ai-describe/local-llm.ts';
@@ -162,6 +166,10 @@ export default class LlmHelper extends Command {
     async function resolveModelPath(req: { modelPath?: string; model?: string }): Promise<string> {
       if (req.modelPath) return req.modelPath;
       const id = req.model?.trim() || DEFAULT_LOCAL_MODEL;
+      if (isCustomModel(id)) {
+        if (!(await isModelDownloaded(id))) throw new Error('The imported model is missing from the models folder.');
+        return localModelPath(id);
+      }
       const info = getLocalModel(id);
       if (!info) throw new Error(`Unknown local model: ${id}`);
       if (!(await isModelDownloaded(id))) {
@@ -173,7 +181,7 @@ export default class LlmHelper extends Command {
     const rl = createInterface({ input: process.stdin });
     rl.on('line', async (line: string) => {
       if (!line.trim()) return;
-      let req: { id?: number; type?: string; modelPath?: string; model?: string; gpu?: unknown; system?: string; prompt?: string; maxTokens?: number; cancelId?: number };
+      let req: { id?: number; type?: string; modelPath?: string; model?: string; path?: string; gpu?: unknown; system?: string; prompt?: string; maxTokens?: number; cancelId?: number };
       try {
         req = JSON.parse(line);
       } catch {
@@ -206,7 +214,42 @@ export default class LlmHelper extends Command {
               downloaded: await isModelDownloaded(m.id),
             }))
           );
-          send({ id, type: 'model_status', models, default: DEFAULT_LOCAL_MODEL });
+          const custom = await listCustomModels();
+          send({ id, type: 'model_status', models: [...models, ...custom], default: DEFAULT_LOCAL_MODEL });
+          return;
+        }
+        if (type === 'import_model') {
+          const src = req.path?.trim();
+          if (!src) {
+            send({ id, type: 'error', message: 'No file path provided.' });
+            return;
+          }
+          let lastEmit = 0;
+          try {
+            const r = await importModel(src, (p) => {
+              const now = Date.now();
+              if (now - lastEmit < 100 && p.received < p.total) return;
+              lastEmit = now;
+              send({ id, type: 'download', model: `custom:${p.file}`, received: p.received, total: p.total, file: p.file });
+            });
+            send({ id, type: 'download_done', model: r.id, path: r.path });
+          } catch (e) {
+            send({ id, type: 'error', model: 'import', message: String((e as Error)?.message ?? e) });
+          }
+          return;
+        }
+        if (type === 'remove_model') {
+          const modelId = req.model?.trim();
+          if (!modelId) {
+            send({ id, type: 'error', message: 'No model id provided.' });
+            return;
+          }
+          try {
+            await removeModel(modelId);
+            send({ id, type: 'removed', model: modelId });
+          } catch (e) {
+            send({ id, type: 'error', model: modelId, message: String((e as Error)?.message ?? e) });
+          }
           return;
         }
         if (type === 'download_model') {

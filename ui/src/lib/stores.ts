@@ -854,7 +854,21 @@ export const aiMode = persistedStr<AiMode>('archifiltre-ai-mode', 'local');
 /** Which local (Qwen) model the `local` AI mode uses. Must be one of the ids the sidecar
  *  advertises via the `model_status` query (see local-llm.ts). Defaults to the balanced
  *  1.5B. The model file is downloaded on demand from Settings › AI. */
-export const localModel = persistedStr<string>('archifiltre-local-model', 'qwen2.5-1.5b');
+// One-time GPU-safety migration: the 1.5B model loaded onto a laptop GPU (Vulkan) can
+// exhaust VRAM and freeze the desktop compositor. Move existing installs that persisted the
+// old 1.5B default to the GPU-safe 0.5B (proven fast + stable on Vulkan). Runs once, guarded
+// by the flag, so a later explicit choice of 1.5B is respected.
+try {
+	if (typeof localStorage !== 'undefined' && !localStorage.getItem('archifiltre-model-safe-default-v1')) {
+		if (localStorage.getItem('archifiltre-local-model') === 'qwen2.5-1.5b') {
+			localStorage.setItem('archifiltre-local-model', 'qwen2.5-0.5b');
+		}
+		localStorage.setItem('archifiltre-model-safe-default-v1', '1');
+	}
+} catch {
+	/* no localStorage (SSR) */
+}
+export const localModel = persistedStr<string>('archifiltre-local-model', 'qwen2.5-0.5b');
 
 /** The app-global LLM host's model state — set ONLY from the host's own `llm:state`
  *  events (mirrored by $lib/llm-describe), never guessed UI-side: 'loading' while the

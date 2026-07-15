@@ -670,6 +670,7 @@ async fn run_on_helper(
                 return Ok(json!({"ok": true, "data": {"path": msg.get("path")}}));
             }
             "pong" => return Ok(json!({"ok": true, "data": {}})),
+            "removed" => return Ok(json!({"ok": true, "data": {"removed": true}})),
             "cancelled" => return Ok(json!({"ok": false, "error": "cancelled", "cancelled": true})),
             "error" => {
                 let message = msg

@@ -133,7 +133,12 @@
 		"aiNoteFast": "Schnell und leicht",
 		"aiNoteBalanced": "Ausgewogen (Qualität/Tempo)",
 		"aiNoteBest": "Beste Qualität — schwerer",
-		"aiRecommended": "Empfohlen"
+		"aiRecommended": "Empfohlen",
+		"aiCustom": "Eigenes",
+		"aiLocalRemove": "Entfernen",
+		"aiImport": "Modell importieren (.gguf)",
+		"aiImporting": "Import…",
+		"aiImportHint": "Wählen Sie eine lokale .gguf-Datei. Große Modelle können auf manchen GPUs langsam oder instabil sein."
 	},
 	"details": {
 		"details": "Details",

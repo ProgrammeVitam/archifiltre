@@ -1011,7 +1011,7 @@ export async function queryDirectoryDescription(
 			  }
 			| undefined;
 		if (mode === 'local') {
-			let model = 'qwen2.5-1.5b';
+			let model = 'qwen2.5-0.5b'; // GPU-safe default (1.5B on a laptop GPU can freeze the desktop)
 			try {
 				const m = localStorage.getItem('archifiltre-local-model');
 				if (m) model = m;
@@ -1110,6 +1110,8 @@ export interface LocalModelStatus {
 	size: number;
 	license: string;
 	downloaded: boolean;
+	/** True for a user-imported .gguf (id `custom:<file>`), false/absent for catalogue models. */
+	custom?: boolean;
 }
 
 /** Ask which local models exist on disk (for the Settings › LLM picker). Preferred: the
@@ -1225,6 +1227,54 @@ export async function downloadLocalModel(
 		} catch {
 			/* ignore */
 		}
+	}
+}
+
+/**
+ * Import a local `.gguf` file as a custom model. The sidecar validates it's a real GGUF and
+ * copies it into `~/.archifiltre/models/`; progress streams on the `model:download` channel
+ * (only one import runs at a time, so we surface every event). Host-only (needs a file dialog),
+ * so no legacy bridge path. Returns the new `custom:<file>` id on success.
+ */
+export async function importLocalModel(
+	srcPath: string,
+	onProgress?: (p: ModelDownloadProgress) => void
+): Promise<{ ok: boolean; id?: string; error?: string }> {
+	const unlisten: UnlistenFn = await onJobUpdate((e) => {
+		try {
+			const msg = JSON.parse(e.line);
+			if (msg.event !== 'model:download' || msg.error) return;
+			onProgress?.(msg as ModelDownloadProgress);
+		} catch {
+			/* not our event */
+		}
+	});
+	try {
+		const r = await llmRequest({ type: 'import_model', path: srcPath });
+		if (!r.ok) return { ok: false, error: r.error };
+		// The terminal reply carries the copied path; the id is `custom:<basename>`.
+		const path = String((r.data?.path as string | undefined) ?? '');
+		const base = path.replace(/^.*[\\/]/, '');
+		return { ok: true, id: base ? `custom:${base}` : undefined };
+	} catch (e) {
+		return { ok: false, error: String((e as { message?: unknown })?.message ?? e) };
+	} finally {
+		try {
+			await Promise.resolve(unlisten?.()).catch(() => {});
+		} catch {
+			/* ignore */
+		}
+	}
+}
+
+/** Delete a model's file(s) from `~/.archifiltre/models/` — works for a downloaded catalogue
+ *  model OR a custom import. Host-only; best-effort. */
+export async function removeLocalModel(id: string): Promise<boolean> {
+	try {
+		const r = await llmRequest({ type: 'remove_model', model: id });
+		return r.ok;
+	} catch {
+		return false;
 	}
 }
 
