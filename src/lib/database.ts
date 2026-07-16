@@ -7,6 +7,7 @@
 
 import * as path from 'node:path';
 import { promises as fs } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { file } from 'bun';
 import { getDatabasePath } from './platform-paths.ts';
 import { ensureDirectory } from './helpers.ts';
@@ -670,6 +671,29 @@ function templateDir(): string {
   return path.join(path.dirname(path.resolve(createDatabasePath('_t'))), '.dbtemplate');
 }
 
+// Fingerprint of the schema shape a template was built with. A template whose shape differs from
+// the current code's is NOT copied into new scans — it's ignored (fresh init instead) and rebuilt
+// in the background. Derived from the descriptor below rather than a hand-bumped v1/v2 counter: edit
+// the descriptor to match any DDL change (the size columns are BIGINT here — an earlier build made
+// them int4, which overflowed on files/archives >2GB and stranded the scan) and the marker follows
+// automatically. Pre-release, so no migration of existing datadirs — there's nothing to keep.
+const TEMPLATE_SCHEMA_DESCRIPTOR = [
+  'files(run_id:text,path:text,physical_size:bigint,content_size:bigint,mtime:bigint,is_directory:bool,is_hidden:bool,is_system:bool,hash:text,enumerated_at:int,is_archive_container:bool,archive_parent_path:text,archive_depth:int,archive_format:text,extraction_error:text,pk[run_id,path])',
+  'scan_metadata(run_id:text,root_path:text,started_at:int,completed_at:int,file_count:int,status:text,pk[run_id])',
+  'dir_stats(run_id:text,path:text,total_size:bigint,file_count:bigint,dir_count:bigint,max_depth:int,deepest_path:text,pk[run_id,path])',
+].join(';');
+const TEMPLATE_SCHEMA_VERSION = createHash('sha1').update(TEMPLATE_SCHEMA_DESCRIPTOR).digest('hex').slice(0, 12);
+
+/** True iff a warm-start template exists AND matches the current schema version. A template from
+ *  an older schema is treated as absent (so its stale shape is never copied into a new scan). */
+async function isTemplateReady(): Promise<boolean> {
+  try {
+    return (await fs.readFile(`${templateDir()}.ready`, 'utf8')).trim() === TEMPLATE_SCHEMA_VERSION;
+  } catch {
+    return false;
+  }
+}
+
 async function pathExists(p: string): Promise<boolean> {
   try {
     await fs.access(p);
@@ -685,7 +709,7 @@ async function pathExists(p: string): Promise<boolean> {
 export async function ensureTemplateInBackground(): Promise<void> {
   const dir = templateDir();
   const ready = `${dir}.ready`;
-  if (_templateBuilding || (await pathExists(ready))) return;
+  if (_templateBuilding || (await isTemplateReady())) return; // current-version template present
   _templateBuilding = true;
   try {
     const build = `${dir}.building-${process.pid}`;
@@ -697,7 +721,7 @@ export async function ensureTemplateInBackground(): Promise<void> {
     await pg.close();
     await fs.rm(dir, { recursive: true, force: true });
     await fs.rename(build, dir); // atomic swap into place
-    await fs.writeFile(ready, 'v1'); // sibling marker (kept OUT of the copied PGDATA)
+    await fs.writeFile(ready, TEMPLATE_SCHEMA_VERSION); // sibling marker (kept OUT of the copied PGDATA)
     logger.debug('Warm-start template built', { dir });
   } catch (error) {
     logger.warn('Warm-start template build failed; using normal init', {
@@ -721,8 +745,10 @@ export async function createDatabase(name: string): Promise<DatabaseConnection> 
     logger.debug('Creating database', { name, dbPath, resolvedPath });
 
     const fresh = !(await pathExists(resolvedPath));
-    if (fresh && (await pathExists(`${templateDir()}.ready`))) {
-      // Warm path: copy the pre-initialized template instead of running initdb.
+    if (fresh && (await isTemplateReady())) {
+      // Warm path: copy the pre-initialized template instead of running initdb. A stale-schema
+      // template (older version marker) is ignored here, so its old column shapes never seed a
+      // new scan — we init fresh (current schema) instead and the template is rebuilt in bg.
       await fs.cp(templateDir(), resolvedPath, { recursive: true });
     } else {
       await ensureDirectory(resolvedPath);

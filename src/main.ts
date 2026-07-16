@@ -104,7 +104,7 @@ class StandaloneConfig extends Config {
 
     // Configure oclif paths to use our app data directory structure
     Object.defineProperty(this, 'name', { value: 'archifiltre', writable: false });
-    Object.defineProperty(this, 'version', { value: '5.0.0-alpha.3', writable: false });
+    Object.defineProperty(this, 'version', { value: '5.0.0-alpha.5', writable: false });
     Object.defineProperty(this, 'bin', { value: 'archifiltre', writable: false });
     Object.defineProperty(this, 'root', { value: appDataDir, writable: false });
     Object.defineProperty(this, 'dataDir', { value: dataPath, writable: false });
@@ -122,7 +122,7 @@ class StandaloneConfig extends Config {
     Object.defineProperty(this, 'pjson', {
       value: {
         name: 'archifiltre',
-        version: '5.0.0-alpha.3',
+        version: '5.0.0-alpha.5',
         description:
           'Privacy-friendly, 100% offline desktop tool for inventorying large file trees',
         oclif: {
@@ -220,7 +220,7 @@ function showHelp(commandName?: string) {
       }
     }
   } else {
-    console.log(`Archifiltre v5.0.0-alpha.3
+    console.log(`Archifiltre v5.0.0-alpha.5
 Privacy-friendly, 100% offline file tree inventory tool
 
 USAGE
