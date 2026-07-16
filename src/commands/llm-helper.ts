@@ -93,7 +93,11 @@ export default class LlmHelper extends Command {
         }
       }
       if (!entry) throw new Error('node-llama-cpp not resolvable from cwd or exe dir');
-      nlc = (await import(entry)) as typeof import('node-llama-cpp');
+      // Bun.resolveSync can return a Windows extended-length path (\\?\C:\…) that import() rejects;
+      // strip the prefix and import a file:// URL, which loads reliably on every platform.
+      const { pathToFileURL } = await import('node:url');
+      const normalized = entry.startsWith('\\\\?\\') ? entry.slice(4) : entry;
+      nlc = (await import(pathToFileURL(normalized).href)) as typeof import('node-llama-cpp');
     } catch (e) {
       err('failed to load node-llama-cpp: ' + String((e as Error)?.stack ?? e));
       // Also to the FILE log (not just discarded stderr) so the REASON the runtime won't load
