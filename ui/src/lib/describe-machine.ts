@@ -158,8 +158,9 @@ export const summaryMachine = setup({
 			always: [{ guard: 'completed', actions: assign({ midScan: false, streamingText: '' }), target: 'generating' }]
 		},
 		error: {
-			// Re-arm at scan completion (the old context-change re-arm): a settled scan regenerates.
-			always: [{ guard: 'completed', actions: assign({ midScan: false, streamingText: '' }), target: 'generating' }]
+			// Terminal: surfaces once, no auto-regenerate. A static `completed` re-arm here would
+			// re-fire forever on a persistent failure. Mid-scan failures use `deferred`/`partial`,
+			// which regenerate once at completion.
 		}
 	}
 });

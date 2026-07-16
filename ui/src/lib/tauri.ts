@@ -9,6 +9,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 export type { UnlistenFn };
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { logFrontend } from '$lib/log-buffer';
+import { circuitBreaker, handleAll, ConsecutiveBreaker, isBrokenCircuitError } from 'cockatiel';
 
 // ================================
 // Single-owner DB mode (read-while-scanning)
@@ -845,6 +847,33 @@ async function llmRequest(req: Record<string, unknown>): Promise<LlmEnvelope> {
 	return (await invoke('llm_request', { req })) as LlmEnvelope;
 }
 
+/** Shared circuit breaker for the LLM host generate call: after consecutive failures it opens and
+ *  describes fast-fail instead of flooding a down host, then half-opens to recover. Counts thrown
+ *  failures only (a `{ok:false}` result is handled by the caller). */
+const llmHostBreaker = circuitBreaker(handleAll, {
+	halfOpenAfter: 30_000,
+	breaker: new ConsecutiveBreaker(5)
+});
+llmHostBreaker.onBreak(() => logFrontend('llm.circuit.open', { cooldownMs: 30_000 }));
+llmHostBreaker.onHalfOpen(() => logFrontend('llm.circuit.half-open'));
+llmHostBreaker.onReset(() => logFrontend('llm.circuit.reset'));
+
+/**
+ * Best-effort: drain the LLM helper's in-memory RFC5424 log ring (backend/model-load + the
+ * AI-stage trace) for the export bundle. This is the copy NOT held in the open .log file, so it
+ * survives a Windows lock. Never throws / never blocks the export: no host, no helper, or any
+ * error → returns undefined and the export omits it. Analog of the owner's fetchSidecarRing().
+ */
+export async function fetchHelperRing(): Promise<string | undefined> {
+	try {
+		const env = await llmRequest({ type: 'get_ring_log' });
+		const ring = env.ok ? (env.data as { ring?: unknown })?.ring : undefined;
+		return typeof ring === 'string' && ring.length > 0 ? ring : undefined;
+	} catch {
+		return undefined; // non-Tauri env or host unspawnable → just omit it
+	}
+}
+
 /** Options for a describe: who asked (user click vs auto rule — autos are preemptible on
  *  the host), a stable clientId for cancellation/queue-tracking, and an explicit db so the
  *  coordinator's requests never retarget when the active tab changes mid-flight. */
@@ -852,6 +881,9 @@ export interface DescribeOpts {
 	kind?: 'user' | 'auto';
 	clientId?: string;
 	dbName?: string;
+	/** Correlation id for this describe invocation — threaded to owner (prepare/store) + helper
+	 *  (generate) so the whole trace shares one id in the exported logs (see llm-describe.ts). */
+	describeId?: string;
 }
 
 /** Cancel a describe by its clientId — drops it from the host queue, or aborts the running
@@ -880,7 +912,8 @@ async function describeViaHost(
 			id: `describe_prepare_${Date.now()}`,
 			action: 'describe_prepare',
 			path: dirPath,
-			llm: { provider: 'local', lang }
+			llm: { provider: 'local', lang },
+			...(opts?.describeId ? { describeId: opts.describeId } : {})
 		},
 		opts?.dbName,
 		30_000
@@ -911,17 +944,41 @@ async function describeViaHost(
 				}
 			});
 		}
-		const gen = await llmRequest({
-			type: 'generate',
-			model,
-			system: p.system,
-			prompt: p.prompt,
-			maxTokens: 256,
-			...(streamId ? { streamId } : {}),
-			...(opts?.clientId ? { clientId: opts.clientId } : {}),
-			...(opts?.kind ? { kind: opts.kind } : {})
-		});
-		if (!gen.ok) return { description: null, error: gen.error ?? 'AI runtime not available' };
+		// When the helper never starts, no helper-side line exists — these are the only record of
+		// why leg 2 failed.
+		logFrontend('llm.generate.request', { describeId: opts?.describeId, model });
+		let gen;
+		try {
+			gen = await llmHostBreaker.execute(() =>
+				llmRequest({
+					type: 'generate',
+					model,
+					system: p.system,
+					prompt: p.prompt,
+					maxTokens: 256,
+					...(streamId ? { streamId } : {}),
+					...(opts?.clientId ? { clientId: opts.clientId } : {}),
+					...(opts?.kind ? { kind: opts.kind } : {}),
+					...(opts?.describeId ? { describeId: opts.describeId } : {})
+				})
+			);
+		} catch (e) {
+			if (isBrokenCircuitError(e)) {
+				// Breaker open → fast-fail without touching the down host.
+				logFrontend('llm.generate.circuit-open', { describeId: opts?.describeId });
+				return { description: null, error: 'AI temporarily unavailable' };
+			}
+			// Host transport unavailable (host unspawnable / non-Tauri) → caller falls back to legacy.
+			logFrontend('llm.generate.transport-fail', {
+				describeId: opts?.describeId,
+				reason: String((e as Error)?.message ?? e)
+			});
+			throw e;
+		}
+		if (!gen.ok) {
+			logFrontend('llm.generate.failed', { describeId: opts?.describeId, reason: gen.error });
+			return { description: null, error: gen.error ?? 'AI runtime not available' };
+		}
 		const text = ((gen.data?.text as string) ?? '').trim();
 		if (!text) return { description: null, error: 'AI runtime returned no text' };
 		// Persist for cache hits — fire-and-forget; a failed cache write must not hide the summary.
@@ -933,7 +990,8 @@ async function describeViaHost(
 					path: dirPath,
 					description: text,
 					model,
-					lang
+					lang,
+					...(opts?.describeId ? { describeId: opts.describeId } : {})
 				},
 				opts?.dbName
 			).catch(() => {});

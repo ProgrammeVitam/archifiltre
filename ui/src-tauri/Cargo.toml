@@ -21,6 +21,10 @@ serde_json = "1"
 log = "0.4"
 tokio = { version = "1", features = ["sync", "process", "io-util"] }
 uuid = { version = "1", features = ["v4"] }
+# Pure-Rust zip writer for the crash-only log export: lets the Tauri shell produce ONE shareable
+# .zip with zero dependency on the Bun sidecar (which is exactly what may be wedged). No default
+# features → no bzip2/zstd C deps, so it cross-compiles cleanly (cargo-xwin).
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # Native window effects — vibrancy on macOS, acrylic on Windows. Not pulled on Linux
 # (window-vibrancy has no Linux backend); Linux keeps the translucent look + the CSS

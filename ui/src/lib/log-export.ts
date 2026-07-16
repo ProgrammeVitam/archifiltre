@@ -11,10 +11,29 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { get } from 'svelte/store';
-import { selectExportPath, type CommandResult } from '$lib/tauri';
+import { selectExportPath, sendQuery, fetchHelperRing, type CommandResult } from '$lib/tauri';
 import { getFrontendLog } from '$lib/log-buffer';
 import { scansStore, cliVersion, platform, reportSaveStatus } from '$lib/stores';
 import { locale } from '$lib/i18n';
+
+/**
+ * Best-effort: drain the active scan owner's in-memory log ring (RFC5424 lines). This is the
+ * copy of the sidecar's recent logs that is NOT held in the open file, so it lands in the bundle
+ * even when a Windows file lock makes the active .log unreadable. Never blocks or fails the export:
+ * no active scan, no session, or any error → we simply omit it and export the on-disk files.
+ */
+async function fetchSidecarRing(): Promise<string | undefined> {
+	try {
+		const s = get(scansStore);
+		const dbName = s.scans.find((x) => x.id === s.activeScanId)?.dbName;
+		if (!dbName) return undefined; // no live owner → nothing in memory to drain
+		const res = await sendQuery({ id: `ringlog_${Date.now()}`, action: 'get_ring_log' }, dbName, 4000);
+		const ring = res.ok ? (res.data as { ring?: unknown })?.ring : undefined;
+		return typeof ring === 'string' && ring.length > 0 ? ring : undefined;
+	} catch {
+		return undefined; // export must never break because the ring couldn't be fetched
+	}
+}
 
 /** Serialise a compact, path-light summary of the UI session for ui-state.json. */
 function buildUiState(): string {
@@ -70,20 +89,65 @@ export async function exportLogsFlow(): Promise<boolean> {
 
 	reportSaveStatus('saving', 'logs');
 	try {
-		const snapshot = JSON.stringify({ frontendLog: getFrontendLog(), uiState: buildUiState() });
+		// The two in-memory rings are drained from the (possibly pinned) owner/host — race each
+		// against a short deadline so a wedged app can NEVER block or fail the export. Whatever
+		// isn't back in time is dropped, never awaited or retried. The frontend snapshot
+		// (getFrontendLog/buildUiState) is pure in-memory and always instant.
+		const [sidecarRing, helperRing] = await Promise.all([
+			bounded(fetchSidecarRing()),
+			bounded(fetchHelperRing())
+		]);
+		const snapshot = JSON.stringify({
+			frontendLog: getFrontendLog(),
+			uiState: buildUiState(),
+			...(sidecarRing ? { sidecarRing } : {}),
+			...(helperRing ? { helperRing } : {})
+		});
 		const result = await invoke<CommandResult>('export_logs', { outputPath, snapshot });
-		if (!result.success) {
-			console.error('Log export failed:', result.error ?? result.output);
-			reportSaveStatus('error', 'logs');
-			return false;
+		if (result.success) {
+			reportSaveStatus('saved', 'logs');
+			return true;
 		}
-		reportSaveStatus('saved', 'logs');
-		return true;
+		console.error('Log export failed, falling back to raw copy:', result.error ?? result.output);
 	} catch (error) {
-		console.error('Log export failed:', error);
-		reportSaveStatus('error', 'logs');
-		return false;
+		console.error('Log export threw, falling back to raw copy:', error);
 	}
+	// FAIL-SAFE: the rich export failed (app wedged, locked destination, sidecar unspawnable). Fall
+	// back to the Rust-native raw copy — it needs NOTHING from the sidecar/owner/host, so the user
+	// always gets their logs. This is the "never blind" guarantee.
+	return await fallbackRawCopy();
+}
+
+/** Race a promise against a short deadline; resolves undefined if it doesn't beat it (never rejects,
+ *  never retries). Used to bound the best-effort ring fetches so they can't block the export. */
+function bounded<T>(p: Promise<T>, ms = 1500): Promise<T | undefined> {
+	return Promise.race([
+		p.catch(() => undefined),
+		new Promise<undefined>((r) => setTimeout(() => r(undefined), ms))
+	]);
+}
+
+/** The crash-only fallback: ask the Rust shell to zip the .log files into ONE dated .zip in
+ *  Downloads with zero dependency on the (possibly wedged) Bun sidecar / owner / host. A single
+ *  dated .zip is mail-client-friendly and removes the "grab the wrong dated .log" trap. Always
+ *  gives the user something. The webview builds the name (Rust has no easy date formatting). */
+async function fallbackRawCopy(): Promise<boolean> {
+	try {
+		const d = new Date();
+		const p = (n: number) => String(n).padStart(2, '0');
+		const filename = `archifiltre-logs-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}.zip`;
+		const res = await invoke<CommandResult>('copy_logs_raw', { filename });
+		if (res.success) {
+			console.warn('Fail-safe log zip written to:', res.output);
+			reportSaveStatus('saved', 'logs');
+			return true;
+		}
+		console.error('Fail-safe log zip failed:', res.error ?? res.output);
+	} catch (e) {
+		console.error('Fail-safe log zip threw:', e);
+	}
+	reportSaveStatus('error', 'logs');
+	return false;
 }
 
 /**

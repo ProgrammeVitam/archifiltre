@@ -6,6 +6,7 @@
  */
 
 import winston from 'winston';
+import Transport from 'winston-transport';
 import DailyRotateFile from 'winston-daily-rotate-file';
 import { join } from 'path';
 import { homedir, hostname } from 'os';
@@ -89,7 +90,9 @@ function createRFC5424Format(appName: string): winston.Logform.Format {
 
       if (metadata.length > 0) {
         const sdElements = metadata
-          .map(([key, value]) => `${key}="${String(value).replace(/"/g, '\\"')}"`)
+          // Escape `"` and strip `]`/newlines: a `]` would prematurely close the [context …] block
+          // and a newline would split the record, breaking the line-based timestamp-merge in export.
+          .map(([key, value]) => `${key}="${String(value).replace(/"/g, '\\"').replace(/[\]\r\n]+/g, ' ')}"`)
           .join(' ');
         structuredData = `[context ${sdElements}]`;
       }
@@ -111,6 +114,51 @@ function getSyslogPriority(level: string): number {
   };
   const severity = severityMap[level] || 6;
   return facility * 8 + severity;
+}
+
+// === In-memory ring transport (the CyclicBufferAppender / MemoryTarget pattern) ===
+//
+// A bounded ring of the most recent formatted lines, kept in the long-running process's memory.
+// This is the export SOURCE that is decoupled from the open file handle — draining it never touches
+// the winston-held file (the Windows lock class). winston ships no MemoryTarget, so this is the
+// standard pattern via its documented `winston-transport` extension point. It carries the SAME
+// RFC5424 lines as the file (its format is set to createRFC5424Format), so a drain === the file.
+const WINSTON_MESSAGE = Symbol.for('message');
+
+class MemoryRingTransport extends Transport {
+  private buf: string[] = [];
+  constructor(private readonly max = 5000, opts?: Transport.TransportStreamOptions) {
+    super(opts);
+  }
+
+  log(info: Record<string | symbol, unknown>, callback: () => void): void {
+    setImmediate(() => this.emit('logged', info));
+    try {
+      // winston writes the transport-formatted output to the MESSAGE symbol; that's the RFC5424
+      // line (this transport's format === the file's). Fall back to the raw message defensively.
+      const line = (info[WINSTON_MESSAGE] as string | undefined) ?? String(info.message ?? '');
+      this.buf.push(line);
+      if (this.buf.length > this.max) this.buf.splice(0, this.buf.length - this.max);
+    } catch {
+      // ring capture must never break logging
+    }
+    callback();
+  }
+
+  /** The most-recent RFC5424 lines (newest last) as text — the export source. */
+  drain(): string {
+    return this.buf.length ? this.buf.join('\n') + '\n' : '';
+  }
+}
+
+// The active process's ring, exposed for the export path (see drainRingLog()).
+let ringTransport: MemoryRingTransport | null = null;
+
+/** Drain this process's in-memory log ring as RFC5424 text. Empty string if none.
+ *  Cross-process note: only the long-running process (session/owner) accumulates a useful ring;
+ *  a short-lived CLI invocation's ring is nearly empty (see the ADR process-boundary note). */
+export function drainRingLog(): string {
+  return ringTransport ? ringTransport.drain() : '';
 }
 
 // === Main Logger Class ===
@@ -161,6 +209,14 @@ class ArchifiltrLogger {
         })
       );
     }
+
+    // In-memory ring — the export source decoupled from the open file handle. Always on (cheap,
+    // bounded): a drain-not-read export reads it so a Windows file lock can't empty the bundle.
+    // Same RFC5424 format as the file, so drained lines are identical to what's on disk.
+    ringTransport = new MemoryRingTransport(5000, {
+      format: createRFC5424Format(this.config.appName),
+    });
+    transports.push(ringTransport);
 
     return winston.createLogger({
       level: this.config.level,

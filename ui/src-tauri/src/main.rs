@@ -456,6 +456,102 @@ async fn open_logs_dir(app: tauri::AppHandle) -> Result<CommandResult, String> {
     })
 }
 
+/// FAIL-SAFE log export (crash-only path): zip the `.log` files into ONE dated `.zip` in Downloads
+/// with ZERO dependency on the Bun sidecar, the DB owner, or the LLM host — so a user can ALWAYS
+/// send logs, even when the rest of the app is wedged/thrashing (the one time diagnostics matter
+/// most). A single `.zip` (not a folder of `.log` files) is what mail clients accept and removes the
+/// "grab the wrong dated file" trap. The logs dir is resolved HERE in Rust the same way the sidecar
+/// computes it (mirror of `src/lib/platform-paths.ts getAppDataDir()` + `/logs`), so it works when
+/// the sidecar can't run. `filename` is the dated name the webview builds (e.g.
+/// `archifiltre-logs-2026-07-16_16-51-23.zip`). Per-file best-effort: a locked active `.log` is
+/// skipped, not fatal — the rotated files still land.
+#[tauri::command]
+async fn copy_logs_raw(app: tauri::AppHandle, filename: String) -> Result<CommandResult, String> {
+    use std::io::Write;
+    use std::path::PathBuf;
+    use tauri::Manager;
+
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_default();
+    let app_data: PathBuf = if cfg!(target_os = "windows") {
+        PathBuf::from(
+            std::env::var("LOCALAPPDATA")
+                .or_else(|_| std::env::var("APPDATA"))
+                .unwrap_or_else(|_| home.clone()),
+        )
+        .join("archifiltre")
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from(&home)
+            .join("Library")
+            .join("Application Support")
+            .join("archifiltre")
+    } else {
+        PathBuf::from(
+            std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{}/.local/share", home)),
+        )
+        .join("archifiltre")
+    };
+    let logs_dir = app_data.join("logs");
+    if !logs_dir.is_dir() {
+        return Err(format!("No logs folder found at {}", logs_dir.display()));
+    }
+
+    let downloads = app
+        .path()
+        .download_dir()
+        .unwrap_or_else(|_| PathBuf::from(&home).join("Downloads"));
+    // Reduce the caller name to a bare `<name>.zip` (no path traversal, always a .zip).
+    let mut name = std::path::Path::new(&filename)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("archifiltre-logs.zip")
+        .to_string();
+    if !name.to_lowercase().ends_with(".zip") {
+        name.push_str(".zip");
+    }
+    let target = downloads.join(&name);
+
+    let file =
+        std::fs::File::create(&target).map_err(|e| format!("Could not create {}: {}", target.display(), e))?;
+    let mut zip = zip::ZipWriter::new(file);
+    let opts = zip::write::SimpleFileOptions::default();
+
+    let mut added = 0u32;
+    let mut skipped = 0u32;
+    if let Ok(entries) = std::fs::read_dir(&logs_dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) == Some("log") {
+                // read → add: a locked active file fails the read and is skipped, not fatal.
+                match std::fs::read(&p) {
+                    Ok(bytes) => {
+                        let inner = e.file_name().to_string_lossy().to_string();
+                        if zip.start_file(inner, opts).is_ok() && zip.write_all(&bytes).is_ok() {
+                            added += 1;
+                        } else {
+                            skipped += 1;
+                        }
+                    }
+                    Err(_) => skipped += 1,
+                }
+            }
+        }
+    }
+    zip.finish()
+        .map_err(|e| format!("Could not finalize zip {}: {}", target.display(), e))?;
+
+    Ok(CommandResult {
+        success: added > 0,
+        output: target.display().to_string(),
+        error: if skipped == 0 {
+            None
+        } else {
+            Some(format!("skipped {} unreadable file(s)", skipped))
+        },
+    })
+}
+
 // ============================================================================
 // Commands - Scan
 // ============================================================================
@@ -1193,6 +1289,7 @@ fn main() {
             list_datadirs,
             export_logs,
             open_logs_dir,
+            copy_logs_raw,
             // Scan
             scan_directory,
             // Checksum

@@ -273,6 +273,27 @@ impl Worker {
             return;
         }
 
+        // ── get_ring_log: a PURE READ for the log export. Peek the LIVE helper's in-memory ring,
+        // but NEVER spawn one — a read must have no side effects, and the export must stay decoupled
+        // from the LLM host's health (a broken/absent helper must not block, or be launched by,
+        // "export logs"). No live helper → empty ring, replied instantly.
+        if req_type == "get_ring_log" {
+            match self.proc.clone().filter(|p| p.alive.load(Ordering::SeqCst)) {
+                Some(proc) => {
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    tokio::spawn(async move {
+                        let r = run_on_helper(proc, req, &sink, timeout, id).await;
+                        let _ = reply.send(r);
+                    });
+                }
+                None => {
+                    let _ = reply.send(Ok(json!({"ok": true, "data": {"ring": ""}})));
+                }
+            }
+            return;
+        }
+
         // ── model_status / download_model / ping: bypass the queue, run concurrently ──
         let serialized = req_type == "load" || req_type == "generate";
         if !serialized {
@@ -670,6 +691,9 @@ async fn run_on_helper(
                 return Ok(json!({"ok": true, "data": {"path": msg.get("path")}}));
             }
             "pong" => return Ok(json!({"ok": true, "data": {}})),
+            // Drained helper log ring (RFC5424 text) for the export bundle. Without this arm the
+            // frame would fall through to `_ => {}` and the request would spin until timeout.
+            "ring" => return Ok(json!({"ok": true, "data": {"ring": msg.get("data")}})),
             "removed" => return Ok(json!({"ok": true, "data": {"removed": true}})),
             "cancelled" => return Ok(json!({"ok": false, "error": "cancelled", "cancelled": true})),
             "error" => {

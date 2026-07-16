@@ -14,8 +14,9 @@
 
 interface LogEntry {
 	ts: string;
-	level: 'error' | 'warn' | 'window-error' | 'unhandled-rejection';
+	level: 'error' | 'warn' | 'window-error' | 'unhandled-rejection' | 'engine';
 	text: string;
+	attrs?: Record<string, unknown>;
 }
 
 const MAX_ENTRIES = 2000;
@@ -32,9 +33,22 @@ function serialize(arg: unknown): string {
 	}
 }
 
-function push(level: LogEntry['level'], text: string): void {
-	entries.push({ ts: new Date().toISOString(), level, text });
+function push(level: LogEntry['level'], text: string, attrs?: Record<string, unknown>): void {
+	entries.push({ ts: new Date().toISOString(), level, text, attrs });
 	if (entries.length > MAX_ENTRIES) entries.splice(0, entries.length - MAX_ENTRIES);
+}
+
+/**
+ * Record an engine-lifecycle event into the ring so the UI leg of the AI trace (where the
+ * `describeId` originates) is present in the export, not just console errors. Renders as RFC5424
+ * with `event` as the message and `attrs` (describeId, path, kind…) in the `[context …]` block.
+ */
+export function logFrontend(event: string, attrs?: Record<string, unknown>): void {
+	try {
+		push('engine', event, attrs);
+	} catch {
+		/* capture must never break the app */
+	}
 }
 
 /** Install the capture hooks (idempotent). Call once at app bootstrap. */
@@ -62,8 +76,41 @@ export function installLogCapture(): void {
 	});
 }
 
-/** Render the buffer as text lines for the export bundle's frontend.log. */
+// RFC5424 severity per level (facility 16/local0 → priority = 128 + severity), so frontend.log is
+// uniform with the sidecar/helper/owner rings and merges into one timestamp-ordered timeline.
+const SEVERITY: Record<LogEntry['level'], number> = {
+	error: 3,
+	'window-error': 3,
+	'unhandled-rejection': 3,
+	warn: 4,
+	engine: 6
+};
+
+/** Escape a structured-data value: RFC5424 SD forbids raw `"`; keep each record on ONE line and
+ *  never emit `]` (which would truncate the `[context …]` block) so the line-based merge is safe. */
+function sd(v: unknown): string {
+	return String(v).replace(/"/g, '\\"').replace(/[\]\r\n]+/g, ' ');
+}
+
+/** Render the buffer as RFC5424 lines for the export bundle's frontend.log. One record per line
+ *  (`<pri>1 <ts> webview archifiltre-ui - - [context source="frontend" …] <msg>`) — host/procid are
+ *  synthetic since a webview has neither. */
 export function getFrontendLog(): string {
 	if (entries.length === 0) return '(no frontend errors or warnings captured this session)\n';
-	return entries.map((e) => `${e.ts} [${e.level}] ${e.text}`).join('\n') + '\n';
+	return (
+		entries
+			.map((e) => {
+				const pri = 16 * 8 + SEVERITY[e.level];
+				const ctx = [
+					['source', 'frontend'],
+					['level', e.level],
+					...Object.entries(e.attrs ?? {}).filter(([, v]) => v !== undefined)
+				]
+					.map(([k, v]) => `${k}="${sd(v)}"`)
+					.join(' ');
+				const body = e.text.replace(/[\r\n]+/g, ' | ');
+				return `<${pri}>1 ${e.ts} webview archifiltre-ui - - [context ${ctx}] ${body}`;
+			})
+			.join('\n') + '\n'
+	);
 }

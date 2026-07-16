@@ -1,6 +1,6 @@
 {
   "name": "archifiltre",
-  "version": "5.0.0-alpha.5",
+  "version": "5.0.0-beta.1",
   "description": "Privacy-friendly, 100% offline desktop tool for inventorying large file trees",
   "type": "module",
   "bin": {

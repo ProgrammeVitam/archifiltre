@@ -17,7 +17,7 @@
 
 import { Command, Flags } from '@oclif/core';
 import * as readline from 'node:readline';
-import { initializeLogging } from '@lib/logging.ts';
+import { initializeLogging, drainRingLog, logger } from '@lib/logging.ts';
 // NOTE: Do NOT use setupOclifContext or enableConsoleLogging - any stdout output corrupts the JSON protocol
 import {
   createScanDatabase,
@@ -909,6 +909,11 @@ export async function dispatchQuery(
       return await handleGetComposition(database, runId, (request.path as string) ?? '');
     case 'ping':
       return { pong: true, timestamp: Date.now() };
+    case 'get_ring_log':
+      // Drain this owner process's in-memory log ring (RFC5424 lines) for the export bundle.
+      // Decoupled from the open log file, so a Windows file lock can't empty the diagnostics.
+      // DB-free: the ring lives in process memory, so this works even when the DB is broken.
+      return { ring: drainRingLog() };
     case 'describe_directory':
       return await handleDescribeDirectory(
         database,
@@ -928,20 +933,37 @@ export async function dispatchQuery(
       );
     // Split describe for the app-global LLM host: the owner does the DB halves (cache +
     // gate + prompt, then the cache write); generation runs on the host (Rust-owned).
-    case 'describe_prepare':
-      return await handleDescribePrepare(
+    case 'describe_prepare': {
+      const prepared = await handleDescribePrepare(
         database,
         runId,
         (request.path as string) ?? '',
         request.llm as { provider?: 'local' | 'external'; lang?: string } | undefined,
         scanning
       );
-    case 'store_description':
-      return await handleStoreDescription(database, runId, (request.path as string) ?? '', {
+      // AI-trace leg 1 (grep 'llm.describe.prepare'), correlated by describeId. `gateBlocked=scan`
+      // means the describe was deferred because a scan is in progress; the ABSENCE of this line for
+      // a describe means leg 1 never ran (session/run not ready — the run-readiness latch upstream).
+      const p = prepared as { error?: string; cached?: unknown; cacheable?: boolean };
+      logger.info('llm.describe.prepare', {
+        describeId: request.describeId as string | undefined,
+        gateBlocked: p.error === 'scan-in-progress' ? 'scan' : undefined,
+        cached: !!p.cached,
+        cacheable: p.cacheable,
+      });
+      return prepared;
+    }
+    case 'store_description': {
+      const stored = await handleStoreDescription(database, runId, (request.path as string) ?? '', {
         description: (request.description as string) ?? '',
         model: (request.model as string) ?? 'unknown',
         lang: request.lang as string | undefined,
       });
+      logger.info('llm.describe.store', {
+        describeId: request.describeId as string | undefined,
+      });
+      return stored;
+    }
     case 'model_status':
       return await handleModelStatus();
     case 'warm_model':

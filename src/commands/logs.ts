@@ -31,10 +31,14 @@ import pkg from '../../package.json' with { type: 'json' };
 const execAsync = promisify(exec);
 
 /** Frontend snapshot piped over stdin by the desktop app (--snapshot-stdin):
- *  the webview's in-memory error ring buffer + a UI-state summary. */
+ *  the webview's in-memory error ring buffer + a UI-state summary + two in-memory RFC5424 rings
+ *  drained from memory (so a locked active .log can't empty them): the scan owner's (`sidecarRing`)
+ *  and the LLM helper's (`helperRing` — backend/model-load + the AI-stage trace). */
 interface FrontendSnapshot {
   frontendLog?: string;
   uiState?: string;
+  sidecarRing?: string;
+  helperRing?: string;
 }
 
 export default class Logs extends Command {
@@ -531,6 +535,7 @@ export default class Logs extends Command {
 
     // Collect the bundle entries first, then write them in the chosen container.
     const entries: { name: string; content: Buffer; mtime?: Date }[] = [];
+    const exportIssues: string[] = []; // files that couldn't be read (surfaced in the bundle + log)
     let filteredCount = 0;
 
     if (scanFilter) {
@@ -547,12 +552,26 @@ export default class Logs extends Command {
         content: Buffer.from(`${filteredLines.join('\n')}\n`, 'utf-8'),
       });
     } else {
+      // Read each log file defensively: on Windows the ACTIVE log file is held open by the
+      // running sidecar (winston), and a single unreadable/locked file must NOT abort the whole
+      // export (which surfaced as a generic failure with no reason). A file we can't read becomes a note
+      // in the bundle + a report line, so the export still succeeds and we can see WHY it failed.
       for (const logFile of logFiles) {
-        entries.push({
-          name: logFile.name,
-          content: await fsp.readFile(logFile.path),
-          mtime: logFile.mtime,
-        });
+        try {
+          entries.push({
+            name: logFile.name,
+            content: await fsp.readFile(logFile.path),
+            mtime: logFile.mtime,
+          });
+        } catch (e) {
+          const err = e as { code?: unknown; message?: unknown };
+          const detail = `${logFile.name}: ${String(err?.code ?? '')} ${String(err?.message ?? e)}`.trim();
+          exportIssues.push(detail);
+          entries.push({
+            name: `${logFile.name}.UNREADABLE.txt`,
+            content: Buffer.from(`Could not read ${logFile.path}\n${detail}\n`, 'utf-8'),
+          });
+        }
       }
     }
 
@@ -562,6 +581,41 @@ export default class Logs extends Command {
     }
     if (snapshot?.uiState) {
       entries.push({ name: 'ui-state.json', content: Buffer.from(snapshot.uiState, 'utf-8') });
+    }
+    // The active scan owner's in-memory log ring (RFC5424) — a copy of the sidecar's recent logs
+    // that is NOT the open file, so it survives a Windows lock that leaves the active .log UNREADABLE.
+    if (snapshot?.sidecarRing) {
+      entries.push({ name: 'sidecar-ring.log', content: Buffer.from(snapshot.sidecarRing, 'utf-8') });
+    }
+    // The LLM helper's in-memory log ring (RFC5424) — backend/model-load lines + the AI-stage trace,
+    // drained from the helper process's memory so model-loading diagnostics survive a .log lock.
+    if (snapshot?.helperRing) {
+      entries.push({ name: 'helper-ring.log', content: Buffer.from(snapshot.helperRing, 'utf-8') });
+    }
+
+    // merged.log — ONE timestamp-ordered timeline across every RFC5424 source (the on-disk .log
+    // files + all three rings: owner, helper, frontend). Every source shares the RFC5424 format, so
+    // this is a pure interleave-by-timestamp — `grep <describeId> merged.log` reads the whole
+    // UI → host → helper → owner trace top-to-bottom. Exact-duplicate lines are dropped (a process
+    // writes to both its ring AND the daily file, so ring+file overlap); unparseable lines (no
+    // leading RFC5424 timestamp) are appended after, keeping their order. Full export only.
+    if (!scanFilter) {
+      const seen = new Set<string>();
+      const dated: { ts: number; line: string }[] = [];
+      const undated: string[] = [];
+      for (const e of entries) {
+        if (!e.name.endsWith('.log')) continue; // .log = the RFC5424 sources (skip json/txt/UNREADABLE)
+        for (const line of e.content.toString('utf-8').split('\n')) {
+          if (!line.trim() || seen.has(line)) continue;
+          seen.add(line);
+          const ts = this.parseLogTimestamp(line);
+          if (ts) dated.push({ ts: ts.getTime(), line });
+          else undated.push(line);
+        }
+      }
+      dated.sort((a, b) => a.ts - b.ts); // Array.sort is stable → equal timestamps keep source order
+      const mergedText = [...dated.map((d) => d.line), ...undated].join('\n') + '\n';
+      entries.push({ name: 'merged.log', content: Buffer.from(mergedText, 'utf-8') });
     }
 
     // system-info.txt — enough environment context to read the bundle on its own.
@@ -574,30 +628,50 @@ export default class Logs extends Command {
       `Logs directory: ${logsDir}`,
       `Log files:      ${scanFilter ? `1 (filtered, ${filteredCount} entries)` : logFiles.length}`,
       `Frontend snapshot: ${snapshot?.frontendLog || snapshot?.uiState ? 'included' : 'not included'}`,
+      `Sidecar ring log:  ${snapshot?.sidecarRing ? 'included (drained from memory)' : 'not included'}`,
+      `Helper ring log:   ${snapshot?.helperRing ? 'included (drained from memory)' : 'not included'}`,
       '',
     ].join('\n');
     entries.push({ name: 'system-info.txt', content: Buffer.from(sysInfo, 'utf-8') });
 
+    // export-report.txt — surface any files we couldn't read (a Windows lock on the active log,
+    // etc.) so the reason travels in the bundle instead of a silent partial/failed export.
+    if (exportIssues.length) {
+      const report = ['Some log files could not be read and were skipped:', '', ...exportIssues, ''].join('\n');
+      entries.push({ name: 'export-report.txt', content: Buffer.from(report, 'utf-8') });
+    }
+
     const outputDir = path.dirname(resolvedOutput);
     await ensureDirectory(outputDir);
 
-    if (asZip) {
-      // .zip via fflate (pure JS, bundles cleanly into the compiled sidecar).
-      const zipInput: Record<string, Uint8Array> = {};
-      for (const e of entries) zipInput[e.name] = new Uint8Array(e.content);
-      const zipped = zipSync(zipInput, { level: 6 });
-      await fsp.writeFile(resolvedOutput, zipped);
-    } else {
-      // .tar.gz via tar-stream (the historical CLI format).
-      const pack = tar.pack();
-      const gzip = createGzip();
-      const output = fs.createWriteStream(resolvedOutput);
-      const pipelinePromise = pipeline(pack, gzip, output);
-      for (const e of entries) {
-        pack.entry({ name: e.name, size: e.content.length, mtime: e.mtime }, e.content);
+    // Guard the write so a failure surfaces the exact path + errno (to stderr → the caller) rather
+    // than a bare "export failed" — the write to Downloads is the other place this can fail on
+    // Windows (permissions / locked destination).
+    try {
+      if (asZip) {
+        // .zip via fflate (pure JS, bundles cleanly into the compiled sidecar).
+        const zipInput: Record<string, Uint8Array> = {};
+        for (const e of entries) zipInput[e.name] = new Uint8Array(e.content);
+        const zipped = zipSync(zipInput, { level: 6 });
+        await fsp.writeFile(resolvedOutput, zipped);
+      } else {
+        // .tar.gz via tar-stream (the historical CLI format).
+        const pack = tar.pack();
+        const gzip = createGzip();
+        const output = fs.createWriteStream(resolvedOutput);
+        const pipelinePromise = pipeline(pack, gzip, output);
+        for (const e of entries) {
+          pack.entry({ name: e.name, size: e.content.length, mtime: e.mtime }, e.content);
+        }
+        pack.finalize();
+        await pipelinePromise;
       }
-      pack.finalize();
-      await pipelinePromise;
+    } catch (e) {
+      const err = e as { code?: unknown; message?: unknown };
+      this.error(
+        `Failed to write the log archive to ${resolvedOutput}: ${String(err?.code ?? '')} ${String(err?.message ?? e)}`.trim(),
+        { exit: 1 }
+      );
     }
 
     this.log('');
@@ -641,6 +715,8 @@ export default class Logs extends Command {
       return {
         frontendLog: typeof parsed.frontendLog === 'string' ? parsed.frontendLog : undefined,
         uiState: typeof parsed.uiState === 'string' ? parsed.uiState : undefined,
+        sidecarRing: typeof parsed.sidecarRing === 'string' ? parsed.sidecarRing : undefined,
+        helperRing: typeof parsed.helperRing === 'string' ? parsed.helperRing : undefined,
       };
     } catch {
       this.warn('Could not read frontend snapshot from stdin — exporting sidecar logs only.');

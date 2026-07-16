@@ -45,7 +45,7 @@ import {
 // The helper's `err()` writes to stderr, which the Rust host spawns with Stdio::null() → discarded.
 // Backend diagnostics must go to the winston FILE logger (console-off for this command, so it can't
 // corrupt the JSON protocol on stdout) to actually land in the exportable logs.
-import { logger as fileLog } from '@lib/logging.ts';
+import { logger as fileLog, drainRingLog } from '@lib/logging.ts';
 
 export default class LlmHelper extends Command {
   static override description = 'Internal: on-device inference worker (stdio JSON-lines). Not for direct use.';
@@ -96,8 +96,17 @@ export default class LlmHelper extends Command {
       nlc = (await import(entry)) as typeof import('node-llama-cpp');
     } catch (e) {
       err('failed to load node-llama-cpp: ' + String((e as Error)?.stack ?? e));
+      // Also to the FILE log (not just discarded stderr) so the REASON the runtime won't load
+      // (missing prebuilt, missing VC++ runtime, bad .node, wrong AF_LLM_DIR…) survives in the
+      // exported bundle. Without this, a broken runtime = the helper dies silently and AI is
+      // undiagnosably dead.
+      fileLog.error('llm.runtime.load.failed', e as Error, {
+        reason: String((e as Error)?.message ?? e),
+      });
       send({ type: 'fatal', message: 'inference runtime unavailable: ' + String((e as Error)?.message ?? e) });
-      process.exit(3);
+      // process.exit() does NOT wait for winston's async file stream to flush, so give the error
+      // line a beat to hit disk before we exit — otherwise the reason we just logged is lost.
+      setTimeout(() => process.exit(3), 250);
       return;
     }
     const { getLlama, LlamaChatSession, LlamaLogLevel } = nlc;
@@ -148,6 +157,13 @@ export default class LlmHelper extends Command {
           `GPU unavailable (requested gpu=${JSON.stringify(g)}) — running on CPU; see node-llama-cpp warnings above for the reason`
         );
       }
+      // Structured AI-trace event: the resolved backend (grep 'llm.backend.select'). gpuFallback
+      // flags a requested-GPU→CPU drop; the reason is in the node-llama-cpp warnings just above.
+      fileLog.info('llm.backend.select', {
+        requestedGpu: String(g),
+        resolvedBackend: backend || 'cpu',
+        gpuFallback: !backend && g !== false,
+      });
       // Persist the resolved backend so the owners' mid-scan gate (localBackendIsGpu) reads the
       // truth this host actually runs on. Fire-and-forget — never blocks a load.
       void rememberBackend(!backend ? 'cpu' : backend === 'metal' ? 'metal' : 'vulkan').catch(
@@ -156,9 +172,18 @@ export default class LlmHelper extends Command {
       model = await llama.loadModel({ modelPath });
       context = await model.createContext({ contextSize: 2048 });
       loadedPath = modelPath;
-      const loadedMsg = `loaded ${modelPath} in ${((performance.now() - t) / 1000).toFixed(2)}s (backend=${JSON.stringify(backend)})`;
+      const load_ms = Math.round(performance.now() - t);
+      const loadedMsg = `loaded ${modelPath} in ${(load_ms / 1000).toFixed(2)}s (backend=${JSON.stringify(backend)})`;
       err(loadedMsg);
       fileLog.info(`[llm-helper] ${loadedMsg}`); // to the FILE log so the resolved backend is diagnosable
+      // Structured AI-trace event (grep 'llm.model.load.end'). modelId is the basename only — the
+      // full path is home-sanitized by the logger, but the basename keeps it PII-light in the context.
+      fileLog.info('llm.model.load.end', {
+        modelId: modelPath.split(/[\\/]/).pop() ?? 'model',
+        load_ms,
+        backend: backend || 'cpu',
+        contextSize: 2048,
+      });
     }
 
     /** Resolve a request's model to an on-disk GGUF path: absolute `modelPath` passes through
@@ -181,7 +206,7 @@ export default class LlmHelper extends Command {
     const rl = createInterface({ input: process.stdin });
     rl.on('line', async (line: string) => {
       if (!line.trim()) return;
-      let req: { id?: number; type?: string; modelPath?: string; model?: string; path?: string; gpu?: unknown; system?: string; prompt?: string; maxTokens?: number; cancelId?: number };
+      let req: { id?: number; type?: string; modelPath?: string; model?: string; path?: string; gpu?: unknown; system?: string; prompt?: string; maxTokens?: number; cancelId?: number; describeId?: string };
       try {
         req = JSON.parse(line);
       } catch {
@@ -191,6 +216,14 @@ export default class LlmHelper extends Command {
       try {
         if (type === 'ping') {
           send({ id, type: 'pong' });
+          return;
+        }
+        if (type === 'get_ring_log') {
+          // Drain THIS helper process's in-memory log ring (RFC5424 lines: backend/model-load,
+          // and the AI-stage trace) for the export bundle. Decoupled from the open .log file, so
+          // a Windows lock can't lose the model-loading diagnostics. Symmetric with the owner's
+          // get_ring_log (query.ts). The ring is populated because main.ts inits logging first.
+          send({ id, type: 'ring', data: drainRingLog() });
           return;
         }
         if (type === 'cancel') {
@@ -288,6 +321,17 @@ export default class LlmHelper extends Command {
           const seq = context!.getSequence();
           const session = new LlamaChatSession({ contextSequence: seq, systemPrompt: req.system });
           let text = '';
+          // AI-stage trace, correlated by describeId. Log the prompt SIZE only, never the prompt
+          // text — it contains folder/file names (PII). Timings drive the slow-vs-stuck diagnosis.
+          const dId = req.describeId;
+          const genStart = performance.now();
+          let firstAt = 0;
+          let tokens = 0;
+          fileLog.info('llm.prompt.build', {
+            describeId: dId,
+            promptChars: (req.prompt ?? '').length,
+            backend: backend || 'cpu',
+          });
           try {
             await session.prompt(req.prompt ?? '', {
               maxTokens: req.maxTokens ?? 256,
@@ -300,14 +344,40 @@ export default class LlmHelper extends Command {
               repeatPenalty: { penalty: 1.15, lastTokens: 128 },
               signal: ac.signal,
               onTextChunk(chunk: string) {
+                if (!firstAt) {
+                  firstAt = performance.now();
+                  fileLog.info('llm.generate.ttft', {
+                    describeId: dId,
+                    ttft_ms: Math.round(firstAt - genStart),
+                    backend: backend || 'cpu',
+                  });
+                }
+                tokens += 1;
                 text += chunk;
                 send({ id, type: 'token', delta: chunk });
               },
             });
+            const decodeMs = Math.max(1, Math.round(performance.now() - (firstAt || genStart)));
+            fileLog.info('llm.generate.end', {
+              describeId: dId,
+              chunksOut: tokens,
+              decode_ms: decodeMs,
+              tok_per_s: +(tokens / (decodeMs / 1000)).toFixed(1),
+              stopReason: tokens >= (req.maxTokens ?? 256) ? 'maxTokens' : 'eos',
+              backend: backend || 'cpu',
+            });
             send({ id, type: 'done', text, backend });
           } catch (e) {
-            if (ac.signal.aborted) send({ id, type: 'cancelled' });
-            else send({ id, type: 'error', message: String((e as Error)?.message ?? e) });
+            if (ac.signal.aborted) {
+              fileLog.info('llm.generate.cancel', { describeId: dId, chunksOut: tokens });
+              send({ id, type: 'cancelled' });
+            } else {
+              fileLog.warn('llm.generate.error', {
+                describeId: dId,
+                message: String((e as Error)?.message ?? e),
+              });
+              send({ id, type: 'error', message: String((e as Error)?.message ?? e) });
+            }
           } finally {
             if (id != null) inflight.delete(id);
             try {

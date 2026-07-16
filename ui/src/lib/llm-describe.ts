@@ -31,6 +31,7 @@ import {
 	type DirectoryDescription
 } from '$lib/tauri';
 import { activeScan, scanPhase, aiMode, localModel, selectedItem, llmModelState } from '$lib/stores';
+import { logFrontend } from '$lib/log-buffer';
 import {
 	summaryMachine,
 	STRUCTURE_READY_PHASES,
@@ -103,12 +104,26 @@ const RETRY_BACKOFFS_MS = [500, 1500, 4000]; // 3 retries over ~6s, spans owner 
  *  as an `error` outcome. Unsubscribing (switchMap teardown / folder switch) cancels on the host. */
 function describe$(db: string, path: string, midScan: boolean, kind: 'auto' | 'user'): Observable<MachineEvent> {
 	const clientId = `${db}::${path}::${currentUiLang()}`;
+	// One correlation id per describe invocation (shared across this attempt's internal retries and
+	// all 3 legs), so `grep <describeId>` reconstructs UI → host → helper → owner in the log bundle.
+	// Distinct from clientId (the stable per-folder key used for cancellation/queue-tracking).
+	const describeId = `desc_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+	// UI leg of the AI trace: the describe was requested here (grep the describeId). `dir` is the
+	// basename only — a relative path can carry sensitive folder names and the sidecar scrubber
+	// doesn't reach webview code, so keep it PII-light.
+	logFrontend('describe:requested', {
+		describeId,
+		dir: path.split('/').pop() || '/',
+		kind,
+		midScan
+	});
 	const settleErr: DescribeOutcome = midScan ? { kind: 'deferred' } : { kind: 'error' };
 	return new Observable<MachineEvent>((sub) => {
 		let done = false;
 		const finish = (result: DescribeOutcome) => {
 			if (done) return;
 			done = true;
+			logFrontend('describe:result', { describeId, outcome: result.kind });
 			sub.next({ type: 'RESULT', result });
 			sub.complete();
 		};
@@ -117,7 +132,7 @@ function describe$(db: string, path: string, midScan: boolean, kind: 'auto' | 'u
 			(delta) => {
 				if (!done) sub.next({ type: 'TOKEN', delta });
 			},
-			{ kind, clientId, dbName: db }
+			{ kind, clientId, dbName: db, describeId }
 		)
 			.then((res: DirectoryDescription | null) => {
 				if (done) return;

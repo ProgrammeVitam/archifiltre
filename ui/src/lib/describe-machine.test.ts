@@ -112,13 +112,21 @@ test('deferred-scan regenerates at completion', () => {
 	expect(t.state()).toBe('generating');
 });
 
-test('error re-arms at scan completion (old context-change re-arm)', () => {
+test('error is TERMINAL — a persistent failure never re-fires (storm fix)', () => {
 	const t = make('selected');
 	t.sync({ scanState: 'scanning' });
+	const startedAfterFirst = t.started; // exactly one describe was invoked
 	t.result({ kind: 'error' });
 	expect(t.state()).toBe('error');
+	// Completion — and ANY subsequent input change — must NOT re-arm the failed describe.
+	// The old `always: completed → generating` re-fired forever on a persistent failure (the
+	// 758-describe "storm"); error is now terminal, so re-attempting is a user action only.
 	t.sync({ scanState: 'complete' });
-	expect(t.state()).toBe('generating'); // a settled scan gives a capped error a fresh attempt
+	expect(t.state()).toBe('error');
+	t.sync({ modelReady: true });
+	t.sync({ scanState: 'complete' });
+	expect(t.state()).toBe('error');
+	expect(t.started).toBe(startedAfterFirst); // no new describe invoked → no storm
 });
 
 test('cancelled returns to absent and the rules re-enqueue a fresh describe', () => {
