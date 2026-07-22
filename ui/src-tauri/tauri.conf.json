@@ -1,7 +1,7 @@
 {
 	"$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
 	"productName": "Archifiltre",
-	"version": "5.0.0-beta.1",
+	"version": "5.0.0-dev",
 	"identifier": "fr.gouv.culture.archifiltre",
 	"build": {
 		"frontendDist": "../build",
@@ -51,6 +51,9 @@
 		"windows": {
 			"nsis": {
 				"installerHooks": "./installer-hooks.nsh",
+				"customLanguageFiles": {
+					"French": "./french.nsh"
+				},
 				"installerIcon": "./icons/icon.ico",
 				"headerImage": "./installer-header.bmp",
 				"sidebarImage": "./installer-sidebar.bmp",

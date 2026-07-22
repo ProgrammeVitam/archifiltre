@@ -343,7 +343,7 @@ export const api = {
    */
   version(): VersionInfo {
     return {
-      appVersion: '5.0.0-beta.1',
+      appVersion: '5.0.0-dev',
       buildDate: new Date().toISOString(),
       commitHash: process.env.GIT_COMMIT || 'dev',
     };

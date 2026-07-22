@@ -10,6 +10,7 @@
         "@node-llama-cpp/win-x64": "^3.19.0",
         "@node-llama-cpp/win-x64-vulkan": "^3.19.0",
         "@oclif/core": "^4.11.4",
+        "cockatiel": "^4.0.0",
         "docx": "^9.7.1",
         "drizzle-orm": "^0.45.2",
         "exceljs": "^4.4.0",
@@ -334,6 +335,8 @@
     "cliui": ["cliui@8.0.1", "", { "dependencies": { "string-width": "^4.2.0", "strip-ansi": "^6.0.1", "wrap-ansi": "^7.0.0" } }, "sha512-BSeNnyus75C4//NQ9gQt1/csTXyo/8Sb+afLAkzAptFuMsod9HFokGNudZpi/oQV73hnVK+sR+5PVRMd+Dr7YQ=="],
 
     "cmake-js": ["cmake-js@8.0.0", "", { "dependencies": { "debug": "^4.4.3", "fs-extra": "^11.3.3", "node-api-headers": "^1.8.0", "rc": "1.2.8", "semver": "^7.7.3", "tar": "^7.5.6", "url-join": "^4.0.1", "which": "^6.0.0", "yargs": "^17.7.2" }, "bin": { "cmake-js": "bin/cmake-js" } }, "sha512-YbUP88RDwCvoQkZhRtGURYm9RIpWdtvZuhT87fKNoLjk8kIFIFeARpKfuZQGdwfH99GZpUmqSfcDrK62X7lTgg=="],
+
+    "cockatiel": ["cockatiel@4.0.0", "", {}, "sha512-XpUZJnogsd03BGB19T9sv7Xb8SwvD8JddZV2Tlp0LNspopZ6Idv24ZwCl8vAGJ6JwODZ0zLRYVj3NWvmRcUDqA=="],
 
     "color": ["color@5.0.2", "", { "dependencies": { "color-convert": "^3.0.1", "color-string": "^2.0.0" } }, "sha512-e2hz5BzbUPcYlIRHo8ieAhYgoajrJr+hWoceg6E345TPsATMUKqDgzt8fSXZJJbxfpiPzkWyphz8yn8At7q3fA=="],
 

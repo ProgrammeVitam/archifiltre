@@ -1,6 +1,6 @@
 {
   "name": "archifiltre",
-  "version": "5.0.0-beta.1",
+  "version": "5.0.0-dev",
   "description": "Privacy-friendly, 100% offline desktop tool for inventorying large file trees",
   "type": "module",
   "bin": {
@@ -64,7 +64,7 @@
     "email": "archifiltre@culture.gouv.fr",
     "url": "https://www.archifiltre.org"
   },
-  "license": "Apache-2.0",
+  "license": "MIT",
   "homepage": "https://www.archifiltre.org",
   "engines": {
     "bun": ">=1.0.0"
@@ -93,6 +93,7 @@
     "@node-llama-cpp/win-x64": "^3.19.0",
     "@node-llama-cpp/win-x64-vulkan": "^3.19.0",
     "@oclif/core": "^4.11.4",
+    "cockatiel": "^4.0.0",
     "docx": "^9.7.1",
     "drizzle-orm": "^0.45.2",
     "exceljs": "^4.4.0",
