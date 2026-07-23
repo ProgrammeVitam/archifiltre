@@ -10,7 +10,7 @@
 import * as path from 'node:path';
 import { promises as fsp } from 'node:fs';
 import type { OperatorFunction } from 'rxjs';
-import { Observable, from, of, concat, firstValueFrom } from 'rxjs';
+import { Observable, from, of, concat, defer, firstValueFrom, timer, throwError } from 'rxjs';
 import {
   tap,
   map,
@@ -21,7 +21,9 @@ import {
   last,
   catchError,
   mergeMap,
+  retry,
 } from 'rxjs/operators';
+import type { IPolicy } from 'cockatiel';
 import {
   eq as _eq,
   and as _and,
@@ -34,6 +36,7 @@ import type { ProvisionalDir, ScanCounts } from '@lib/job-context.ts';
 import {
   cleanDatabase,
   insertFileBatch,
+  insertScanSkips,
   type BatchInsertResult,
   sanitizeDbText,
   rollupDirStatsBatch,
@@ -51,10 +54,25 @@ import {
   files as _files,
 } from '@lib/database.ts';
 import { Frontier } from '@lib/frontier.ts';
-import { listArchive } from 'streamarchive';
+import { readArchive } from 'streamarchive';
 import { ensureStreamArchive } from '@lib/streamarchive-init.ts';
 import { performHashing } from '@lib/hash-calculator.ts';
 import { toLongPath, normalizePath } from '@lib/path-utils.ts';
+import {
+  runCancelable,
+  raceDeadline,
+  DIR_TIMEOUT_MS,
+  classify,
+  skipReason,
+  DeadlineError,
+  RETRY_BACKOFFS_MS,
+  volumeKey,
+  createBreakerRegistry,
+  type SkipReason,
+} from '@lib/scan-resilience.ts';
+
+/** Reports a unit that could not be fully processed (archive/dir/file), by stable reason class. */
+export type NoteSkip = (kind: 'archive' | 'dir' | 'file', path: string, reason: SkipReason) => void;
 
 // Archive Detection Constants
 // prettier-ignore
@@ -236,7 +254,9 @@ async function processArchiveEntries(
   archivePath: string,
   rootPath: string,
   entry: FileEntry,
-  config: ArchiveProcessingConfig = DEFAULT_ARCHIVE_CONFIG
+  config: ArchiveProcessingConfig,
+  breakerFor: (key: string) => IPolicy,
+  noteSkip: NoteSkip
 ): Promise<FileEntry[]> {
   const results: FileEntry[] = [];
 
@@ -274,86 +294,100 @@ async function processArchiveEntries(
     return results;
   }
 
-  try {
-    const absolutePath = path.resolve(rootPath, archivePath);
+  const absolutePath = path.resolve(rootPath, archivePath);
+  // Cap the rows read per archive. `readArchive` is lazy, so returning at the cap closes the
+  // generator and stops the decompress; truncation is reported, never silent.
+  const maxEntries = 100000;
 
-    // Streaming metadata listing: no data reads, constant memory. On a seekable zip
-    // this is the central directory — fast and exact-sized even for multi-GB archives
-    // (the previous memory-based port loaded the ENTIRE archive into RAM here).
+  // Read entries into a fresh array per attempt: `retry` re-runs this, so accumulating into the
+  // shared `results` would duplicate a partial read. Metadata only, so memory stays constant.
+  const readEntries = async (signal: AbortSignal): Promise<{ rows: FileEntry[]; truncated: boolean }> => {
     await ensureStreamArchive();
-    const archiveEntries = await listArchive(toLongPath(absolutePath));
+    const rows: FileEntry[] = [];
+    let n = 0;
+    for await (const ae of readArchive(toLongPath(absolutePath), { signal })) {
+      if (n >= maxEntries) return { rows, truncated: true };
 
-    let entryCount = 0;
-    const maxEntries = 10000; // Bound the per-archive row count (DB pressure, not memory)
-
-    for (const archiveEntry of archiveEntries) {
-      if (entryCount >= maxEntries) {
-        logger.warn('Archive has too many entries, stopping processing', {
-          path: archivePath,
-          processedEntries: entryCount,
-          limit: maxEntries,
-        });
-        break;
-      }
-
-      // Stored names may carry a leading './' or backslashes depending on the
-      // archiver; normalize to match the paths the rest of the pipeline uses.
-      const entryPath = normalizePath(archiveEntry.path).replace(/^\.\//, '');
-      const size = archiveEntry.size ?? 0;
-      const isDirectory = archiveEntry.isDirectory || entryPath.endsWith('/');
-      const modTime = archiveEntry.mtime || 0; // Unix seconds
-
-      // Create relative path: archive.zip/path/to/file.txt
+      // Stored names may carry a leading './' or backslashes; normalize to match the pipeline.
+      const entryPath = normalizePath(ae.path).replace(/^\.\//, '');
+      const size = ae.size ?? 0;
+      const isDirectory = ae.isDirectory || entryPath.endsWith('/');
+      const modTime = ae.mtime || 0; // Unix seconds
       const relativePath = `${entry.path}/${entryPath}`;
 
       const archiveFileEntry: FileEntry = {
         path: relativePath,
-        physical_size: 0, // Files within archives have no physical footprint
-        content_size: isDirectory ? null : size, // Decompressed size for files, null for directories
+        physical_size: 0,
+        content_size: isDirectory ? null : size,
         mtime: modTime > 0 ? modTime : entry.mtime,
         isDirectory,
-        isHidden: false, // Archive entries are not considered hidden
-        isSystem: false, // Archive entries are not considered system files
+        isHidden: false,
+        isSystem: false,
         isArchiveContainer: false,
         archiveParentPath: entry.path,
         archiveDepth: entry.archiveDepth + 1,
         archiveFormat: entry.archiveFormat,
         extractionError: null,
       };
+      rows.push(archiveFileEntry);
+      n++;
 
-      results.push(archiveFileEntry);
-      entryCount++;
-
-      // If this entry is also an archive and nesting is enabled, mark it (nested
-      // archives are flagged as containers but their contents are not expanded).
+      // Nested archives are flagged as containers but their contents are not expanded.
       if (!isDirectory && config.enableNesting && entry.archiveDepth + 1 < config.maxDepth) {
         const archiveCheck = isArchiveByExtensionOnly(entryPath);
         if (archiveCheck.isArchive) {
           archiveFileEntry.isArchiveContainer = true;
           archiveFileEntry.content_size = null;
           archiveFileEntry.archiveFormat = archiveCheck.format || 'unknown';
-
-          logger.debug('Found nested archive (marked but not processed)', {
-            path: relativePath,
-            format: archiveCheck.format,
-            depth: entry.archiveDepth + 1,
-          });
         }
       }
     }
+    return { rows, truncated: false };
+  };
 
-    logger.debug('Archive processing completed', {
-      path: archivePath,
-      entriesFound: entryCount,
-      format: entry.archiveFormat,
-    });
-  } catch (error) {
-    logger.error('Failed to process archive', error as Error, {
-      path: archivePath,
-      format: entry.archiveFormat,
-    });
+  // Bound + retry(transient) + per-volume breaker. This NEVER throws: any failure degrades
+  // to a labelled container + skip note, so the caller's onUnitComplete still fires (the
+  // frontier stamps) and the scan stream still completes. Mirrors describe$'s retry operator.
+  const breaker = breakerFor(volumeKey(absolutePath, rootPath));
+  const readStart = Date.now();
+  // Breaker OUTSIDE the deadline so a DeadlineError counts against the volume — repeated timeouts
+  // on a sick share trip it and the rest fast-skip (BrokenCircuitError → 'location-unavailable').
+  // runCancelable still aborts the underlying read on timeout. `defer` re-runs execute per retry.
+  const { rows, truncated } = await firstValueFrom(
+    defer(() =>
+      from(breaker.execute(() => firstValueFrom(runCancelable(sig => readEntries(sig), config.timeoutMs))))
+    ).pipe(
+      retry({
+        count: RETRY_BACKOFFS_MS.length,
+        resetOnSuccess: true,
+        // Retry transient IO/WASM blips only. A deadline (a slow archive won't get faster on
+        // a re-read) and any deterministic corruption skip immediately.
+        delay: (e, i) =>
+          classify(e) === 'transient' && !(e instanceof DeadlineError)
+            ? timer(RETRY_BACKOFFS_MS[i - 1] ?? RETRY_BACKOFFS_MS[RETRY_BACKOFFS_MS.length - 1])
+            : throwError(() => e),
+      }),
+      catchError(e => {
+        const reason = skipReason(e);
+        archiveContainer.extractionError = `not processed (${reason})`;
+        noteSkip('archive', archivePath, reason);
+        logger.warn('Archive skipped', { path: archivePath, reason, error: (e as Error)?.message });
+        return of({ rows: [] as FileEntry[], truncated: false });
+      })
+    )
+  );
 
-    archiveContainer.extractionError = `Processing failed: ${(error as Error).message}`;
+  // Log slow archive reads: the prime "near-stuck" signal, and the one the exported log needs.
+  const readMs = Date.now() - readStart;
+  if (readMs > 3000) {
+    logger.info('archive.slow', { path: archivePath, ms: readMs, entries: rows.length, truncated });
+  }
+
+  results.push(...rows);
+  if (truncated) {
+    archiveContainer.extractionError = `truncated: more than ${maxEntries} entries`;
+    noteSkip('archive', archivePath, 'truncated');
+    logger.warn('Archive truncated', { path: archivePath, limit: maxEntries });
   }
 
   return results;
@@ -366,6 +400,8 @@ function processFileEntry(
   rootPath: string,
   entry: FileEntry,
   config: ArchiveProcessingConfig,
+  breakerFor: (key: string) => IPolicy,
+  noteSkip: NoteSkip,
   // Frontier producer signal for archives: an archive container is an enumeration unit
   // whose children are its entries. Announce its exact child count once expanded, so the
   // Frontier can stamp it when those entries commit (and stamp nested-but-unexpanded
@@ -397,7 +433,7 @@ function processFileEntry(
         };
 
         // Process the archive and return all entries (container + contents)
-        const results = await processArchiveEntries(entry.path, rootPath, archiveEntry, config);
+        const results = await processArchiveEntries(entry.path, rootPath, archiveEntry, config, breakerFor, noteSkip);
         if (onUnitComplete) {
           // results[0] is the container itself (belongs to its parent dir); results[1..]
           // are its inner entries, all with archive_parent_path === entry.path.
@@ -544,6 +580,9 @@ export interface ScanProgressEvent {
   duplicateSizes?: number;
   duplicateGroups: number;
   status: string;
+  /** Units that couldn't be fully processed, by stable reason (unreadable/timed-out archive,
+   *  dead share, permission, truncation): the ledger the UI groups. */
+  skipped?: { total: number; byReason: Record<string, number> };
 }
 
 // Scanner progress → canonical job:progress {processed, total}. Phase-aware:
@@ -579,6 +618,16 @@ export function scanDirectory(
   // per successfully-inserted batch below; seeded from the DB on resume. `files` + `folders`
   // == filesIngested (this is filesIngested partitioned by type).
   const committed: ScanCounts = { files: 0, folders: 0, archiveEntries: 0, bytes: 0 };
+  // Per-scan breaker registry (one breaker per volume, GC'd with the scan) + the skip ledger.
+  // A skip = a unit that could not be fully processed (unreadable/timed-out archive, dead share,
+  // truncation), tallied by stable reason so the parent unit still stamps and the UI can group it.
+  const breakerFor = createBreakerRegistry();
+  const skippedByReason = new Map<SkipReason, number>();
+  const skipLedger: Array<{ kind: string; path: string; reason: string }> = [];
+  const noteSkip: NoteSkip = (kind, p, reason) => {
+    skippedByReason.set(reason, (skippedByReason.get(reason) ?? 0) + 1);
+    skipLedger.push({ kind, path: p, reason });
+  };
 
   /** Fold one committed batch into the canonical counts (matches insertFileBatch's
    *  batch-length accounting, so committed stays == the DB rows the batch produced).
@@ -603,6 +652,9 @@ export function scanDirectory(
       counts: { ...committed },
       duplicateGroups,
       status,
+      skipped: skippedByReason.size
+        ? { total: skipLedger.length, byReason: Object.fromEntries(skippedByReason) }
+        : undefined,
       ...extra,
     });
   };
@@ -788,6 +840,9 @@ export function scanDirectory(
       if (frontier && seed.seedDirs.length) frontier.seedSelfCommitted(seed.seedDirs);
       const walkOpts: WalkOptions = {
         shouldContinue: config.shouldContinue,
+        dirTimeoutMs: DIR_TIMEOUT_MS,
+        breakerFor,
+        noteSkip,
         ...(frontier
           ? {
               onDirComplete: (rel: string, n: number) => frontier.unitComplete(rel, n),
@@ -836,6 +891,8 @@ export function scanDirectory(
               config.rootPath,
               entry,
               archiveConfig,
+              breakerFor,
+              noteSkip,
               frontier ? (u, c) => frontier.unitComplete(u, c) : undefined
             ).pipe(mergeMap(entries => from(entries)));
           }
@@ -1011,6 +1068,20 @@ export function scanDirectory(
       );
     }),
 
+    // Persist the skip ledger ONCE now the pipeline has completed (no interleave with inserts).
+    // Best-effort: a ledger-write hiccup must not fail an otherwise-successful scan.
+    switchMap(v =>
+      skipLedger.length
+        ? from(insertScanSkips(connection, config.runId, skipLedger)).pipe(
+            map(() => v),
+            catchError(error => {
+              logger.warn('Failed to persist skip ledger', { error: (error as Error).message });
+              return of(v);
+            })
+          )
+        : of(v)
+    ),
+
     // Frontier resume: dir_stats was cleared and NOT incrementally rolled up (we skipped
     // the done subtrees), so recompute it once now from the full files table.
     switchMap(v =>
@@ -1078,6 +1149,17 @@ export function scanDirectory(
           filesIngested,
         });
       }
+      // One greppable completion line: what the scan captured vs skipped, by reason.
+      logger.info('scan.finalize', {
+        runId: config.runId,
+        files: committed.files,
+        folders: committed.folders,
+        archiveEntries: committed.archiveEntries,
+        bytes: committed.bytes,
+        quarantined: filesSkipped,
+        skippedTotal: skipLedger.length,
+        skippedByReason: JSON.stringify(Object.fromEntries(skippedByReason)),
+      });
     }),
     map(() => ({
       phase: 'complete' as const,
@@ -1143,6 +1225,11 @@ interface WalkOptions {
    *  exact number of child entries emitted — the producer signal the Frontier needs to
    *  know when the directory's children are all accounted for. */
   onDirComplete?: (relDir: string, childCount: number) => void;
+  /** Resilience hooks for the walker: a per-directory fs deadline, the shared per-volume breaker,
+   *  and the skip sink, so a dead mount can't stall enumeration and every skip is recorded. */
+  dirTimeoutMs?: number;
+  breakerFor?: (key: string) => IPolicy;
+  noteSkip?: NoteSkip;
   /** Resume: relative directory paths still on the frontier, seeded onto the stack in
    *  addition to root, so we re-list exactly the unfinished directories. */
   seedDirs?: string[];
@@ -1167,12 +1254,20 @@ async function enumerateDir(
   rootPath: string,
   currentDir: string,
   enumeratedDirs: Set<string> | undefined,
-  queued: Set<string>
+  queued: Set<string>,
+  resil?: { dirTimeoutMs?: number; breakerFor?: (key: string) => IPolicy; noteSkip?: NoteSkip }
 ): Promise<{ emitted: FileEntry[]; pushDirs: string[] }> {
   const emitted: FileEntry[] = [];
   const pushDirs: string[] = [];
+  // guard(): every fs await is deadline-bounded and, when a registry is supplied, runs through the
+  // volume breaker. On failure the dir/file contributes nothing and is noted as a skip.
+  const timeoutMs = resil?.dirTimeoutMs ?? DIR_TIMEOUT_MS;
+  const breaker = resil?.breakerFor?.(volumeKey(currentDir, rootPath));
+  const guard = <T>(op: () => Promise<T>): Promise<T> =>
+    breaker ? breaker.execute(() => raceDeadline(op(), timeoutMs)) : raceDeadline(op(), timeoutMs);
+  const currentRel = path.relative(rootPath, currentDir).replace(/\\/g, '/');
   try {
-    const entries = await fsp.readdir(toLongPath(currentDir), { withFileTypes: true });
+    const entries = await guard(() => fsp.readdir(toLongPath(currentDir), { withFileTypes: true }));
     for (const entry of entries) {
       const fullPath = path.join(currentDir, entry.name);
 
@@ -1210,7 +1305,7 @@ async function enumerateDir(
         });
       } else if (entry.isFile()) {
         try {
-          const stats = await fsp.stat(toLongPath(fullPath));
+          const stats = await guard(() => fsp.stat(toLongPath(fullPath)));
           emitted.push({
             path: relativePath,
             physical_size: stats.size,
@@ -1227,6 +1322,7 @@ async function enumerateDir(
           });
         } catch (error) {
           logger.warn('Cannot access file', { path: fullPath, error: (error as Error).message });
+          resil?.noteSkip?.('file', relativePath, skipReason(error));
         }
       }
     }
@@ -1235,6 +1331,7 @@ async function enumerateDir(
       path: currentDir,
       error: (error as Error).message,
     });
+    resil?.noteSkip?.('dir', currentRel, skipReason(error));
   }
   return { emitted, pushDirs };
 }
@@ -1269,7 +1366,7 @@ async function* walkFilesGenerator(
   _includeHidden = false,
   opts: WalkOptions = {}
 ): AsyncGenerator<FileEntry> {
-  const { onDirComplete, seedDirs, enumeratedDirs, shouldContinue } = opts;
+  const { onDirComplete, seedDirs, enumeratedDirs, shouldContinue, dirTimeoutMs, breakerFor, noteSkip } = opts;
   const { stack, queued } = seedWalk(rootPath, seedDirs);
 
   while (stack.length > 0) {
@@ -1279,7 +1376,11 @@ async function* walkFilesGenerator(
 
     const currentDir = stack.pop()!;
     const currentRel = path.relative(rootPath, currentDir).replace(/\\/g, '/');
-    const { emitted, pushDirs } = await enumerateDir(rootPath, currentDir, enumeratedDirs, queued);
+    const { emitted, pushDirs } = await enumerateDir(rootPath, currentDir, enumeratedDirs, queued, {
+      dirTimeoutMs,
+      breakerFor,
+      noteSkip,
+    });
     for (const d of pushDirs) stack.push(d);
     for (const e of emitted) yield e;
 
@@ -1311,7 +1412,7 @@ function walkFilesConcurrent(
   canEnumerate?: () => boolean
 ): Observable<FileEntry> {
   return new Observable<FileEntry>(subscriber => {
-    const { onDirComplete, seedDirs, enumeratedDirs, shouldContinue } = opts;
+    const { onDirComplete, seedDirs, enumeratedDirs, shouldContinue, dirTimeoutMs, breakerFor, noteSkip } = opts;
     const { stack, queued } = seedWalk(rootPath, seedDirs);
     let active = 0;
     let closed = false;
@@ -1332,7 +1433,7 @@ function walkFilesConcurrent(
       active++;
       const currentRel = path.relative(rootPath, currentDir).replace(/\\/g, '/');
       const startedAt = performance.now();
-      void enumerateDir(rootPath, currentDir, enumeratedDirs, queued)
+      void enumerateDir(rootPath, currentDir, enumeratedDirs, queued, { dirTimeoutMs, breakerFor, noteSkip })
         .then(({ emitted, pushDirs }) => {
           // per-op latency ≈ this dir's wall-time / (readdir + one stat per entry) → feed
           // the ramp so concurrency tracks the mount's actual round-trip cost.

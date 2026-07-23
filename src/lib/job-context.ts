@@ -31,7 +31,7 @@ export interface ScanCounts {
 
 export type JobEvent =
   | { event: 'job:start';    jobId: string; type: string; label: string; phases: string[] }
-  | { event: 'job:progress'; jobId: string; phase: string; processed: number; total: number | null; detail: string; counts?: ScanCounts }
+  | { event: 'job:progress'; jobId: string; phase: string; processed: number; total: number | null; detail: string; counts?: ScanCounts; skipped?: { total: number; byReason: Record<string, number> } }
   | { event: 'job:paused';   jobId: string }
   | { event: 'job:complete'; jobId: string; durationMs: number }
   | { event: 'job:error';    jobId: string; error: string }

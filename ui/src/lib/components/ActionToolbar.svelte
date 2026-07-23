@@ -29,7 +29,7 @@
 	});
 
 	let filterCount = $derived(Object.values($listFilters).filter(Boolean).length);
-	function setFilter(key: 'marked' | 'tagged' | 'big', value: boolean) {
+	function setFilter(key: 'marked' | 'tagged' | 'big' | 'notProcessed', value: boolean) {
 		listFilters.update((f) => ({ ...f, [key]: value }));
 	}
 
@@ -125,6 +125,9 @@
 				</DropdownMenu.CheckboxItem>
 				<DropdownMenu.CheckboxItem checked={$listFilters.big} onCheckedChange={(v) => setFilter('big', v)}>
 					{$_('toolbar.large')}
+				</DropdownMenu.CheckboxItem>
+				<DropdownMenu.CheckboxItem checked={$listFilters.notProcessed} onCheckedChange={(v) => setFilter('notProcessed', v)}>
+					{$_('toolbar.notProcessed')}
 				</DropdownMenu.CheckboxItem>
 			</DropdownMenu.Content>
 		</DropdownMenu.Root>

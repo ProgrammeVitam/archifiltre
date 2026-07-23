@@ -24,8 +24,10 @@
 		FileArchiveIcon,
 		FileStackIcon,
 		SquareIcon,
-		SquareCheckIcon
+		SquareCheckIcon,
+		SearchAlertIcon
 	} from '@lucide/svelte';
+	import { Badge } from '$lib/components/ui/badge';
 
 	let { data, class: className = '' }: { data: TreeData | null; class?: string } = $props();
 
@@ -59,6 +61,9 @@
 		alias: string | null;
 		enriched: boolean;
 		del: boolean;
+		/** The scan couldn't fully process this unit (unreadable/too large/timed-out/truncated
+		 *  archive). Drives the "Not processed" filter + a subtle row marker. */
+		notProcessed: boolean;
 		type: string;
 		hash: string | null;
 		/** Duplicates mode: the true group size (copies of this hash across the whole result),
@@ -175,7 +180,8 @@
 		return {
 			path: f.path, name: f.name, size: f.size, mtime: f.mtime, isDir: false, depth,
 			alias: f.alias ?? null, enriched: !!(f.alias || f.has_comment || f.has_tag),
-			del: !!f.tagged_for_deletion, type: fileType(f.name), hash: f.hash ?? null,
+			del: !!f.tagged_for_deletion, notProcessed: !!f.not_processed,
+			type: fileType(f.name), hash: f.hash ?? null,
 			dupCount: f.dup_count, src: f
 		};
 	}
@@ -183,7 +189,8 @@
 		return {
 			path: d.path, name: d.name, size: d.total_size, mtime: 0, isDir: true, depth,
 			alias: d.alias ?? null, enriched: !!(d.alias || d.has_comment || d.has_tag),
-			del: !!d.tagged_for_deletion, type: d.is_archive ? 'archive' : 'folder', hash: null, src: d
+			del: !!d.tagged_for_deletion, notProcessed: false,
+			type: d.is_archive ? 'archive' : 'folder', hash: null, src: d
 		};
 	}
 
@@ -196,6 +203,7 @@
 		if (filters.marked && !r.del) return false;
 		if (filters.tagged && !r.enriched) return false;
 		if (filters.big && r.size < 1e9) return false;
+		if (filters.notProcessed && !r.notProcessed) return false;
 		return true;
 	}
 	function cmp(a: Row, b: Row): number {
@@ -453,6 +461,7 @@
 											     elsewhere the file/alias name is enough. -->
 											<span class="truncate {r.del ? 'text-muted-foreground line-through' : ''} {r.isDir ? 'font-medium' : ''} {item.member ? 'text-muted-foreground' : ''}" title={item.member ? r.path : ''}>{item.member ? r.path : (r.alias ?? r.name)}</span>
 											{#if r.enriched}<span class="size-1.5 shrink-0 rounded-full bg-blue-500" title="enriched"></span>{/if}
+											{#if r.notProcessed}<Badge variant="outline" class="shrink-0 gap-1 border-amber-500/30 px-1.5 py-0 text-[10px] font-normal text-amber-600" title={$_('skips.title')}><SearchAlertIcon class="size-3" />{$_('toolbar.notProcessed')}</Badge>{/if}
 										</div>
 									</div>
 								</Table.Cell>
