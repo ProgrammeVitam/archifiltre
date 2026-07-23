@@ -243,6 +243,22 @@ async function initializeSchema(db: ReturnType<typeof drizzle>): Promise<void> {
       )
     `);
 
+    // Skip ledger: units the scan could not fully process (unreadable/timed-out archive, dead
+    // share, permission, truncation), grouped by reason for the UI and drillable to path. fs skips
+    // have no files row, so extraction_error alone can't carry them; this table is the unified
+    // record.
+    await db.execute(sql`
+      CREATE TABLE IF NOT EXISTS scan_skips (
+        run_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        at INTEGER NOT NULL,
+        CONSTRAINT scan_skips_pkey PRIMARY KEY (run_id, path)
+      )
+    `);
+    await db.execute(sql`CREATE INDEX IF NOT EXISTS idx_scan_skips_reason ON scan_skips (run_id, reason)`);
+
     logger.debug(
       'Database schema initialized with physical_size, content_size, archive preprocessing fields, and scan_metadata'
     );
@@ -658,6 +674,33 @@ export function countRunRows(
   );
 }
 
+/** Bulk-persist the scan's skip ledger (units that couldn't be fully processed). Called ONCE
+ *  at finalize on the owner connection (the pipeline has completed → no interleave with inserts).
+ *  ON CONFLICT DO NOTHING keeps it idempotent across resumes; paths are sanitized like file rows. */
+export async function insertScanSkips(
+  connection: DatabaseConnection,
+  runId: string,
+  skips: Array<{ kind: string; path: string; reason: string }>
+): Promise<void> {
+  if (skips.length === 0) return;
+  const at = Math.floor(Date.now() / 1000);
+  const CHUNK = 500;
+  for (let i = 0; i < skips.length; i += CHUNK) {
+    const chunk = skips.slice(i, i + CHUNK);
+    const values: string[] = [];
+    const params: unknown[] = [];
+    chunk.forEach((s, j) => {
+      const b = j * 4;
+      values.push(`($${b + 1}, $${b + 2}, $${b + 3}, $${b + 4}, ${at})`);
+      params.push(runId, sanitizeDbText(s.path), s.kind, s.reason);
+    });
+    await connection.pg.query(
+      `INSERT INTO scan_skips (run_id, path, kind, reason, at) VALUES ${values.join(', ')} ON CONFLICT (run_id, path) DO NOTHING`,
+      params
+    );
+  }
+}
+
 // ── Warm-start template ──────────────────────────────────────────────────────
 // Opening a fresh datadir runs PGlite's initdb (~2.5–3 s — the bulk of the DB cold
 // start). Instead we keep ONE pre-initialized template PGDATA (clean: schema only,
@@ -681,6 +724,7 @@ const TEMPLATE_SCHEMA_DESCRIPTOR = [
   'files(run_id:text,path:text,physical_size:bigint,content_size:bigint,mtime:bigint,is_directory:bool,is_hidden:bool,is_system:bool,hash:text,enumerated_at:int,is_archive_container:bool,archive_parent_path:text,archive_depth:int,archive_format:text,extraction_error:text,pk[run_id,path])',
   'scan_metadata(run_id:text,root_path:text,started_at:int,completed_at:int,file_count:int,status:text,pk[run_id])',
   'dir_stats(run_id:text,path:text,total_size:bigint,file_count:bigint,dir_count:bigint,max_depth:int,deepest_path:text,pk[run_id,path])',
+  'scan_skips(run_id:text,path:text,kind:text,reason:text,at:int,pk[run_id,path])',
 ].join(';');
 const TEMPLATE_SCHEMA_VERSION = createHash('sha1').update(TEMPLATE_SCHEMA_DESCRIPTOR).digest('hex').slice(0, 12);
 
@@ -703,6 +747,22 @@ async function pathExists(p: string): Promise<boolean> {
   }
 }
 
+/** True only for a complete PGDATA. A `.ready` marker can outlive a half-written template dir, so
+ *  verify the three artifacts initdb always produces before trusting a datadir: a non-empty
+ *  global/pg_control, PG_VERSION, and base/. */
+async function isValidPgdata(dir: string): Promise<boolean> {
+  try {
+    const [ctrl] = await Promise.all([
+      fs.stat(path.join(dir, 'global', 'pg_control')),
+      fs.access(path.join(dir, 'PG_VERSION')),
+      fs.access(path.join(dir, 'base')),
+    ]);
+    return ctrl.size > 0;
+  } catch {
+    return false;
+  }
+}
+
 /** Build the clean template PGDATA once (background, fire-and-forget). No-op if ready.
  *  Call this when the process is IDLE (e.g. right after a scan completes) — its initdb
  *  blocks the single JS thread, so it must NOT overlap an active scan. */
@@ -711,19 +771,30 @@ export async function ensureTemplateInBackground(): Promise<void> {
   const ready = `${dir}.ready`;
   if (_templateBuilding || (await isTemplateReady())) return; // current-version template present
   _templateBuilding = true;
+  const build = `${dir}.building-${process.pid}`;
   try {
-    const build = `${dir}.building-${process.pid}`;
+    // The `.ready` marker is a COMMIT record, written last. Remove it up front: from now until a
+    // fully-built, verified template is in place, isTemplateReady() is false and nothing copies a
+    // half-written template. If the build crashes anywhere below, we rebuild next idle — never poison.
+    await fs.rm(ready, { force: true });
     await fs.rm(build, { recursive: true, force: true });
     await ensureDirectory(build);
     const pg = new PGlite({ dataDir: build, ...(await getStandalonePGliteOptions()) });
     await pg.waitReady;
     await initializeSchema(drizzle(pg, { schema: { files } }));
-    await pg.close();
+    await pg.close(); // flushes global/pg_control
+    // Only publish a template that verifies as a complete PGDATA: a partial one would copy itself
+    // into every new scan.
+    if (!(await isValidPgdata(build))) {
+      throw new Error('built template is not a complete PGDATA (missing pg_control/PG_VERSION/base)');
+    }
     await fs.rm(dir, { recursive: true, force: true });
     await fs.rename(build, dir); // atomic swap into place
-    await fs.writeFile(ready, TEMPLATE_SCHEMA_VERSION); // sibling marker (kept OUT of the copied PGDATA)
+    await fs.writeFile(ready, TEMPLATE_SCHEMA_VERSION); // commit AFTER the dir is valid + in place
     logger.debug('Warm-start template built', { dir });
   } catch (error) {
+    // Leave nothing behind that could later look ready; `.ready` was already removed above.
+    await fs.rm(build, { recursive: true, force: true }).catch(() => {});
     logger.warn('Warm-start template build failed; using normal init', {
       error: (error as Error).message,
     });
@@ -745,10 +816,12 @@ export async function createDatabase(name: string): Promise<DatabaseConnection> 
     logger.debug('Creating database', { name, dbPath, resolvedPath });
 
     const fresh = !(await pathExists(resolvedPath));
-    if (fresh && (await isTemplateReady())) {
-      // Warm path: copy the pre-initialized template instead of running initdb. A stale-schema
-      // template (older version marker) is ignored here, so its old column shapes never seed a
-      // new scan — we init fresh (current schema) instead and the template is rebuilt in bg.
+    // Warm path only if the template is BOTH marked ready AND structurally a complete PGDATA — the
+    // second check is belt-and-suspenders against a stale-but-matching marker over a corrupt dir.
+    const warm = fresh && (await isTemplateReady()) && (await isValidPgdata(templateDir()));
+    if (warm) {
+      // Copy the pre-initialized template instead of running initdb. A stale-schema template (older
+      // version marker) is ignored, so its old column shapes never seed a new scan — we init fresh.
       await fs.cp(templateDir(), resolvedPath, { recursive: true });
     } else {
       await ensureDirectory(resolvedPath);
@@ -756,13 +829,26 @@ export async function createDatabase(name: string): Promise<DatabaseConnection> 
 
     // Initialize PGlite with explicit dataDir for standalone compatibility. Opening a
     // copied (already-initialized) datadir skips initdb; a fresh one inits as before.
-    const pg = new PGlite({
-      dataDir: resolvedPath,
-      ...(await getStandalonePGliteOptions()),
-    });
-
-    // Wait for PGlite to be ready
-    await pg.waitReady;
+    const openOptions = await getStandalonePGliteOptions();
+    let pg = new PGlite({ dataDir: resolvedPath, ...openOptions });
+    try {
+      await pg.waitReady;
+    } catch (openError) {
+      // A fresh init failing is a genuine problem, so surface it. A warm copy that won't open means
+      // the template itself is corrupt: discard the copy, delete the template so it can't affect the
+      // next scan, and retry with a clean init.
+      if (!warm) throw openError;
+      logger.warn('Warm template copy failed to open; discarding template and initializing fresh', {
+        error: (openError as Error).message,
+      });
+      await pg.close().catch(() => {});
+      await fs.rm(resolvedPath, { recursive: true, force: true });
+      await fs.rm(`${templateDir()}.ready`, { force: true });
+      await fs.rm(templateDir(), { recursive: true, force: true });
+      await ensureDirectory(resolvedPath);
+      pg = new PGlite({ dataDir: resolvedPath, ...openOptions });
+      await pg.waitReady;
+    }
 
     const db = drizzle(pg, { schema: { files } });
 
