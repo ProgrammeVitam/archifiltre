@@ -47,6 +47,27 @@ export interface LLMResult {
   model: string;
 }
 
+/** A remote agent applying backpressure (429/503 + optional Retry-After) — its own queue is full
+ *  or it's rate-limiting. This is "wait, healthy", NOT a failure: honor the delay and retry. */
+export class LLMBackpressureError extends Error {
+  constructor(
+    readonly retryAfterMs: number,
+    readonly status: number,
+  ) {
+    super(`LLM API backpressure (${status}); retry after ${retryAfterMs}ms`);
+    this.name = 'LLMBackpressureError';
+  }
+}
+
+/** Parse a Retry-After header (delta-seconds or an HTTP-date) to milliseconds; 0 if absent/bad. */
+function parseRetryAfterMs(header: string | null): number {
+  if (!header) return 0;
+  const secs = Number(header);
+  if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+  const when = Date.parse(header);
+  return Number.isFinite(when) ? Math.max(0, when - Date.now()) : 0;
+}
+
 // === Constants ===
 
 const DEFAULT_MODEL = 'llama-3.1-8b-instruct';
@@ -152,6 +173,12 @@ export async function callLLM(
   });
 
   if (!response.ok) {
+    // 429/503 = the remote's own queue is full / rate-limited. Surface it as backpressure (wait,
+    // healthy), honoring Retry-After when present, so the caller waits instead of hard-failing.
+    if (response.status === 429 || response.status === 503) {
+      const retryAfterMs = parseRetryAfterMs(response.headers.get('retry-after')) || 2000;
+      throw new LLMBackpressureError(retryAfterMs, response.status);
+    }
     const errorText = await response.text().catch(() => 'unknown error');
     throw new Error(`LLM API error (${response.status} ${response.statusText}): ${errorText}`);
   }

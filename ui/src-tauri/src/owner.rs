@@ -1,4 +1,4 @@
-//! Single-owner DB session (read-while-scanning) — Phase 2.
+//! Single-owner DB session (read-while-scanning).
 //!
 //! Replaces the legacy synchronous `QuerySession` (write-a-line / read-a-line under
 //! a mutex, which breaks the moment async events interleave with query responses)
@@ -12,8 +12,11 @@
 //! Tauri-agnostic on purpose (the event sink is a plain closure) so it can be
 //! exercised directly against the real dev sidecar in a unit test.
 use crate::{QueryRequest, QueryResponse};
+use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::Path;
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -24,8 +27,20 @@ use tokio::sync::{oneshot, Mutex};
 /// Receives raw event-line JSON ({"event":…}) from the session for the UI stream.
 pub type EventSink = Arc<dyn Fn(String) + Send + Sync>;
 
+/// Runs one app-global LLM host request on the owner's behalf: given the request JSON and an
+/// event sink for streamed tokens (→ the UI), resolves to the terminal result envelope. Kept
+/// as a plain closure (like `EventSink`) so owner.rs stays Tauri-agnostic; the command layer
+/// wires it to the real `LlmHost` in `spawn_owner`. This is the owner→Rust upstream channel.
+pub type HostBridge = Arc<
+    dyn Fn(Value, EventSink) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub struct Owner {
-    stdin: Mutex<tokio::process::ChildStdin>,
+    /// Shared with the background reader so it can write `{host_reply}` lines back to the
+    /// session without interleaving with `send_request`'s writes (one mutex serializes both).
+    stdin: Arc<Mutex<tokio::process::ChildStdin>>,
     child: Mutex<tokio::process::Child>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<QueryResponse>>>>,
     alive: Arc<AtomicBool>,
@@ -37,13 +52,27 @@ pub struct Owner {
 
 impl Owner {
     /// Spawn the session process (`program args…` in optional `cwd`) and wait for its
-    /// `ready` event. `on_event` receives forwarded event lines.
+    /// `ready` event. `on_event` receives forwarded event lines. No LLM host upstream.
     pub async fn spawn(
         program: &str,
         args: &[String],
         cwd: Option<&Path>,
         on_event: EventSink,
         current_job_id: Arc<std::sync::Mutex<String>>,
+    ) -> Result<Owner, String> {
+        Self::spawn_with_host(program, args, cwd, on_event, current_job_id, None).await
+    }
+
+    /// Like `spawn`, plus an optional `host` bridge: when the session emits a
+    /// `{host_request, hrid}` line, the reader runs it on `host` (tokens stream to the UI via
+    /// `on_event`) and writes a `{host_reply, hrid}` line back to the session's stdin.
+    pub async fn spawn_with_host(
+        program: &str,
+        args: &[String],
+        cwd: Option<&Path>,
+        on_event: EventSink,
+        current_job_id: Arc<std::sync::Mutex<String>>,
+        host: Option<HostBridge>,
     ) -> Result<Owner, String> {
         let mut cmd = crate::sidecar_command(program);
         cmd.args(args)
@@ -57,7 +86,7 @@ impl Owner {
             .spawn()
             .map_err(|e| format!("Failed to spawn session: {}", e))?;
 
-        let stdin = child.stdin.take().ok_or("no stdin")?;
+        let stdin = Arc::new(Mutex::new(child.stdin.take().ok_or("no stdin")?));
         let stdout = child.stdout.take().ok_or("no stdout")?;
 
         let pending: Arc<Mutex<HashMap<String, oneshot::Sender<QueryResponse>>>> =
@@ -71,6 +100,7 @@ impl Owner {
             let pending = pending.clone();
             let alive = alive.clone();
             let run_id = run_id.clone();
+            let stdin_for_host = stdin.clone();
             let mut ready_tx = Some(ready_tx);
             tokio::spawn(async move {
                 let mut lines = tokio::io::BufReader::new(stdout).lines();
@@ -90,6 +120,27 @@ impl Owner {
                             continue; // internal handshake; not forwarded
                         }
                         on_event(line);
+                    } else if let Some(hreq) = v.get("host_request") {
+                        // Owner→Rust upstream: run it on the LLM host and reply on the session's
+                        // stdin. SPAWNED, never awaited inline — a generate can take minutes and
+                        // must not stall the reader (which also demuxes the owner's query replies).
+                        if let Some(host) = host.clone() {
+                            let hrid = v.get("hrid").and_then(|h| h.as_str()).unwrap_or("").to_string();
+                            let hreq = hreq.clone();
+                            let sink = on_event.clone();
+                            let stdin_w = stdin_for_host.clone();
+                            tokio::spawn(async move {
+                                let payload = match host(hreq, sink).await {
+                                    Ok(v) => v,
+                                    Err(e) => json!({ "ok": false, "error": e }),
+                                };
+                                let mut out = json!({ "host_reply": payload, "hrid": hrid }).to_string();
+                                out.push('\n');
+                                let mut s = stdin_w.lock().await;
+                                let _ = s.write_all(out.as_bytes()).await;
+                                let _ = s.flush().await;
+                            });
+                        }
                     } else if let Some(id) = v.get("id").and_then(|i| i.as_str()) {
                         let sender = { pending.lock().await.remove(id) };
                         if let Some(sender) = sender {
@@ -126,7 +177,7 @@ impl Owner {
         }
 
         Ok(Owner {
-            stdin: Mutex::new(stdin),
+            stdin,
             child: Mutex::new(child),
             pending,
             alive,
@@ -526,5 +577,258 @@ mod tests {
         assert!(!run_a2.is_empty(), "switch back to A must reload A's run id (got empty)");
         assert_eq!(dirs_a, dirs_a2, "A's data must be intact after switch away+back");
         println!("SWITCH-DB OK: A={} dirs (run {}), switch->B(fresh) {}ms, switch->A(existing) {}ms, A intact={}", dirs_a, run_a2, switch_b_ms, switch_a_ms, dirs_a == dirs_a2);
+    }
+
+    /// The owner→Rust upstream round-trip: the owner emits a `{host_request}`, the reader runs it
+    /// on the injected HostBridge (streaming a token to the UI sink) and writes `{host_reply}` back
+    /// to the session's stdin, which resolves the Bun-side `hostRequest`. A stub bridge isolates
+    /// the wire from node-llama-cpp. Run: `ARCHI_REPO=/abs/repo cargo test
+    /// owner_host_request_roundtrip -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual: needs a real repo path via ARCHI_REPO"]
+    fn owner_host_request_roundtrip() {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(owner_host_request_roundtrip_impl());
+    }
+
+    async fn owner_host_request_roundtrip_impl() {
+        let repo = std::env::var("ARCHI_REPO").unwrap_or_else(|_| "/path/to/archifiltre".into());
+        let archi = Path::new(&repo);
+        let db = "hostbridgetest";
+        let _ = std::fs::remove_dir_all(archi.join(format!("dbdata-{}", db)));
+        let scan_path = archi.join("src").to_string_lossy().to_string(); // small, real
+
+        // Capture emitted event lines to assert the streamed token reached the UI sink.
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: EventSink = {
+            let seen = seen.clone();
+            Arc::new(move |line: String| seen.lock().unwrap().push(line))
+        };
+        let jid = Arc::new(std::sync::Mutex::new(String::new()));
+
+        // Stub bridge: stream one token, then resolve with an envelope echoing the request.
+        let host: HostBridge = Arc::new(|req: Value, sink: EventSink| {
+            sink(json!({ "event": "describe:token", "streamId": "t1", "delta": "hi" }).to_string());
+            Box::pin(async move { Ok(json!({ "ok": true, "pong": true, "echo": req })) })
+        });
+
+        let owner = Owner::spawn_with_host("bun", &dev_args(db), Some(archi), sink, jid, Some(host))
+            .await
+            .expect("spawn owner");
+
+        // Load a run (the run-readiness guard fronts every query incl. host_ping) with a tiny scan.
+        let mut p = serde_json::Map::new();
+        p.insert("path".into(), json!(scan_path));
+        p.insert("batchSize".into(), json!(100));
+        assert!(owner.send_request(&req("s", "start_scan", p), 5000).await.unwrap().ok, "start_scan ack");
+
+        // Round-trip the LLM host through the owner→Rust upstream wire.
+        let resp = owner.send_request(&req("hp", "host_ping", serde_json::Map::new()), 8000).await.unwrap();
+        owner.kill().await;
+
+        assert!(resp.ok, "host_ping ok: {:?}", resp.error);
+        let data = resp.data.expect("host_ping data");
+        assert_eq!(data.get("pong").and_then(|b| b.as_bool()), Some(true), "stub host reply routed back to the owner");
+        let saw_token = seen.lock().unwrap().iter().any(|l| l.contains("describe:token"));
+        assert!(saw_token, "the token streamed by the bridge reached the UI sink");
+        println!("HOST-BRIDGE OK: round-trip pong=true, token_streamed={}", saw_token);
+    }
+
+    /// The single-call `describe` action: prepare (DB) → callAI (internal provider via the
+    /// owner→Rust upstream) → store (DB), streaming tokens. The model is stubbed with canned text,
+    /// so this covers orchestration only, not inference.
+    /// Run: `ARCHI_REPO=/abs/repo cargo test owner_describe_action -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual: needs a real repo path via ARCHI_REPO"]
+    fn owner_describe_action() {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(owner_describe_action_impl());
+    }
+
+    async fn owner_describe_action_impl() {
+        let repo = std::env::var("ARCHI_REPO").unwrap_or_else(|_| "/path/to/archifiltre".into());
+        let archi = Path::new(&repo);
+        let db = "describeactiontest";
+        let _ = std::fs::remove_dir_all(archi.join(format!("dbdata-{}", db)));
+        let scan_path = archi.join("src").to_string_lossy().to_string();
+
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: EventSink = {
+            let seen = seen.clone();
+            Arc::new(move |line: String| seen.lock().unwrap().push(line))
+        };
+        let jid = Arc::new(std::sync::Mutex::new(String::new()));
+
+        // Stub the model: stream two tokens, then return a canned generate envelope.
+        let host: HostBridge = Arc::new(|req: Value, sink: EventSink| {
+            if let Some(sid) = req.get("streamId").and_then(|s| s.as_str()) {
+                sink(json!({ "event": "describe:token", "streamId": sid, "delta": "A concise " }).to_string());
+                sink(json!({ "event": "describe:token", "streamId": sid, "delta": "test summary." }).to_string());
+            }
+            Box::pin(async move { Ok(json!({ "ok": true, "data": { "text": "A concise test summary.", "backend": "cpu" } })) })
+        });
+
+        let owner = Owner::spawn_with_host("bun", &dev_args(db), Some(archi), sink, jid, Some(host))
+            .await
+            .expect("spawn owner");
+        let dirs = scan_to_completion(&owner, &scan_path).await;
+        assert!(dirs > 0, "scan produced {} dirs", dirs);
+
+        // First describe of a real subfolder via the single-call action.
+        let mut p = serde_json::Map::new();
+        p.insert("path".into(), json!("lib"));
+        p.insert("llm".into(), json!({ "provider": "local", "lang": "en" }));
+        p.insert("streamId".into(), json!("s1"));
+        p.insert("clientId".into(), json!("c1"));
+        let d1 = owner.send_request(&req("d1", "describe", p.clone()), 15000).await.unwrap();
+        assert!(d1.ok, "describe ok: {:?}", d1.error);
+        let desc = d1.data.as_ref().and_then(|x| x.get("description")).and_then(|s| s.as_str()).unwrap_or("").to_string();
+        assert!(desc.contains("test summary"), "expected the canned summary, got {:?}", desc);
+        let fresh = !d1.data.as_ref().and_then(|x| x.get("cached")).and_then(|b| b.as_bool()).unwrap_or(true);
+        assert!(fresh, "first describe must be fresh (not cached)");
+
+        // Second describe of the same folder → leg 3 persisted it, so this is a cache hit (no model).
+        let d2 = owner.send_request(&req("d2", "describe", p), 8000).await.unwrap();
+        let cached = d2.data.as_ref().and_then(|x| x.get("cached")).and_then(|b| b.as_bool()).unwrap_or(false);
+        owner.kill().await;
+
+        let saw_token = seen.lock().unwrap().iter().any(|l| l.contains("describe:token"));
+        assert!(saw_token, "tokens streamed to the UI sink");
+        assert!(cached, "second describe must be served from the DB cache (leg 3 persisted)");
+        println!("DESCRIBE-ACTION OK: streamed={} cached_on_2nd={} desc={:?}", saw_token, cached, desc);
+    }
+
+    /// End-to-end with the real model: owner `describe` → owner→Rust upstream → a real `LlmHost`
+    /// (spawns llm-helper, loads the on-device model) → real summary → store. Covers the whole
+    /// internal path headlessly, with no GUI. Run:
+    /// `ARCHI_REPO=/abs/repo cargo test owner_describe_real_model -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual: needs ARCHI_REPO + a downloaded model + the compiled sidecar"]
+    fn owner_describe_real_model() {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(owner_describe_real_model_impl());
+    }
+
+    async fn owner_describe_real_model_impl() {
+        let repo = std::env::var("ARCHI_REPO").unwrap_or_else(|_| "/path/to/archifiltre".into());
+        let archi = Path::new(&repo);
+        let sidecar = archi.join("dist/archifiltre-x86_64-unknown-linux-gnu");
+        assert!(sidecar.exists(), "compiled sidecar missing: {:?} (run bun run build:linux)", sidecar);
+        let db = "describerealtest";
+        let _ = std::fs::remove_dir_all(archi.join(format!("dbdata-{}", db)));
+        let scan_path = archi.join("src/lib").to_string_lossy().to_string();
+
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: EventSink = {
+            let seen = seen.clone();
+            Arc::new(move |line: String| seen.lock().unwrap().push(line))
+        };
+        let jid = Arc::new(std::sync::Mutex::new(String::new()));
+
+        // The REAL app-global LLM host: spawns the real llm-helper, loads the on-device model.
+        let llm = Arc::new(crate::llm_host::LlmHost::default());
+        let host: HostBridge = {
+            let llm = llm.clone();
+            let sidecar = sidecar.clone();
+            Arc::new(move |req, sink| {
+                let llm = llm.clone();
+                let sidecar = sidecar.clone();
+                Box::pin(async move { llm.request(&sidecar, req, sink, Duration::from_secs(120)).await })
+            })
+        };
+
+        let owner = Owner::spawn_with_host("bun", &dev_args(db), Some(archi), sink, jid, Some(host))
+            .await
+            .expect("spawn owner");
+        let dirs = scan_to_completion(&owner, &scan_path).await;
+        assert!(dirs > 0, "scan produced {} dirs", dirs);
+
+        let mut p = serde_json::Map::new();
+        p.insert("path".into(), json!("")); // describe the scanned root
+        p.insert("llm".into(), json!({ "provider": "local", "model": "qwen2.5-0.5b", "lang": "en" }));
+        p.insert("streamId".into(), json!("r1"));
+        p.insert("clientId".into(), json!("cr1"));
+        let t = std::time::Instant::now();
+        let d = owner.send_request(&req("dr", "describe", p), 120_000).await.unwrap();
+        let elapsed = t.elapsed();
+        owner.kill().await;
+        llm.kill().await;
+
+        assert!(d.ok, "describe ok: {:?}", d.error);
+        let desc = d.data.as_ref().and_then(|x| x.get("description")).and_then(|s| s.as_str()).unwrap_or("").to_string();
+        assert!(desc.len() > 20, "real model produced a summary (got {} chars: {:?})", desc.len(), desc);
+        let saw_token = seen.lock().unwrap().iter().any(|l| l.contains("describe:token"));
+        println!("REAL-MODEL OK in {:?}: streamed={} desc={:?}", elapsed, saw_token, desc);
+    }
+
+    /// Two describes for the same target, fired concurrently, must coalesce to one generation
+    /// (the in-flight dedupe in handleDescribe) rather than double-describing.
+    /// The stub bridge counts generations and stays in-flight (sleep) so the second request arrives
+    /// while the first is running. Run: `ARCHI_REPO=/abs/repo cargo test owner_describe_dedupe --
+    /// --ignored --nocapture`.
+    #[test]
+    #[ignore = "manual: needs a real repo path via ARCHI_REPO"]
+    fn owner_describe_dedupe() {
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        rt.block_on(owner_describe_dedupe_impl());
+    }
+
+    async fn owner_describe_dedupe_impl() {
+        let repo = std::env::var("ARCHI_REPO").unwrap_or_else(|_| "/path/to/archifiltre".into());
+        let archi = Path::new(&repo);
+        let db = "dedupetest";
+        let _ = std::fs::remove_dir_all(archi.join(format!("dbdata-{}", db)));
+        let scan_path = archi.join("src").to_string_lossy().to_string();
+
+        let sink: EventSink = Arc::new(|_l: String| {});
+        let jid = Arc::new(std::sync::Mutex::new(String::new()));
+
+        // Count generations; stay in-flight so a concurrent duplicate has something to coalesce onto.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let host: HostBridge = {
+            let calls = calls.clone();
+            Arc::new(move |_req: Value, _sink: EventSink| {
+                let calls = calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    Ok(json!({ "ok": true, "data": { "text": "deduped summary" } }))
+                })
+            })
+        };
+
+        let owner = Arc::new(
+            Owner::spawn_with_host("bun", &dev_args(db), Some(archi), sink, jid, Some(host))
+                .await
+                .expect("spawn owner"),
+        );
+        let dirs = scan_to_completion(&owner, &scan_path).await;
+        assert!(dirs > 0, "scan produced {} dirs", dirs);
+
+        // A unique lang ('zz') so there is no prior cache OR durable snapshot to adopt — the
+        // describe MUST actually generate (otherwise a snapshot hit would mask the dedupe).
+        let mut p = serde_json::Map::new();
+        p.insert("path".into(), json!("lib"));
+        p.insert("llm".into(), json!({ "provider": "local", "lang": "zz" }));
+        p.insert("streamId".into(), json!("dsid"));
+        p.insert("clientId".into(), json!("dclient"));
+
+        // Fire TWO describes for the SAME target concurrently (owned requests moved into each task).
+        let (o1, req1) = (owner.clone(), req("dd1", "describe", p.clone()));
+        let (o2, req2) = (owner.clone(), req("dd2", "describe", p.clone()));
+        let h1 = tokio::spawn(async move { o1.send_request(&req1, 15000).await });
+        let h2 = tokio::spawn(async move { o2.send_request(&req2, 15000).await });
+        let r1 = h1.await.unwrap();
+        let r2 = h2.await.unwrap();
+        owner.kill().await;
+
+        let (r1, r2) = (r1.unwrap(), r2.unwrap());
+        assert!(r1.ok && r2.ok, "both describes ok: {:?} {:?}", r1.error, r2.error);
+        let t1 = r1.data.as_ref().and_then(|x| x.get("description")).and_then(|s| s.as_str()).unwrap_or("");
+        let t2 = r2.data.as_ref().and_then(|x| x.get("description")).and_then(|s| s.as_str()).unwrap_or("");
+        assert_eq!(t1, t2, "both requests got the same summary");
+        let n = calls.load(Ordering::SeqCst);
+        assert_eq!(n, 1, "concurrent describes for the same target must coalesce to ONE generation (got {})", n);
+        println!("DEDUPE OK: 2 concurrent describes → {} generation, text={:?}", n, t1);
     }
 }

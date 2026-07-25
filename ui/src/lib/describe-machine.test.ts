@@ -32,7 +32,7 @@ function make(role: 'root' | 'selected') {
 		sync: (o: Partial<Sync>) =>
 			actor.send({
 				type: 'SYNC',
-				sync: { enabled: true, local: true, scanState: '', phaseReady: false, modelReady: false, ...o }
+				sync: { enabled: true, local: true, scanState: '', phaseReady: false, modelReady: false, modelFailed: false, ...o }
 			}),
 		result: (r: DescribeOutcome) => ctl.sendBack?.({ type: 'RESULT', result: r }),
 		token: (d: string) => ctl.sendBack?.({ type: 'TOKEN', delta: d }),

@@ -54,9 +54,18 @@ struct HostProc {
 
 #[derive(Clone)]
 struct ModelInfo {
-    state: String, // "unloaded" | "loading" | "ready"
+    state: String, // "unloaded" | "loading" | "ready" | "failed"
     id: Option<String>,
     backend: Option<Value>,
+    /// Machine code for why `state == "failed"` ("runtime-missing" | "model-load-failed" |
+    /// "unknown"). `None` in every other state; only serialized into `llm:state` when failed.
+    reason: Option<String>,
+    /// Static engine info for the status-bar Tier-2 tooltip, extracted from node-llama-cpp at
+    /// load: the real GPU device name + total VRAM (GPU backend only) and the host CPU core
+    /// count. Sticky once known — surfaced in every `llm:state`, never guessed.
+    gpu_name: Option<String>,
+    vram_total_mb: Option<u64>,
+    cpu_count: Option<u64>,
 }
 
 impl ModelInfo {
@@ -65,6 +74,10 @@ impl ModelInfo {
             state: "unloaded".into(),
             id: None,
             backend: None,
+            reason: None,
+            gpu_name: None,
+            vram_total_mb: None,
+            cpu_count: None,
         }
     }
 }
@@ -203,6 +216,11 @@ struct Worker {
     replies: HashMap<u64, oneshot::Sender<Result<Value, String>>>,
     next_id: u64,
     last_sink: Option<LlmEventSink>,
+    /// Latched to the category when the model fails PERMANENTLY for the session (only
+    /// "runtime-missing": the native runtime can't be dlopen'd, so respawning is futile). While
+    /// set, `pump()` fails queued work fast instead of relaunching the doomed helper in a tight
+    /// loop. A fresh user-describe / load request clears it (one deliberate retry).
+    permanent_failure: Option<String>,
 }
 
 impl Worker {
@@ -217,6 +235,7 @@ impl Worker {
             replies: HashMap::new(),
             next_id: 1,
             last_sink: None,
+            permanent_failure: None,
         }
     }
 
@@ -330,6 +349,12 @@ impl Worker {
         };
         let target_model = req.get("model").and_then(|m| m.as_str()).map(String::from);
 
+        // Only a deliberate action (user click, explicit `load`) clears the latch, giving one
+        // fresh attempt; background auto-describes must not relaunch a doomed runtime.
+        if kind == "user-describe" || kind == "load" {
+            self.permanent_failure = None;
+        }
+
         // Preempt: a user describe cancels an actively-generating auto on the helper — its
         // `Done` (cancelled) frees the slot and the user's job (queued ahead) runs next.
         if kind == "user-describe" {
@@ -371,6 +396,21 @@ impl Worker {
         if self.active.is_some() {
             return;
         }
+        // Latch set: fail queued work fast with the reason rather than respawning the helper for
+        // each job (see `permanent_failure`).
+        if let Some(reason) = self.permanent_failure.clone() {
+            while let Some(job) = self.queue.pop_front() {
+                if let Some(r) = self.replies.remove(&job.id) {
+                    let _ = r.send(Ok(
+                        json!({"ok": false, "error": reason, "category": reason, "fatal": true}),
+                    ));
+                }
+            }
+            if let Some(sink) = self.last_sink.clone() {
+                self.emit_state(&sink).await;
+            }
+            return;
+        }
         loop {
             let Some(job) = self.queue.pop_front() else {
                 return;
@@ -390,6 +430,7 @@ impl Worker {
             if set_loading {
                 self.model.state = "loading".into();
                 self.model.id = job.target_model.clone();
+                self.model.reason = None;
                 self.emit_state(&job.sink).await;
             }
             self.active = Some(ActiveJob {
@@ -430,23 +471,56 @@ impl Worker {
     ) {
         // Truthful model state from the terminal reply.
         let ok = matches!(&result, Ok(v) if v.get("ok") == Some(&json!(true)));
+        // A helper-reported `fatal` carries a category — a TERMINAL failure (the runtime is
+        // missing, or this model failed to load), distinct from a transient error/cancel. A bare
+        // process-exit fatal has no category and stays transient (→ unloaded, retryable).
+        let fatal_category = match &result {
+            Ok(v) if v.get("fatal") == Some(&json!(true)) => v
+                .get("category")
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string()),
+            _ => None,
+        };
         if ok {
             if let Ok(v) = &result {
-                let backend = v
-                    .get("data")
+                let data = v.get("data");
+                let backend = data
                     .and_then(|d| d.get("backend"))
                     .cloned()
                     .filter(|b| !b.is_null());
                 self.model.state = "ready".into();
                 self.model.id = target_model;
+                self.model.reason = None;
                 if backend.is_some() {
                     self.model.backend = backend;
                 }
+                // Sticky engine info (only overwrite when the reply actually carries it, so a
+                // later `done` without it doesn't wipe what `loaded` established).
+                if let Some(n) = data.and_then(|d| d.get("gpuName")).and_then(|n| n.as_str()) {
+                    self.model.gpu_name = Some(n.to_string());
+                }
+                if let Some(t) = data.and_then(|d| d.get("vramTotalMb")).and_then(|t| t.as_u64()) {
+                    self.model.vram_total_mb = Some(t);
+                }
+                if let Some(c) = data.and_then(|d| d.get("cpuCount")).and_then(|c| c.as_u64()) {
+                    self.model.cpu_count = Some(c);
+                }
+            }
+        } else if let Some(category) = fatal_category {
+            // Terminal failure → the UI stops "loading…" and can explain why (reason=category).
+            self.model.state = "failed".into();
+            self.model.reason = Some(category.clone());
+            self.model.id = None;
+            // runtime-missing is permanent for the session: latch so we never auto-respawn the
+            // doomed helper in a tight loop. model-load-failed / unknown stay retryable.
+            if category == "runtime-missing" {
+                self.permanent_failure = Some(category);
             }
         } else if set_loading && self.model.state == "loading" {
-            // A load we started never became resident (error / cancelled during load).
+            // A load we started never became resident (transient error / cancelled during load).
             self.model.state = "unloaded".into();
             self.model.id = None;
+            self.model.reason = None;
         }
 
         if self.active.as_ref().map(|a| a.id) == Some(id) {
@@ -570,9 +644,24 @@ impl Worker {
         for j in &self.queue {
             q.push(json!({"clientId": j.client_id, "kind": j.kind, "state": "queued"}));
         }
+        let mut model = json!({
+            "state": self.model.state,
+            "id": self.model.id,
+            "backend": self.model.backend,
+            "gpuName": self.model.gpu_name,
+            "vramTotalMb": self.model.vram_total_mb,
+            "cpuCount": self.model.cpu_count,
+        });
+        // `reason` rides along ONLY in the failed state — a short machine code the UI maps to a
+        // localized, blame-free line ("runtime-missing" → install the runtime, etc.).
+        if self.model.state == "failed" {
+            if let Some(reason) = &self.model.reason {
+                model["reason"] = json!(reason);
+            }
+        }
         sink(json!({
             "event": "llm:state",
-            "model": {"state": self.model.state, "id": self.model.id, "backend": self.model.backend},
+            "model": model,
             "queue": q,
         })
         .to_string());
@@ -584,6 +673,7 @@ impl Worker {
             p.alive.store(false, Ordering::SeqCst);
         }
         self.model = ModelInfo::unloaded();
+        self.permanent_failure = None;
         for (_, r) in self.replies.drain() {
             let _ = r.send(Err("llm host shutting down".to_string()));
         }
@@ -641,13 +731,16 @@ async fn run_on_helper(
         let _ = stdin.flush().await;
     }
 
-    let deadline = tokio::time::Instant::now() + timeout;
+    // Idle (no-progress) timeout, not wall-clock: any helper message resets the window, so a slow
+    // but streaming generation never false-times-out. Queue wait happens earlier, in pump().
+    let mut deadline = tokio::time::Instant::now() + timeout;
     loop {
         let msg = match tokio::time::timeout_at(deadline, rx.recv()).await {
             Ok(Some(m)) => m,
             Ok(None) => return Err("llm-helper channel closed".to_string()),
-            Err(_) => return Err("llm request timed out".to_string()),
+            Err(_) => return Err("llm request stalled (no progress)".to_string()),
         };
+        deadline = tokio::time::Instant::now() + timeout; // progress → reset the idle window
         match msg.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             // ── streamed intermediates → UI event lines (identical to the owner-era shapes) ──
             "token" => {
@@ -667,12 +760,35 @@ async fn run_on_helper(
                 })
                 .to_string());
             }
+            // Live resource telemetry (only during generation) → a status-bar meter event. Also
+            // counts as progress, so a long GPU generation that streams slowly still resets the
+            // idle window between tokens.
+            "resource" => {
+                sink(json!({
+                    "event":"llm:resource",
+                    "cpuPct": msg.get("cpuPct"),
+                    "rssMb": msg.get("rssMb"),
+                    "vramUsedMb": msg.get("vramUsedMb"),
+                    "vramTotalMb": msg.get("vramTotalMb"),
+                })
+                .to_string());
+            }
             // ── terminals ──
-            "loaded" => return Ok(json!({"ok": true, "data": {"backend": msg.get("backend")}})),
+            "loaded" => {
+                return Ok(json!({"ok": true, "data": {
+                    "backend": msg.get("backend"),
+                    "gpuName": msg.get("gpuName"),
+                    "vramTotalMb": msg.get("vramTotalMb"),
+                    "cpuCount": msg.get("cpuCount"),
+                }}))
+            }
             "done" => {
                 return Ok(json!({"ok": true, "data": {
                     "text": msg.get("text"),
                     "backend": msg.get("backend"),
+                    "gpuName": msg.get("gpuName"),
+                    "vramTotalMb": msg.get("vramTotalMb"),
+                    "cpuCount": msg.get("cpuCount"),
                 }}))
             }
             "model_status" => {
@@ -718,7 +834,17 @@ async fn run_on_helper(
                     .and_then(|m| m.as_str())
                     .unwrap_or("AI runtime not available")
                     .to_string();
-                return Ok(json!({"ok": false, "error": message}));
+                // A category = a DELIBERATE helper fatal (runtime missing / model failed to load):
+                // mark it terminal so the worker sets model.state="failed" with the reason. A bare
+                // process-exit fatal has no category → stays a transient error (retryable).
+                match msg.get("category").and_then(|c| c.as_str()) {
+                    Some(category) => {
+                        return Ok(
+                            json!({"ok": false, "error": message, "fatal": true, "category": category}),
+                        )
+                    }
+                    None => return Ok(json!({"ok": false, "error": message})),
+                }
             }
             _ => {} // unknown intermediate — ignore
         }

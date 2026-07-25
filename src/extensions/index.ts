@@ -15,6 +15,7 @@
  */
 
 import type { Command } from '@oclif/core';
+import { registerProvider, type AiProvider } from '@extensions/ai-describe/ai-api.ts';
 
 // === Extension Types ===
 
@@ -119,6 +120,28 @@ function hasManifest(ext: Record<string, unknown>): ext is { MANIFEST: Extension
 export const EXTENSION_MANIFESTS: Extension[] = EXTENSIONS.filter(hasManifest).map(
   ext => ext.MANIFEST
 );
+
+// === AI Provider Discovery ===
+// An extension provides AI agents (an on-device model, a remote endpoint, an OCR/whisper engine,
+// ...) by exporting `AI_PROVIDERS: AiProvider[]`. Contract and per-kind concurrency:
+// src/extensions/ai-describe/ai-api.ts.
+
+function hasAiProviders(ext: Record<string, unknown>): ext is { AI_PROVIDERS: AiProvider[] } {
+  return 'AI_PROVIDERS' in ext && Array.isArray((ext as { AI_PROVIDERS?: unknown }).AI_PROVIDERS);
+}
+
+/**
+ * Register every extension-provided AI provider into the AI API. Call ONCE at sidecar startup, in
+ * the process that runs callAI (the owner). The built-in internal/external providers self-register
+ * in ai-api.ts at import; this adds the extension ones. Idempotent (re-registering overwrites).
+ */
+export function registerExtensionAiProviders(): void {
+  for (const ext of EXTENSIONS) {
+    if (hasAiProviders(ext)) {
+      for (const p of ext.AI_PROVIDERS) registerProvider(p);
+    }
+  }
+}
 
 // === Re-export Extension Functions ===
 // Export individual extensions for direct use by other commands

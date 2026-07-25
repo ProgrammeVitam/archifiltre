@@ -68,6 +68,8 @@ const ENRICHMENT_MUTATIONS = new Set([
   'restore_annotations',
 ]);
 import { getDatabasePath } from '@lib/platform-paths.ts';
+import { handleHostReply } from '@lib/host-bridge.ts';
+import { registerExtensionAiProviders } from '@extensions/index.ts';
 import { dispatchQuery, type QueryRequest } from './query.ts';
 
 export default class Session extends Command {
@@ -252,6 +254,9 @@ export default class Session extends Command {
       void ensureTemplateInBackground();
     }
 
+    // Register any extension-provided AI agents into the AI API (built-ins self-register).
+    registerExtensionAiProviders();
+
     const rl = readline.createInterface({ input: process.stdin, terminal: false });
     rl.on('line', line => {
       const trimmed = line.trim();
@@ -282,12 +287,15 @@ export default class Session extends Command {
   }
 
   private async handle(line: string): Promise<void> {
-    let req: QueryRequest;
+    let parsed: unknown;
     try {
-      req = JSON.parse(line) as QueryRequest;
+      parsed = JSON.parse(line);
     } catch {
       return; // ignore malformed line, owner survives
     }
+    // A reply from the app-global LLM host (Rust -> owner), not a query — route it and stop.
+    if (handleHostReply(parsed)) return;
+    const req = parsed as QueryRequest;
     const { id, action } = req;
 
     try {
@@ -308,6 +316,11 @@ export default class Session extends Command {
       // with resume:true — the frontier makes that cheap (re-walk only the remainder).
       if (action === 'pause_scan' || action === 'cancel_scan') {
         await this.stopScan(action === 'pause_scan' ? 'paused' : 'cancelled');
+        this.send({ id, ok: true });
+        return;
+      }
+      if (action === 'finish_scan') {
+        this.finishWithCommitted();
         this.send({ id, ok: true });
         return;
       }
@@ -553,6 +566,7 @@ export default class Session extends Command {
           detail: event.status,
           // Canonical committed-so-far counts — the numbers every UI surface shows.
           counts: event.counts,
+          skipped: event.skipped,
         });
       }
     ).subscribe({
@@ -595,6 +609,18 @@ export default class Session extends Command {
         })();
       },
     });
+  }
+
+  /**
+   * "Finish with what I have": stop the walker pulling NEW directories but leave the subscription
+   * intact, so the pipeline completes naturally on committed data (walker returns → last() →
+   * hashing/dedup → the `complete:` handler → job:complete). Reuses the pause flag WITHOUT
+   * unsubscribing, so it can't reopen the pause=unsubscribe soft-crash race. The scan is marked
+   * complete — it simply didn't walk the whole tree (the user chose to land it early).
+   */
+  private finishWithCommitted(): void {
+    if (!this.scanning) return;
+    this.scanPaused = true;
   }
 
   /**

@@ -31,12 +31,13 @@ import {
   type ScanStats,
 } from '@lib/database.ts';
 import { eq, and, like, isNotNull, sql, desc, gt, asc } from 'drizzle-orm';
+import { hostRequest } from '@lib/host-bridge.ts';
 import {
+  handleDescribe,
   handleDescribeDirectory,
   handleDescribePrepare,
   handleStoreDescription,
 } from '@extensions/ai-describe/index.ts';
-import { warmLocal } from '@extensions/ai-describe/local-engine.ts';
 import {
   LOCAL_MODELS,
   DEFAULT_LOCAL_MODEL,
@@ -472,6 +473,11 @@ async function handleGetAllFiles(
       hash: files.hash,
       is_archive_container: files.is_archive_container,
       archive_format: files.archive_format,
+      // A container the scan couldn't fully expand (too large / too deep / unreadable / timed
+      // out / truncated) carries extraction_error — the file-level "not processed" flag the
+      // ledger's "Show in list" filters on. (fs/dir skips have no files row; they live only in
+      // the scan_skips ledger and its popover tally.)
+      not_processed: sql<boolean>`extraction_error IS NOT NULL`,
       alias: sql<
         string | null
       >`(SELECT a.alias FROM aliases a WHERE a.run_id = ${runId} AND a.path = "files"."path")`,
@@ -511,6 +517,7 @@ async function handleGetAllFiles(
       has_comment: Boolean(row.has_comment),
       has_tag: Boolean(row.has_tag),
       tagged_for_deletion: Boolean(row.tagged_for_deletion),
+      not_processed: Boolean(row.not_processed),
       dup_count: duplicatesOnly ? Number(row.dup_count) : undefined,
     };
   });
@@ -844,14 +851,6 @@ async function handleDownloadModel(id: string): Promise<unknown> {
   }
 }
 
-/**
- * Pre-load the local model so the first describe is warm (~0.7 s) not cold (~9 s). Fired by the UI
- * when local-AI mode is active (e.g. on scan start) — cheap and idempotent; loads in the background.
- */
-async function handleWarmModel(id: string): Promise<unknown> {
-  return warmLocal(id || DEFAULT_LOCAL_MODEL);
-}
-
 export async function dispatchQuery(
   database: DatabaseConnection,
   runId: string,
@@ -914,6 +913,34 @@ export async function dispatchQuery(
       // Decoupled from the open log file, so a Windows file lock can't empty the diagnostics.
       // DB-free: the ring lives in process memory, so this works even when the DB is broken.
       return { ring: drainRingLog() };
+    // Single-call describe: prepare -> callAI (internal/external/extension) -> store.
+    // Tokens stream out-of-band, keyed by streamId.
+    case 'describe': {
+      const llm = request.llm as
+        | { provider?: 'local' | 'external'; model?: string; lang?: string; baseUrl?: string; apiKey?: string }
+        | undefined;
+      const result = await handleDescribe(
+        database,
+        runId,
+        (request.path as string) ?? '',
+        {
+          provider: llm?.provider,
+          model: llm?.model,
+          lang: llm?.lang,
+          baseUrl: llm?.baseUrl,
+          apiKey: llm?.apiKey,
+          streamId: request.streamId as string | undefined,
+          clientId: request.clientId as string | undefined,
+        },
+        scanning
+      );
+      logger.info('llm.describe', {
+        describeId: request.describeId as string | undefined,
+        cached: result.cached ?? false,
+        ok: !result.error,
+      });
+      return result;
+    }
     case 'describe_directory':
       return await handleDescribeDirectory(
         database,
@@ -966,8 +993,11 @@ export async function dispatchQuery(
     }
     case 'model_status':
       return await handleModelStatus();
-    case 'warm_model':
-      return await handleWarmModel((request.model as string) ?? '');
+    case 'host_ping':
+      // Round-trip the app-global LLM host through the owner->Rust upstream channel: proves
+      // the wire end to end (owner stdout {host_request} -> Rust LLM host -> owner stdin
+      // {host_reply}). The AI API's internal provider uses the same hostRequest() seam.
+      return await hostRequest({ type: 'ping' });
     case 'download_model':
       return await handleDownloadModel((request.model as string) ?? '');
     case 'get_thumbnail':

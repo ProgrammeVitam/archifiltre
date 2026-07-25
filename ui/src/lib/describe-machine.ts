@@ -25,6 +25,7 @@ export interface Sync {
 	scanState: string; // 'scanning' | 'complete' | 'paused' | …
 	phaseReady: boolean; // scanPhase ∈ STRUCTURE_READY_PHASES
 	modelReady: boolean; // host model.state === 'ready'
+	modelFailed: boolean; // host model.state === 'failed' (runtime could not load) — local only
 }
 
 export interface Ctx {
@@ -52,7 +53,7 @@ export interface DescribeInput {
 	kind: 'auto' | 'user';
 }
 
-const NO_SYNC: Sync = { enabled: false, local: false, scanState: '', phaseReady: false, modelReady: false };
+const NO_SYNC: Sync = { enabled: false, local: false, scanState: '', phaseReady: false, modelReady: false, modelFailed: false };
 
 /** Placeholder describe actor — never emits. Overridden with the real RxJS-backed actor in
  *  llm-describe.ts (`.provide`) and with a controllable mock in tests. */
@@ -83,7 +84,10 @@ export const summaryMachine = setup({
 			c.sync.enabled &&
 			(c.sync.scanState === 'scanning' || c.sync.scanState === 'complete' || c.sync.scanState === 'paused'),
 		completed: ({ context: c }) => c.sync.enabled && c.sync.scanState === 'complete',
-		completedNeedsPersist: ({ context: c }) => c.sync.scanState === 'complete' && c.needsPersist && !!c.text
+		completedNeedsPersist: ({ context: c }) => c.sync.scanState === 'complete' && c.needsPersist && !!c.text,
+		// The on-device runtime could not load (e.g. a missing system dependency). Only meaningful
+		// for local mode; an external endpoint never loads a local model, so it can't be "failed".
+		runtimeUnavailable: ({ context: c }) => c.sync.enabled && c.sync.local && c.sync.modelFailed
 	}
 }).createMachine({
 	id: 'summary',
@@ -104,6 +108,10 @@ export const summaryMachine = setup({
 	states: {
 		absent: {
 			always: [
+				// Runtime is dead before we even try — go straight to a named unavailable state
+				// instead of spinning a describe that will only fail. This is what stops the
+				// "loading… → blank" churn when the on-device runtime can't load.
+				{ guard: 'runtimeUnavailable', target: 'unavailable' },
 				{ guard: 'startMidScanRoot', actions: assign({ midScan: true, streamingText: '' }), target: 'generating' },
 				{ guard: 'startSettledRoot', actions: assign({ midScan: false, streamingText: '' }), target: 'generating' },
 				{
@@ -114,6 +122,9 @@ export const summaryMachine = setup({
 			]
 		},
 		generating: {
+			// If the runtime dies mid-attempt (host reports model.state='failed'), abandon this
+			// describe and surface the named unavailable state rather than streaming nothing forever.
+			always: [{ guard: 'runtimeUnavailable', target: 'unavailable' }],
 			invoke: {
 				src: 'describe',
 				input: ({ context: c }): DescribeInput => ({
@@ -161,6 +172,13 @@ export const summaryMachine = setup({
 			// Terminal: surfaces once, no auto-regenerate. A static `completed` re-arm here would
 			// re-fire forever on a persistent failure. Mid-scan failures use `deferred`/`partial`,
 			// which regenerate once at completion.
+		},
+		unavailable: {
+			// The on-device runtime failed to load — surface a named reason and stop, never a blank
+			// or a perpetual spinner. Recoverable: if the model later loads (modelFailed clears),
+			// re-arm to `absent` so a fresh attempt can run. The `!modelFailed` guard can't loop —
+			// on entry modelFailed is true, so it only fires once the failure genuinely clears.
+			always: [{ guard: ({ context: c }) => !c.sync.modelFailed, target: 'absent' }]
 		}
 	}
 });

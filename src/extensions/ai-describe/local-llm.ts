@@ -93,7 +93,8 @@ export const LOCAL_MODELS: LocalModelInfo[] = [
     'Qwen/Qwen2.5-0.5B-Instruct-GGUF', 'qwen2.5-0.5b-instruct-q4_k_m.gguf', 491_400_032),
   m('qwen2.5-1.5b', 'Qwen2.5 1.5B', 'Qwen', 'balanced', 'Balanced quality and speed', 'Apache-2.0',
     'Qwen/Qwen2.5-1.5B-Instruct-GGUF', 'qwen2.5-1.5b-instruct-q4_k_m.gguf', 1_117_320_736),
-  // Qwen2.5 7B is a 2-shard GGUF — llama-server auto-loads both from the first path.
+  // Qwen2.5 7B ships as a 2-shard GGUF; the loader resolves the second shard from the first path,
+  // so only that one is recorded here.
   {
     id: 'qwen2.5-7b',
     label: 'Qwen2.5 7B',

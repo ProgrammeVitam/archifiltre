@@ -12,8 +12,8 @@ import type { DatabaseConnection } from '@lib/database.ts';
 import { directoryDescriptions } from '@extensions/ai-describe/schema.ts';
 import { getLLMConfig } from '@extensions/ai-describe/llm-client.ts';
 import { callLLM } from '@extensions/ai-describe/llm-client.ts';
-import { DEFAULT_LOCAL_MODEL, localBackendIsGpu } from '@extensions/ai-describe/local-llm.ts';
-import { generateLocal } from '@extensions/ai-describe/local-engine.ts';
+import { localBackendIsGpu } from '@extensions/ai-describe/local-llm.ts';
+import { callAI, providerIdForMode, type AiResult } from '@extensions/ai-describe/ai-api.ts';
 import {
   buildTreeString,
   buildStatsBlock,
@@ -260,39 +260,31 @@ export async function handleDescribeDirectory(
         }
       : undefined;
 
-    // 6. Generate.
-    //    - Local (Qwen): run the model IN-PROCESS via a private stdio inference helper — no
-    //      server, no listening port. The model must already be downloaded.
-    //    - External: POST to the configured OpenAI-compatible endpoint (Settings win, else the
-    //      LLM_BASE_URL / LLM_API_KEY env vars).
+    // 6. Generate via the external OpenAI-compatible endpoint (Settings win, else the
+    //    LLM_BASE_URL / LLM_API_KEY env vars). On-device describe does not run here: it goes
+    //    through the app-global Rust LLM host, so only one llm-helper holds a model in memory.
     let aiResult: { description: string; model: string };
     if (override?.provider === 'local') {
-      try {
-        aiResult = await generateLocal(override.model?.trim() || DEFAULT_LOCAL_MODEL, {
-          systemPrompt,
-          userPrompt,
-          onToken,
-        });
-      } catch (err) {
-        return { description: null, error: err instanceof Error ? err.message : String(err) };
-      }
-    } else {
-      const config =
-        override?.baseUrl && override?.apiKey
-          ? { baseUrl: override.baseUrl.trim().replace(/\/+$/, ''), apiKey: override.apiKey.trim() }
-          : getLLMConfig();
-      if (!config) {
-        return {
-          description: null,
-          error:
-            'LLM service not configured. Set the base URL and API key in Settings › LLM (or the LLM_BASE_URL / LLM_API_KEY environment variables).',
-        };
-      }
-      aiResult = await callLLM(config, systemPrompt, userPrompt, {
-        model: override?.model?.trim() || undefined,
-        onToken,
-      });
+      return {
+        description: null,
+        error: 'on-device describe runs on the app LLM host, not the in-owner engine',
+      };
     }
+    const config =
+      override?.baseUrl && override?.apiKey
+        ? { baseUrl: override.baseUrl.trim().replace(/\/+$/, ''), apiKey: override.apiKey.trim() }
+        : getLLMConfig();
+    if (!config) {
+      return {
+        description: null,
+        error:
+          'LLM service not configured. Set the base URL and API key in Settings › LLM (or the LLM_BASE_URL / LLM_API_KEY environment variables).',
+      };
+    }
+    aiResult = await callLLM(config, systemPrompt, userPrompt, {
+      model: override?.model?.trim() || undefined,
+      onToken,
+    });
 
     // 8. Persist for future cache hits — but NEVER a mid-scan summary (whether it came from the
     //    filesystem fallback or a still-partial DB tree): leave it uncached so the post-scan pass
@@ -309,15 +301,16 @@ export async function handleDescribeDirectory(
   }
 }
 
-// === Split describe (app-global LLM host) ===
+// === DB-side halves of describe ===
 //
-// The app runs inference in ONE Rust-owned `llm-helper` process shared by every scan (warm model,
-// no per-owner reload). The owner keeps the DB-side halves as two thin actions:
-//   describe_prepare  → cache check + mid-scan gate + prompt build   (leg 1)
-//   (the app then generates on the host — leg 2)
-//   store_description → persist the generated text for cache hits    (leg 3)
-// `handleDescribeDirectory` above stays intact for the CLI/bridge (standalone, in-owner engine)
-// and for the external provider path.
+// Inference runs in one Rust-owned `llm-helper` process shared by every scan, so the model stays
+// warm and is never reloaded per owner. These two are the DB work `handleDescribe` composes
+// around that call:
+//   describe_prepare  → cache check + mid-scan gate + prompt build
+//   store_description → persist the generated text for later cache hits
+// Both are still exposed as actions, but only `store_description` has an outside caller: the
+// promote path, where the app keeps a summary produced mid-scan (see tauri.ts persistDescription).
+// `handleDescribeDirectory` above serves the external provider only (see step 6).
 
 export interface DescribePrepared {
   /** Cache hit — the summary, done (no generation needed). */
@@ -406,6 +399,76 @@ export async function handleStoreDescription(
   await ensureDescriptionTable(db);
   await saveDescription(db, runId, dirPath, body.description, body.model, body.lang);
   return { stored: true };
+}
+
+/** In-flight describes keyed by `${runId}::${path}::${lang}` — concurrent triggers for the same
+ *  target coalesce onto one generation (no double-describe). */
+const inFlightDescribes = new Map<string, Promise<DescribeResult>>();
+
+/**
+ * The single-call describe the frontend invokes: prepare (DB) -> callAI (provider dispatch) ->
+ * store (DB), streaming tokens to the UI throughout.
+ */
+export async function handleDescribe(
+  db: DatabaseConnection,
+  runId: string,
+  dirPath: string,
+  override: {
+    provider?: 'local' | 'external'; // aiMode
+    model?: string;
+    lang?: string;
+    streamId?: string;
+    clientId?: string;
+    /** External provider endpoint (from Settings); falls back to the LLM_* env config. */
+    baseUrl?: string;
+    apiKey?: string;
+  } = {},
+  scanning = false
+): Promise<DescribeResult> {
+  const key = `${runId}::${dirPath}::${override.lang ?? ''}`;
+  const existing = inFlightDescribes.get(key);
+  if (existing) return existing;
+
+  const run = (async (): Promise<DescribeResult> => {
+    try {
+      // Leg 1 — prepare (DB): cache hit / snapshot adopt / mid-scan gate / prompt build.
+      const prep = await handleDescribePrepare(db, runId, dirPath, { provider: override.provider, lang: override.lang }, scanning);
+      if (prep.error) return { description: null, error: prep.error };
+      if (prep.cached) return { description: prep.cached.description, model: prep.cached.model, cached: true };
+      if (!prep.system || !prep.prompt) return { description: null, error: 'AI prompt unavailable' };
+
+      // Leg 2 — infer (dispatch: internal via the Rust host, external via HTTP).
+      const providerId = providerIdForMode(override.provider ?? 'local');
+      const config =
+        override.baseUrl && override.apiKey
+          ? { baseUrl: override.baseUrl.trim().replace(/\/+$/, ''), apiKey: override.apiKey.trim() }
+          : undefined;
+      let result: AiResult;
+      try {
+        result = await callAI(providerId, {
+          system: prep.system,
+          prompt: prep.prompt,
+          model: override.model,
+          clientId: override.clientId ?? key,
+          streamId: override.streamId,
+          ...(config ? { config } : {}),
+        });
+      } catch (err) {
+        return { description: null, error: err instanceof Error ? err.message : String(err) };
+      }
+
+      // Leg 3 — store (DB) for future cache hits, only when leg 1 said cacheable.
+      if (prep.cacheable) {
+        await handleStoreDescription(db, runId, dirPath, { description: result.text, model: result.model, lang: override.lang });
+      }
+      return { description: result.text, model: result.model, cached: false };
+    } finally {
+      inFlightDescribes.delete(key);
+    }
+  })();
+
+  inFlightDescribes.set(key, run);
+  return run;
 }
 
 /** The scanned root's absolute path (files are stored relative to it), or null if the

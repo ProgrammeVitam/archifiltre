@@ -3,7 +3,7 @@
  *
  * Runs under **Bun** (this very sidecar binary, re-invoked as `archifiltre llm-helper`), loading
  * node-llama-cpp IN-PROCESS: NO server, NO listening port, and NO separate Node runtime. The
- * scan sidecar spawns it and talks over stdin/stdout JSON-lines; see {@link ../extensions/ai-describe/local-engine.ts}.
+ * app-global Rust LLM host (`ui/src-tauri/src/llm_host.rs`) spawns it and talks over stdin/stdout JSON-lines.
  *
  * node-llama-cpp is imported **dynamically inside run()** on purpose: it's an external dep resolved
  * from the bundled `node_modules` at runtime, so a `session`/`query` invocation (which never needs
@@ -28,6 +28,7 @@
  */
 import { Command } from '@oclif/core';
 import { createInterface } from 'node:readline';
+import { cpus } from 'node:os';
 import {
   DEFAULT_LOCAL_MODEL,
   DownloadError,
@@ -46,6 +47,37 @@ import {
 // Backend diagnostics must go to the winston FILE logger (console-off for this command, so it can't
 // corrupt the JSON protocol on stdout) to actually land in the exportable logs.
 import { logger as fileLog, drainRingLog } from '@lib/logging.ts';
+
+/** Machine code carried on a `fatal` message → the Rust host's `llm:state.model.reason`. */
+type FatalCategory = 'runtime-missing' | 'model-load-failed' | 'unknown';
+
+/**
+ * Classify a load/runtime failure into a stable machine code the UI can act on.
+ *  - `runtime-missing`: the native runtime can't even be dlopen'd (missing prebuilt / VC++
+ *    redistributable / bad .node / unresolvable module). Permanent for the session.
+ *  - otherwise `fallback` — `unknown` for the module-resolution path, `model-load-failed` for the
+ *    later getLlama()/loadModel() path (the runtime loaded, but this model failed to open).
+ * The DLL/module patterns still win over the model fallback: a dlopen failure at load time is
+ * really a missing runtime, whatever stage surfaced it.
+ */
+function classifyFatal(e: unknown, fallback: Exclude<FatalCategory, 'runtime-missing'>): FatalCategory {
+  const s = `${(e as Error)?.message ?? ''} ${(e as Error)?.stack ?? ''}`;
+  if (
+    /ERR_DLOPEN_FAILED|NoBinaryFoundError|not resolvable|cannot find module|missing (dll|module)|\bdlopen\b|\.dll\b/i.test(
+      s
+    )
+  ) {
+    return 'runtime-missing';
+  }
+  return fallback;
+}
+
+/** Tag an error thrown by the getLlama()/loadModel() path so the request handler reports it as a
+ *  terminal `model-load-failed` fatal (vs a transient, retry-on-next-request per-request error). */
+function markLoadFailure(e: unknown): never {
+  (e as { __afLoadFailure?: boolean }).__afLoadFailure = true;
+  throw e;
+}
 
 export default class LlmHelper extends Command {
   static override description = 'Internal: on-device inference worker (stdio JSON-lines). Not for direct use.';
@@ -104,10 +136,12 @@ export default class LlmHelper extends Command {
       // (missing prebuilt, missing VC++ runtime, bad .node, wrong AF_LLM_DIR…) survives in the
       // exported bundle. Without this, a broken runtime = the helper dies silently and AI is
       // undiagnosably dead.
+      const category = classifyFatal(e, 'unknown');
       fileLog.error('llm.runtime.load.failed', e as Error, {
         reason: String((e as Error)?.message ?? e),
+        category,
       });
-      send({ type: 'fatal', message: 'inference runtime unavailable: ' + String((e as Error)?.message ?? e) });
+      send({ type: 'fatal', category, message: 'inference runtime unavailable: ' + String((e as Error)?.message ?? e) });
       // process.exit() does NOT wait for winston's async file stream to flush, so give the error
       // line a beat to hit disk before we exit — otherwise the reason we just logged is lost.
       setTimeout(() => process.exit(3), 250);
@@ -152,7 +186,7 @@ export default class LlmHelper extends Command {
           logLevel: LlamaLogLevel.warn,
           logger: (level: unknown, message: string) =>
             fileLog.warn(`[node-llama-cpp:${String(level)}] ${message}`),
-        }));
+        }).catch(markLoadFailure));
       backend = (llama.gpu ?? false) as string | false;
       // A GPU backend was requested but the runtime fell back to CPU → say so explicitly; the warnings above
       // carry the why. This is the line to grep when "everything is slow" = stuck on CPU.
@@ -173,9 +207,10 @@ export default class LlmHelper extends Command {
       void rememberBackend(!backend ? 'cpu' : backend === 'metal' ? 'metal' : 'vulkan').catch(
         () => {}
       );
-      model = await llama.loadModel({ modelPath });
-      context = await model.createContext({ contextSize: 2048 });
+      model = await llama.loadModel({ modelPath }).catch(markLoadFailure);
+      context = await model.createContext({ contextSize: 2048 }).catch(markLoadFailure);
       loadedPath = modelPath;
+      engineInfo = null; // recompute the static engine info for the newly-loaded model
       const load_ms = Math.round(performance.now() - t);
       const loadedMsg = `loaded ${modelPath} in ${(load_ms / 1000).toFixed(2)}s (backend=${JSON.stringify(backend)})`;
       err(loadedMsg);
@@ -188,6 +223,29 @@ export default class LlmHelper extends Command {
         backend: backend || 'cpu',
         contextSize: 2048,
       });
+    }
+
+    /** Static engine info for the status-bar Tier-2 tooltip: the real GPU device name + total VRAM
+     *  (once a GPU backend is attached) and the host CPU core count. Extracted from node-llama-cpp
+     *  at load and memoized (it never changes for a loaded model). Best-effort — telemetry must
+     *  never break a load, so any probe failure just leaves the field null. */
+    let engineInfo: { gpuName: string | null; vramTotalMb: number; cpuCount: number } | null = null;
+    async function readEngineInfo() {
+      const cpuCount = cpus().length || 1;
+      let gpuName: string | null = null;
+      let vramTotalMb = 0;
+      try {
+        if (llama && backend) {
+          const names = await llama.getGpuDeviceNames();
+          gpuName = (names && names[0]) || null;
+          const vram = await llama.getVramState();
+          vramTotalMb = Math.round((vram?.total ?? 0) / 1048576);
+        }
+      } catch {
+        /* best-effort telemetry — never fail a load over it */
+      }
+      engineInfo = { gpuName, vramTotalMb, cpuCount };
+      return engineInfo;
     }
 
     /** Resolve a request's model to an on-disk GGUF path: absolute `modelPath` passes through
@@ -310,7 +368,7 @@ export default class LlmHelper extends Command {
         }
         if (type === 'load') {
           await ensureModel(await resolveModelPath(req), req.gpu);
-          send({ id, type: 'loaded', backend });
+          send({ id, type: 'loaded', backend, ...(await readEngineInfo()) });
           return;
         }
         if (type === 'generate') {
@@ -336,13 +394,44 @@ export default class LlmHelper extends Command {
             promptChars: (req.prompt ?? '').length,
             backend: backend || 'cpu',
           });
+          // Live resource sampler for the status-bar meter: this helper's own CPU%/RSS (plus VRAM
+          // on a GPU backend) ~1×/s while this generation runs; cleared in `finally`.
+          const cores = cpus().length || 1;
+          let lastCpu = process.cpuUsage();
+          let lastAt = performance.now();
+          const sampleOnce = () => {
+            const now = performance.now();
+            const cur = process.cpuUsage();
+            const busyUs = cur.user - lastCpu.user + (cur.system - lastCpu.system);
+            const elapsedMs = Math.max(1, now - lastAt);
+            lastCpu = cur;
+            lastAt = now;
+            const cpuPct = Math.min(100, Math.round((busyUs / 1000 / elapsedMs / cores) * 100));
+            const rssMb = Math.round(process.memoryUsage().rss / 1048576);
+            void (async () => {
+              let vramUsedMb: number | undefined;
+              let vramTotalMb: number | undefined;
+              try {
+                if (llama && backend) {
+                  const v = await llama.getVramState();
+                  vramUsedMb = Math.round((v?.used ?? 0) / 1048576);
+                  vramTotalMb = Math.round((v?.total ?? 0) / 1048576);
+                }
+              } catch {
+                /* best-effort telemetry */
+              }
+              send({ id, type: 'resource', cpuPct, rssMb, vramUsedMb, vramTotalMb });
+            })();
+          };
+          // Seed one reading at 350 ms so even a sub-second generation lights the meter.
+          const firstSample = setTimeout(sampleOnce, 350);
+          const sampler = setInterval(sampleOnce, 1000);
           try {
             await session.prompt(req.prompt ?? '', {
               maxTokens: req.maxTokens ?? 256,
               // node-llama-cpp's default is greedy decoding (temperature 0), which sends small
               // models into degenerate repetition loops ("… de jardinage de jardinage de …").
-              // Match the sampling the old llama-server shipped by default: mild temperature +
-              // nucleus sampling + a repetition penalty.
+              // So use mild temperature + nucleus sampling + a repetition penalty instead.
               temperature: 0.7,
               topP: 0.9,
               repeatPenalty: { penalty: 1.15, lastTokens: 128 },
@@ -370,7 +459,7 @@ export default class LlmHelper extends Command {
               stopReason: tokens >= (req.maxTokens ?? 256) ? 'maxTokens' : 'eos',
               backend: backend || 'cpu',
             });
-            send({ id, type: 'done', text, backend });
+            send({ id, type: 'done', text, backend, ...(engineInfo ?? (await readEngineInfo())) });
           } catch (e) {
             if (ac.signal.aborted) {
               fileLog.info('llm.generate.cancel', { describeId: dId, chunksOut: tokens });
@@ -383,6 +472,8 @@ export default class LlmHelper extends Command {
               send({ id, type: 'error', message: String((e as Error)?.message ?? e) });
             }
           } finally {
+            clearTimeout(firstSample); // stop the live meter the moment generation ends
+            clearInterval(sampler);
             if (id != null) inflight.delete(id);
             try {
               seq.dispose();
@@ -392,6 +483,19 @@ export default class LlmHelper extends Command {
           }
         }
       } catch (e) {
+        // The model itself failed to load (getLlama/loadModel/createContext): a terminal fatal,
+        // distinct from a transient per-request error. The runtime is alive, so don't exit — a
+        // later request, or a different model, may still succeed. The Rust host maps this `fatal`
+        // to model.state="failed" with the category.
+        if ((e as { __afLoadFailure?: boolean })?.__afLoadFailure) {
+          const category = classifyFatal(e, 'model-load-failed');
+          fileLog.error('llm.model.load.failed', e as Error, {
+            reason: String((e as Error)?.message ?? e),
+            category,
+          });
+          send({ type: 'fatal', category, message: String((e as Error)?.message ?? e) });
+          return;
+        }
         send({ id, type: 'error', message: String((e as Error)?.message ?? e) });
       }
     });

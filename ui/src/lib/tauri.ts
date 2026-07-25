@@ -402,6 +402,10 @@ export interface FileNode extends NodeEnrichment {
 	hash: string | null;
 	is_archive: boolean;
 	archive_format: string | null;
+	/** The scan could not fully process this unit (unreadable / too large / too deep / timed
+	 *  out / truncated archive) — it carries an extraction_error. Drives the "Not processed"
+	 *  list filter. Only set by get_all_files. */
+	not_processed?: boolean;
 	/** Duplicates mode only: total copies sharing this file's hash across the whole result
 	 *  (independent of pagination), so the UI can show the real "N×" for a group even when a
 	 *  page boundary splits it. Undefined outside duplicates mode. */
@@ -894,119 +898,6 @@ export function cancelDescribe(clientId: string): void {
 }
 
 /**
- * The 3-leg local describe on the app-global host:
- *   leg 1 (owner)  describe_prepare  — cache hit / mid-scan gate / prompt build (DB work)
- *   leg 2 (host)   generate          — THE warm model, tokens streamed via job-update
- *   leg 3 (owner)  store_description — persist for future cache hits (when cacheable)
- * Throws only when the HOST transport is unavailable (caller falls back to legacy).
- */
-async function describeViaHost(
-	dirPath: string,
-	model: string,
-	lang: string,
-	onToken?: (delta: string) => void,
-	opts?: DescribeOpts
-): Promise<DirectoryDescription> {
-	const prep = await sendQuery(
-		{
-			id: `describe_prepare_${Date.now()}`,
-			action: 'describe_prepare',
-			path: dirPath,
-			llm: { provider: 'local', lang },
-			...(opts?.describeId ? { describeId: opts.describeId } : {})
-		},
-		opts?.dbName,
-		30_000
-	);
-	if (!prep.ok) return { description: null, error: prep.error };
-	const p = prep.data as {
-		cached?: { description: string; model: string };
-		system?: string;
-		prompt?: string;
-		cacheable?: boolean;
-		provisional?: boolean;
-		error?: string;
-	};
-	if (p.error) return { description: null, error: p.error }; // e.g. scan-in-progress
-	if (p.cached) return { description: p.cached.description, model: p.cached.model, cached: true };
-
-	const streamId = onToken ? `desc_${Date.now()}_${Math.floor(Math.random() * 1e6)}` : undefined;
-	let unlisten: UnlistenFn | null = null;
-	try {
-		if (streamId && onToken) {
-			unlisten = await onJobUpdate((e) => {
-				try {
-					const msg = JSON.parse(e.line);
-					if (msg.event === 'describe:token' && msg.streamId === streamId && msg.delta)
-						onToken(msg.delta as string);
-				} catch {
-					/* not our event */
-				}
-			});
-		}
-		// When the helper never starts, no helper-side line exists — these are the only record of
-		// why leg 2 failed.
-		logFrontend('llm.generate.request', { describeId: opts?.describeId, model });
-		let gen;
-		try {
-			gen = await llmHostBreaker.execute(() =>
-				llmRequest({
-					type: 'generate',
-					model,
-					system: p.system,
-					prompt: p.prompt,
-					maxTokens: 256,
-					...(streamId ? { streamId } : {}),
-					...(opts?.clientId ? { clientId: opts.clientId } : {}),
-					...(opts?.kind ? { kind: opts.kind } : {}),
-					...(opts?.describeId ? { describeId: opts.describeId } : {})
-				})
-			);
-		} catch (e) {
-			if (isBrokenCircuitError(e)) {
-				// Breaker open → fast-fail without touching the down host.
-				logFrontend('llm.generate.circuit-open', { describeId: opts?.describeId });
-				return { description: null, error: 'AI temporarily unavailable' };
-			}
-			// Host transport unavailable (host unspawnable / non-Tauri) → caller falls back to legacy.
-			logFrontend('llm.generate.transport-fail', {
-				describeId: opts?.describeId,
-				reason: String((e as Error)?.message ?? e)
-			});
-			throw e;
-		}
-		if (!gen.ok) {
-			logFrontend('llm.generate.failed', { describeId: opts?.describeId, reason: gen.error });
-			return { description: null, error: gen.error ?? 'AI runtime not available' };
-		}
-		const text = ((gen.data?.text as string) ?? '').trim();
-		if (!text) return { description: null, error: 'AI runtime returned no text' };
-		// Persist for cache hits — fire-and-forget; a failed cache write must not hide the summary.
-		if (p.cacheable) {
-			void sendQuery(
-				{
-					id: `store_description_${Date.now()}`,
-					action: 'store_description',
-					path: dirPath,
-					description: text,
-					model,
-					lang,
-					...(opts?.describeId ? { describeId: opts.describeId } : {})
-				},
-				opts?.dbName
-			).catch(() => {});
-		}
-		return { description: text, model, cached: false, provisional: p.provisional };
-	} finally {
-		try {
-			await Promise.resolve(unlisten?.()).catch(() => {});
-		} catch {
-			/* ignore */
-		}
-	}
-}
-
-/**
  * Persist an already-generated summary for future cache hits WITHOUT regenerating it — the
  * "promote" path. The engine calls this at scan completion for an authoritative mid-scan
  * summary (built from the full tree, so no need to regenerate): it was left uncached while
@@ -1039,8 +930,8 @@ export async function queryDirectoryDescription(
 ): Promise<DirectoryDescription | null> {
 	let unlistenTokens: UnlistenFn | null = null;
 	try {
-		// LLM provider from Settings › LLM. `off` → don't call. `local` → on-device Qwen via
-		// the sidecar's llama-server. `external` → the configured OpenAI-compatible endpoint.
+		// LLM provider from Settings › LLM. `off` → don't call. `local` → on-device Qwen in the
+		// app-global llm-helper. `external` → the configured OpenAI-compatible endpoint.
 		// Default (no value) is `local`.
 		let mode = 'local';
 		try {
@@ -1058,17 +949,27 @@ export async function queryDirectoryDescription(
 		// switches — tokens for an abandoned stream simply don't match).
 		const streamId = onToken ? `desc_${Date.now()}_${_ownerReqCounter}` : undefined;
 
-		let llm:
-			| {
-					provider?: 'local' | 'external';
-					baseUrl?: string;
-					apiKey?: string;
-					model?: string;
-					lang?: string;
-					streamId?: string;
-			  }
-			| undefined;
-		if (mode === 'local') {
+		// Provider params for the backend AI API. local = the on-device model; external = the
+		// configured OpenAI-compatible endpoint (creds from Settings, else the sidecar's env).
+		let llm: {
+			provider: 'local' | 'external';
+			model?: string;
+			lang?: string;
+			baseUrl?: string;
+			apiKey?: string;
+		};
+		if (mode === 'external') {
+			llm = { provider: 'external', lang };
+			try {
+				const raw = localStorage.getItem('archifiltre-llm-config');
+				if (raw) {
+					const c = JSON.parse(raw);
+					if (c && (c.baseUrl || c.apiKey || c.model)) llm = { provider: 'external', lang, ...c };
+				}
+			} catch {
+				/* no/bad config → the sidecar falls back to its LLM_* env vars */
+			}
+		} else {
 			let model = 'qwen2.5-0.5b'; // GPU-safe default (1.5B on a laptop GPU can freeze the desktop)
 			try {
 				const m = localStorage.getItem('archifiltre-local-model');
@@ -1076,39 +977,11 @@ export async function queryDirectoryDescription(
 			} catch {
 				/* default model */
 			}
-			// Preferred path: the app-global LLM host (ONE warm model, scan-independent).
-			// Transport failure only (bridge env / host unspawnable) falls through to the
-			// legacy in-owner path below — business errors return as-is (never retried).
-			try {
-				return await describeViaHost(dirPath, model, lang, onToken, opts);
-			} catch (hostErr) {
-				// A TRANSIENT session error must NOT cascade into the legacy in-owner describe
-				// (which would load a SECOND model in the owner). Re-raise it as a transient result
-				// so the engine's bounded retry handles it on the host path — never a second load.
-				if (isTransientSessionError(hostErr)) {
-					return { description: null, error: String((hostErr as { message?: unknown })?.message ?? hostErr) };
-				}
-				console.warn('LLM host unavailable — legacy in-owner describe:', hostErr);
-			}
 			llm = { provider: 'local', model, lang };
-		} else {
-			// LLM credentials from Settings › LLM (localStorage). Sent with the request; the
-			// sidecar falls back to its LLM_* env vars when these are empty.
-			try {
-				const raw = localStorage.getItem('archifiltre-llm-config');
-				if (raw) {
-					const c = JSON.parse(raw);
-					if (c && (c.baseUrl || c.apiKey || c.model))
-						llm = { provider: 'external', ...c, lang };
-				}
-			} catch {
-				/* no/bad config → undefined → env fallback */
-			}
-			if (!llm) llm = { provider: 'external', lang };
 		}
-		if (llm && streamId) llm.streamId = streamId;
 
-		// Subscribe to streamed token events for this request (cache hits emit none).
+		// Subscribe to streamed token events for this request (cache hits emit none). Tokens reach
+		// us as `describe:token` matched by streamId, whichever provider served the describe.
 		if (streamId && onToken) {
 			unlistenTokens = await onJobUpdate((e) => {
 				try {
@@ -1121,20 +994,37 @@ export async function queryDirectoryDescription(
 			});
 		}
 
-		// A cold local describe must spawn llama-server and load the model (1–5 GB) before
-		// generating, which easily exceeds the default 15 s request cap — give it room so it
-		// doesn't error out as "no description". External calls keep the default.
-		const timeoutMs = mode === 'local' ? 180_000 : undefined;
-		const response = await sendQuery(
-			{
-				id: `describe_directory_${Date.now()}`,
-				action: 'describe_directory',
-				path: dirPath,
-				...(llm ? { llm } : {})
-			},
-			undefined,
-			timeoutMs
-		);
+		// One call: the owner orchestrates prepare → infer → store and streams throughout, wrapped in
+		// the host breaker so repeated transport failures fast-fail.
+		//
+		// The timeout is only a backstop against a wedged owner — the backend enforces the real
+		// no-progress bound, so time spent merely queued must not count as a failure here. A dead
+		// owner still fails fast, since the Rust reader drains pending on exit.
+		const timeoutMs = mode === 'local' ? 1_800_000 : 300_000;
+		let response;
+		try {
+			response = await llmHostBreaker.execute(() =>
+				sendQuery(
+					{
+						id: `describe_${Date.now()}`,
+						action: 'describe',
+						path: dirPath,
+						llm,
+						...(streamId ? { streamId } : {}),
+						...(opts?.clientId ? { clientId: opts.clientId } : {}),
+						...(opts?.describeId ? { describeId: opts.describeId } : {})
+					},
+					opts?.dbName,
+					timeoutMs
+				)
+			);
+		} catch (e) {
+			if (isBrokenCircuitError(e)) {
+				logFrontend('llm.describe.circuit-open', { describeId: opts?.describeId });
+				return { description: null, error: 'AI temporarily unavailable' };
+			}
+			throw e;
+		}
 
 		if (!response.ok) {
 			console.error('Failed to get directory description:', response.error);

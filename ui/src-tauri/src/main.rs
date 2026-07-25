@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 mod llm_host;
 mod owner;
 use llm_host::LlmHost;
-use owner::{EventSink, Owner};
+use owner::{EventSink, HostBridge, Owner};
 
 // ============================================================================
 // Types
@@ -966,6 +966,7 @@ async fn spawn_owner(
     binary_path: &std::path::Path,
     db: &str,
 ) -> Result<Arc<Owner>, String> {
+    use tauri::Manager;
     let current_job_id = Arc::new(std::sync::Mutex::new(String::new()));
     let sink: EventSink = {
         let app = app.clone();
@@ -975,13 +976,32 @@ async fn spawn_owner(
             let _ = app.emit("job-update", JobUpdateEvent { job_id, line });
         })
     };
+    // Owner→Rust upstream: let this owner reach the app-global LLM host (one warm model,
+    // Rust-owned + queued). Streamed tokens flow straight to the UI via the host's sink.
+    let host: HostBridge = {
+        let app_state = app.state::<Arc<AppState>>().inner().clone();
+        let sidecar = binary_path.to_path_buf();
+        Arc::new(move |req, sink| {
+            let app_state = app_state.clone();
+            let sidecar = sidecar.clone();
+            Box::pin(async move {
+                // No-progress (liveness) window, not a wall-clock bound: the host resets it on
+                // every helper message, so only genuine silence for 900s fails a request.
+                app_state
+                    .llm
+                    .request(&sidecar, req, sink, std::time::Duration::from_secs(900))
+                    .await
+            })
+        })
+    };
     let args = vec!["session".to_string(), "--db".to_string(), db.to_string()];
-    let owner = Owner::spawn(
+    let owner = Owner::spawn_with_host(
         binary_path.to_string_lossy().as_ref(),
         &args,
         None,
         sink,
         current_job_id,
+        Some(host),
     )
     .await?;
     Ok(Arc::new(owner))
