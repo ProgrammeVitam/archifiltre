@@ -12,7 +12,8 @@
 		activeScan,
 		scanPhase,
 		isDiscovering,
-		aiMode
+		aiMode,
+		localModel
 	} from '$lib/stores';
 	import { smoothFilesDiscovered } from '$lib/scan-counters';
 	import {
@@ -24,7 +25,7 @@
 		type DirDateStats,
 		type CompositionEntry
 	} from '$lib/tauri';
-	import { rootSummary } from '$lib/llm-describe';
+	import { rootSummary, llmBackend } from '$lib/llm-describe';
 	import { _, locale } from '$lib/i18n';
 	import { fmtBytes, fmtNum, fmtDate } from '$lib/format';
 	import { getFileType, type FileType } from '$lib/file-types';
@@ -175,19 +176,51 @@
 			<p class="text-base leading-relaxed text-foreground">{$rootSummary.text}</p>
 			{#if $rootSummary.model}
 				<p class="mt-2 text-xs text-muted-foreground/60">
-					{$_($aiMode === 'external' ? 'details.summarizedExternal' : 'details.summarizedLocally')}
-					· {$rootSummary.model}{$rootSummary.cached ? ' · ' + $_('details.cached') : ''}
+					{$_(
+						$aiMode === 'external' ? 'details.summarizedExternal' : 'details.summarizedLocally',
+						{ values: { model: $rootSummary.model } }
+					)}{$rootSummary.cached ? ' ' + $_('details.cached') : ''}
 				</p>
 			{/if}
 		</div>
+	{:else if $rootSummary.status === 'unavailable'}
+		<!-- On-device AI could not start — named, actionable reason; never blank. -->
+		<p class="text-xs italic text-muted-foreground/70">
+			{$_(
+				$rootSummary.reason === 'runtime-missing'
+					? 'details.aiUnavailableRuntime'
+					: $rootSummary.reason === 'model-load-failed'
+						? 'details.aiUnavailableModel'
+						: 'details.aiUnavailableGeneric'
+			)}
+		</p>
 	{:else if $rootSummary.status === 'error'}
 		<p class="mx-auto max-w-prose text-center text-sm italic text-muted-foreground/60">
 			{$_('details.summaryUnavailable')}
 		</p>
-	{:else if $rootSummary.status === 'generating' && $rootSummary.streamingText}
+	{:else if $rootSummary.status === 'generating' && !$rootSummary.modelLoading && !$rootSummary.waiting}
+		<!-- Generating with no pending wait state, including the prefill window: a blinking cursor
+		     holds the text area, and the engine line sits where the finished summary's line goes. -->
+		{@const engine =
+			$aiMode === 'local'
+				? $llmBackend === 'gpu'
+					? 'GPU'
+					: $llmBackend === 'cpu'
+						? 'CPU'
+						: null
+				: null}
 		<div class="mx-auto max-w-prose text-center">
 			<p class="text-base leading-relaxed text-foreground">
 				{$rootSummary.streamingText}<span class="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-foreground/50"></span>
+			</p>
+			<p class="mt-2 text-xs text-muted-foreground/60">
+				{#if engine}
+					{$_('details.generatingWith', {
+						values: { model: $rootSummary.model || $localModel, engine }
+					})}
+				{:else}
+					{$_('details.generatingGeneric')}
+				{/if}
 			</p>
 		</div>
 	{:else if $rootSummary.status === 'generating'}
@@ -197,6 +230,10 @@
 			<Skeleton class="h-4 w-[85%]" />
 			{#if $rootSummary.modelLoading}
 				<p class="text-xs italic text-muted-foreground/60">{$_('details.modelLoading')}</p>
+			{:else if $rootSummary.queuedAhead > 1}
+				<p class="text-xs italic text-muted-foreground/60">
+					{$_('details.queuedAhead', { values: { count: $rootSummary.queuedAhead } })}
+				</p>
 			{:else if $rootSummary.waiting}
 				<p class="text-xs italic text-muted-foreground/60">{$_('details.waitingTurn')}</p>
 			{/if}

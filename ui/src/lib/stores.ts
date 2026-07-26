@@ -35,6 +35,9 @@ export interface ScanResult {
 	totalSize: number;
 	filesHashed: number;
 	filesToHash: number;
+	/** Units that couldn't be fully processed (unreadable/timed-out archive, dead share,
+	 *  permission, truncation), by stable reason. The honest broken-units ledger. */
+	skipped?: { total: number; byReason: Record<string, number> };
 }
 
 export interface TerminalLine {
@@ -422,19 +425,6 @@ export const scanOptions = derived(activeScan, ($scan) => ({
 /** Scan result (from active scan) - LEGACY */
 export const scanResult = derived(activeScan, ($scan) => $scan?.scanResult ?? defaultScanResult);
 
-/** Live resource telemetry from the single-owner session (owner mode). The session
- *  emits a `resource` event every ~500ms; the status bar shows it and the scan can
- *  be throttled against it. Null when idle / not in owner mode. */
-export interface ResourceStats {
-	cpuPct: number;
-	rssMB: number;
-	load1: number;
-	cores: number;
-	budget: number;
-	scanning: boolean;
-}
-export const resourceStats = writable<ResourceStats | null>(null);
-
 /** Terminal output (from active scan) - LEGACY */
 export const terminalOutput = derived(activeScan, ($scan) => $scan?.terminalOutput ?? []);
 
@@ -500,7 +490,7 @@ export const sortMode = writable<SortMode>('size');
  *  them (arrangement, quick filters, search). */
 export type ListMode = 'flat' | 'folders' | 'dupes';
 export const listMode = writable<ListMode>('flat');
-export const listFilters = writable({ marked: false, tagged: false, big: false });
+export const listFilters = writable({ marked: false, tagged: false, big: false, notProcessed: false });
 export const listSearch = writable('');
 
 // Selected item store for details panel (shared across all views)
@@ -826,7 +816,7 @@ export const llmConfig = persistedJson<LlmConfig>('archifiltre-llm-config', {
 });
 
 /** How LLM directory summaries are provided. `off` disables it entirely; `local` runs a
- *  Qwen model on this machine via a sidecar-spawned llama-server (private, no network — the
+ *  Qwen model in a sidecar-spawned helper process (private, no network — the
  *  user downloads the model from Settings); `external` uses the credentials in
  *  {@link llmConfig} (or the LLM_* env fallback). Defaults to `local` — private summaries
  *  out of the box. */
@@ -870,10 +860,8 @@ try {
 }
 export const localModel = persistedStr<string>('archifiltre-local-model', 'qwen2.5-0.5b');
 
-/** The app-global LLM host's model state — set ONLY from the host's own `llm:state`
- *  events (mirrored by $lib/llm-describe), never guessed UI-side: 'loading' while the
- *  one-time load runs, 'ready' once resident, 'idle' when unknown. Session-only. */
-export const llmModelState = writable<'idle' | 'loading' | 'ready'>('idle');
+// On-device AI status (backend, busy, failure, engine info, live resource) lives in
+// $lib/llm-describe: { aiCellState, aiMeter, llmBackend, llmEngineInfo }.
 
 // ================================
 // Scan Actions
@@ -928,6 +916,8 @@ interface JobProgressEvent {
 	detail: string;
 	/** Canonical committed-so-far counts (DB-true) — the numbers every surface shows. */
 	counts?: { files: number; folders: number; archiveEntries: number; bytes: number };
+	/** Units that couldn't be fully processed, by stable reason. */
+	skipped?: { total: number; byReason: Record<string, number> };
 }
 
 function tryParseJsonProgressEvent(line: string): JobProgressEvent | null {
@@ -974,7 +964,11 @@ export function parseScanOutputForScan(scanId: string, line: string): void {
 		scansStore.updateScan(scanId, {
 			scanPhase: phase,
 			scanProgress: event.detail,
-			scanResult: { ...scan.scanResult, ...metrics }
+			scanResult: {
+				...scan.scanResult,
+				...metrics,
+				...(event.skipped ? { skipped: event.skipped } : {})
+			}
 		});
 		return;
 	}

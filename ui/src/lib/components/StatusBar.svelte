@@ -6,11 +6,14 @@
 		activeScan,
 		enrichmentSaveStatus,
 		isDiscovering,
-		resourceStats,
 		resumeScanningScan,
 		requestPauseScanningScan,
-		aiMode
+		aiMode,
+		localModel
 	} from '$lib/stores';
+	// AI status view-models (see $lib/llm-describe): `aiCellState` is the status-cell glyph,
+	// `aiMeter` the backend-aware meter model.
+	import { aiCellState, aiMeter, llmBackend, llmEngineInfo } from '$lib/llm-describe';
 	import { smoothFilesDiscovered, smoothFilesHashed } from '$lib/scan-counters';
 	import { pauseScan, resumeScan, useOwnerDb } from '$lib/tauri';
 	import { _ } from '$lib/i18n';
@@ -23,13 +26,47 @@
 		PauseIcon,
 		PlayIcon,
 		ShieldCheckIcon,
-		GlobeIcon
+		GlobeIcon,
+		GlobeXIcon,
+		LoaderPinwheelIcon,
+		ServerCrashIcon,
+		GpuIcon
 	} from '@lucide/svelte';
+	import SkippedLink from './SkippedLink.svelte';
 
 	// Privacy provenance for the whole session. The scan + all analysis is on-device; the LLM
 	// summary is the one thing that leaves the machine — and only when the provider is External.
 	// So the chip is mode-aware: it never claims "nothing leaves" while External is selected.
 	let external = $derived($aiMode === 'external');
+
+	// On-device cell tooltip (Tier-1 engine info): model + resolved backend once known, or the
+	// unavailable reason. Falls back to the plain privacy line before the backend has resolved so
+	// it never claims a guessed engine.
+	let engineWord = $derived($llmBackend === 'gpu' ? 'GPU' : $llmBackend === 'cpu' ? 'CPU' : null);
+	// Tier-2 device detail appended to the tooltip once node-llama-cpp reports it: the real GPU
+	// name + total VRAM on a GPU backend, or the CPU core count on CPU. Empty until known.
+	let engineDetail = $derived.by(() => {
+		const e = $llmEngineInfo;
+		if ($llmBackend === 'gpu' && e.gpuName) {
+			return e.vramTotalMb
+				? ` (${e.gpuName}, ${(e.vramTotalMb / 1024).toFixed(1)} GB)`
+				: ` (${e.gpuName})`;
+		}
+		if ($llmBackend === 'cpu' && e.cpuCount) return ` (${e.cpuCount} cores)`;
+		return '';
+	});
+	let aiCellTitle = $derived(
+		$aiCellState === 'crash'
+			? $_('status.aiUnavailableHint')
+			: engineWord
+				? $_('status.aiOnDeviceHint', { values: { model: $localModel, engine: engineWord } }) +
+					engineDetail
+				: $_('status.privacyOnDeviceHint')
+	);
+	// Stable locals so the template can narrow the discriminated unions (each bare `$store` is a
+	// fresh get() TS can't narrow across; a $derived binding is one stable reference).
+	let cell = $derived($aiCellState);
+	let meter = $derived($aiMeter);
 
 	// Completed-scan stats are computed in +page.svelte (it has the query stats),
 	// so they're passed in; everything else comes from the stores.
@@ -47,6 +84,16 @@
 
 	let scan = $derived($activeScan);
 	let save = $derived($enrichmentSaveStatus);
+
+	// The broken-units ledger. Severity escalates the segment's tone (grey→amber) when a whole
+	// location failed or a large fraction was skipped.
+	let skipped = $derived(scan?.scanResult?.skipped);
+	let severeSkips = $derived(
+		!!skipped &&
+			skipped.total > 0 &&
+			((skipped.byReason['location-unavailable'] ?? 0) > 0 ||
+				skipped.total > Math.max(20, fileCount * 0.05))
+	);
 
 	const PHASE_KEY: Record<string, string> = {
 		discovery: 'status.phaseDiscovering',
@@ -201,34 +248,75 @@
 		<span class="whitespace-nowrap">{$fmtNum(duplicateCount)} {$_('status.duplicates')}</span>
 		<span class="text-[8px] opacity-40">{sep}</span>
 		<span class="whitespace-nowrap">{$fmtBytes(totalSize)}</span>
+		{#if skipped && skipped.total > 0}
+			<span class="text-[8px] opacity-40">{sep}</span>
+			<SkippedLink {skipped} severe={severeSkips} />
+		{/if}
 	{/if}
 
 	<!-- Right side: live scan telemetry (owner mode, while scanning) + the persistent privacy
 	     chip. Grouped so the privacy chip stays pinned right in every state. -->
 	<div class="ml-auto flex items-center gap-2">
-		{#if $resourceStats && $resourceStats.scanning}
+		<!-- `scan` is the scan governor's draw; `gpu`/`cpu` is a generating model's own. The scan and
+		     cpu branches render identically, so the kind is the only thing telling them apart. -->
+		{#if meter.kind === 'scan'}
 			<span class="flex items-center gap-1.5 whitespace-nowrap tabular-nums">
 				<CpuIcon class="h-3 w-3" />
-				<span>{$resourceStats.cpuPct}%</span>
+				<span>{meter.cpuPct}%</span>
 				<span class="text-[8px] opacity-40">{sep}</span>
-				<span>{$resourceStats.rssMB} MB</span>
-				{#if $resourceStats.budget < 1}
+				<span>{meter.rssMb} MB</span>
+				{#if meter.budget < 1}
 					<span class="text-[8px] opacity-40">{sep}</span>
 					<span class="text-[var(--color-warning,#d97706)]"
-						>{$_('status.throttled')} {Math.round($resourceStats.budget * 100)}%</span
+						>{$_('status.throttled')} {Math.round(meter.budget * 100)}%</span
 					>
 				{/if}
 			</span>
 			<span class="text-[8px] opacity-40">{sep}</span>
+		{:else if meter.kind === 'gpu'}
+			<!-- VRAM occupancy, not a compute %: node-llama-cpp exposes no GPU-utilisation figure. -->
+			<span class="flex items-center gap-1.5 whitespace-nowrap tabular-nums">
+				<GpuIcon class="h-3 w-3" />
+				<span>{(meter.usedMb / 1024).toFixed(1)}/{(meter.totalMb / 1024).toFixed(1)} GB</span>
+			</span>
+			<span class="text-[8px] opacity-40">{sep}</span>
+		{:else if meter.kind === 'cpu'}
+			<span class="flex items-center gap-1.5 whitespace-nowrap tabular-nums">
+				<CpuIcon class="h-3 w-3" />
+				<span>{meter.cpuPct}%</span>
+				<span class="text-[8px] opacity-40">{sep}</span>
+				<span>{meter.rssMb} MB</span>
+			</span>
+			<span class="text-[8px] opacity-40">{sep}</span>
 		{/if}
+		<!-- One cell carries provider identity + live engine status. On the on-device cell the
+		     tooltip adds the model and backend; the external one only states where data goes. -->
 		{#if external}
-			<span class="flex items-center gap-1.5 whitespace-nowrap" title={$_('status.privacyExternalHint')}>
-				<GlobeIcon class="h-3 w-3" />
+			<span
+				class="flex items-center gap-1.5 whitespace-nowrap {cell === 'globe-x'
+					? 'text-destructive'
+					: ''}"
+				title={$_(cell === 'globe-x' ? 'status.aiExternalDownHint' : 'status.privacyExternalHint')}
+			>
+				{#if cell === 'globe-x'}
+					<GlobeXIcon class="h-3 w-3" />
+				{:else}
+					<GlobeIcon class="h-3 w-3 {cell === 'globe-pulse' ? 'animate-pulse' : ''}" />
+				{/if}
 				<span>{$_('status.privacyExternal')}</span>
 			</span>
 		{:else}
-			<span class="flex items-center gap-1.5 whitespace-nowrap" title={$_('status.privacyOnDeviceHint')}>
-				<ShieldCheckIcon class="h-3 w-3" />
+			<span
+				class="flex items-center gap-1.5 whitespace-nowrap {cell === 'crash' ? 'text-destructive' : ''}"
+				title={aiCellTitle}
+			>
+				{#if cell === 'crash'}
+					<ServerCrashIcon class="h-3 w-3" />
+				{:else if cell === 'pinwheel'}
+					<LoaderPinwheelIcon class="h-3 w-3 animate-spin" />
+				{:else}
+					<ShieldCheckIcon class="h-3 w-3" />
+				{/if}
 				<span>{$_('status.privacyOnDevice')}</span>
 			</span>
 		{/if}

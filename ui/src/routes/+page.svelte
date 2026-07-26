@@ -24,7 +24,6 @@
 		activeProvisionalTree,
 		setProvisionalTree,
 		clearProvisionalTree,
-		resourceStats,
 		isDiscovering,
 		aiMode,
 		localModel
@@ -139,9 +138,6 @@
 						// Live directory tree → grow the provisional icicle during the scan
 						if (parsed?.event === 'scan:tree' && Array.isArray(parsed.directories)) {
 							setProvisionalTree(scan.id, parsed.directories as Parameters<typeof setProvisionalTree>[1]);
-						} else if (parsed?.event === 'resource') {
-							// Live CPU/mem telemetry from the single-owner session (owner mode).
-							resourceStats.set(parsed as unknown as Parameters<typeof resourceStats.set>[0]);
 						}
 
 						// Handle scan completion via job:complete

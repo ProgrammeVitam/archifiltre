@@ -11,9 +11,10 @@
 		isDiscovering,
 		activeScan,
 		panelTab,
-		aiMode
+		aiMode,
+		localModel
 	} from '$lib/stores';
-	import { selectedSummary } from '$lib/llm-describe';
+	import { selectedSummary, llmBackend } from '$lib/llm-describe';
 	import * as Tabs from '$lib/components/ui/tabs';
 	import { Skeleton } from '$lib/components/ui/skeleton';
 	import { _, locale } from '$lib/i18n';
@@ -676,24 +677,46 @@
 							<p class="flex-1 text-sm text-muted-foreground/40 italic">
 								{$_('details.selectFolderHint')}
 							</p>
-						{:else if $selectedSummary.streamingText}
-							<!-- Tokens streaming in from the on-device model (via the describe engine) -->
-							<p class="flex-1 leading-relaxed text-foreground">
-								{$selectedSummary.streamingText}<span class="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-foreground/50"></span>
-							</p>
+						{:else if $selectedSummary.status === 'generating' && !$selectedSummary.modelLoading && !$selectedSummary.waiting}
+							<!-- Generating with no pending wait state, including the prefill window before the
+							     first token: a blinking cursor holds the answer area so text streams in with no
+							     spinner→text jump. The engine line sits in the footer, where the finished
+							     summary's line goes. -->
+							{@const engine =
+								$aiMode === 'local'
+									? $llmBackend === 'gpu'
+										? 'GPU'
+										: $llmBackend === 'cpu'
+											? 'CPU'
+											: null
+									: null}
+							<div class="flex flex-1 flex-col">
+								<p class="leading-relaxed text-foreground">
+									{$selectedSummary.streamingText}<span class="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-foreground/50"></span>
+								</p>
+								<p class="mt-auto pt-4 text-xs text-muted-foreground/60">
+									{#if engine}
+										{$_('details.generatingWith', {
+											values: { model: $selectedSummary.model || $localModel, engine }
+										})}
+									{:else}
+										{$_('details.generatingGeneric')}
+									{/if}
+								</p>
+							</div>
 						{:else if $selectedSummary.status === 'generating'}
 							<div class="flex flex-1 items-center gap-2 text-sm text-muted-foreground">
 								<LoaderCircleIcon class="h-4 w-4 animate-spin" />
-								<!-- Honest wait states: model loading (one-time), queued behind another
-								     summary, or genuinely analyzing. Never an anonymous spinner. -->
+								<!-- Honest wait states BEFORE generation starts: model loading (one-time) or
+								     queued behind another summary. Never an anonymous spinner. -->
 								<span>
-									{$_(
-										$selectedSummary.modelLoading
-											? 'details.modelLoading'
-											: $selectedSummary.waiting
-												? 'details.waitingTurn'
-												: 'details.analyzing'
-									)}
+									{#if $selectedSummary.modelLoading}
+										{$_('details.modelLoading')}
+									{:else if $selectedSummary.queuedAhead > 1}
+										{$_('details.queuedAhead', { values: { count: $selectedSummary.queuedAhead } })}
+									{:else}
+										{$_('details.waitingTurn')}
+									{/if}
 								</span>
 							</div>
 						{:else if $selectedSummary.text}
@@ -703,12 +726,26 @@
 								</p>
 								{#if $selectedSummary.model}
 									<p class="mt-auto pt-4 text-xs text-muted-foreground/60">
-										{$_($aiMode === 'external' ? 'details.summarizedExternal' : 'details.summarizedLocally')}
-									·
-										{$selectedSummary.model}{$selectedSummary.cached ? ' · ' + $_('details.cached') : ''}
+										{$_(
+											$aiMode === 'external'
+												? 'details.summarizedExternal'
+												: 'details.summarizedLocally',
+											{ values: { model: $selectedSummary.model } }
+										)}{$selectedSummary.cached ? ' ' + $_('details.cached') : ''}
 									</p>
 								{/if}
 							</div>
+						{:else if $selectedSummary.status === 'unavailable'}
+							<!-- On-device AI could not start — named, actionable reason; never blank. -->
+							<p class="text-sm text-muted-foreground/70 italic">
+								{$_(
+									$selectedSummary.reason === 'runtime-missing'
+										? 'details.aiUnavailableRuntime'
+										: $selectedSummary.reason === 'model-load-failed'
+											? 'details.aiUnavailableModel'
+											: 'details.aiUnavailableGeneric'
+								)}
+							</p>
 						{:else if $selectedSummary.status === 'error'}
 							<p class="text-sm text-muted-foreground/60 italic">{$_('details.summaryUnavailable')}</p>
 						{:else}

@@ -1,25 +1,30 @@
 /**
- * The summary subsystem's ONE state owner on the UI side — the describe engine, rebuilt on
- * RxJS (flow) + XState (per-target lifecycle) so concurrency is STRUCTURAL, not hand-managed.
+ * The describe engine: the UI-side owner of folder-summary state, built on RxJS for flow and
+ * XState (describe-machine.ts) for each target's lifecycle, with the IO injected here.
  *
- * Why this shape:
- *   • `switchMap` over the selected target = cancel-the-previous describe on folder switch —
- *     replaces the old inFlight map + cancelDescribe bookkeeping (race R5/R8 gone).
- *   • `shareReplay(1)` on the host `llm:state` stream = a late subscriber gets the current
- *     value, so a warm-load fired before we subscribed is never missed (race R3 gone).
- *   • `retry({delay})` gated on the transient predicate = the entire bounded-retry apparatus
- *     (attempts/retryTimers/scheduleTransientRetry) in ONE operator, correct by construction.
- *   • The per-target lifecycle is a PURE XState machine (describe-machine.ts) — explicit,
- *     inspectable, unit-tested — with the IO (describe stream, persistence) INJECTED here.
+ * Concurrency comes from the operators rather than hand-kept bookkeeping: `switchMap` over the
+ * selected target cancels the previous describe on a folder switch, `shareReplay(1)` lets a
+ * component that mounts late still see the current host state, and `retry({delay})` gated on the
+ * transient predicate is the whole bounded-retry policy.
  *
- * Public surface (unchanged — components + +page render these, never call describe):
+ * Public surface — components render these and never call describe themselves:
  *   rootSummary, selectedSummary : Readable<SummaryView>
+ *   aiCellState, aiMeter         : Readable<AiCellState | AiMeter>   (status-bar view-models)
+ *   llmBackend, llmEngineInfo    : Readable<'gpu' | 'cpu' | null | LlmEngineInfo>
  *   initLlmDescribe()            : Promise<() => void>
  */
-import { writable, type Readable } from 'svelte/store';
+import { writable, readable, type Readable } from 'svelte/store';
 import { locale } from 'svelte-i18n';
-import { Observable, combineLatest, timer, throwError, of, type Subscription } from 'rxjs';
-import { map, distinctUntilChanged, switchMap, retry, startWith } from 'rxjs/operators';
+import { Observable, Subject, combineLatest, timer, throwError, of, type Subscription } from 'rxjs';
+import {
+	map,
+	filter,
+	distinctUntilChanged,
+	switchMap,
+	retry,
+	startWith,
+	shareReplay
+} from 'rxjs/operators';
 import { createActor, fromCallback, type ActorRefFrom } from 'xstate';
 import {
 	onJobUpdate,
@@ -30,7 +35,7 @@ import {
 	currentUiLang,
 	type DirectoryDescription
 } from '$lib/tauri';
-import { activeScan, scanPhase, aiMode, localModel, selectedItem, llmModelState } from '$lib/stores';
+import { activeScan, scanPhase, aiMode, localModel, selectedItem, isScanning } from '$lib/stores';
 import { logFrontend } from '$lib/log-buffer';
 import {
 	summaryMachine,
@@ -43,15 +48,21 @@ import {
 // ── Public view shape (unchanged) ───────────────────────────────────────────
 
 export interface SummaryView {
-	status: 'absent' | 'generating' | 'partial' | 'done' | 'error' | 'deferred-scan';
+	status: 'absent' | 'generating' | 'partial' | 'done' | 'error' | 'deferred-scan' | 'unavailable';
 	text: string | null;
 	streamingText: string;
 	model?: string;
 	cached?: boolean;
 	/** Our request sits in the host queue behind something else (honest waiting label). */
 	waiting: boolean;
+	/** How many requests (active + queued) are ahead of ours on the shared model — drives the
+	 *  honest "In queue (N ahead)" label. 0 when we're at the front (or not queued). */
+	queuedAhead: number;
 	/** The model is loading (one-time warm) — shown instead of a bare spinner. */
 	modelLoading: boolean;
+	/** When status==='unavailable', a machine code for WHY the on-device runtime could not load
+	 *  ('runtime-missing' | 'model-load-failed' | 'unknown'), so the UI can name the reason. */
+	reason?: string;
 }
 
 const EMPTY_VIEW: SummaryView = {
@@ -59,6 +70,7 @@ const EMPTY_VIEW: SummaryView = {
 	text: null,
 	streamingText: '',
 	waiting: false,
+	queuedAhead: 0,
 	modelLoading: false
 };
 
@@ -67,23 +79,59 @@ export const rootSummary = writable<SummaryView>({ ...EMPTY_VIEW });
 /** FileDetailsPanel renders this — the currently-selected sub-folder's summary. */
 export const selectedSummary = writable<SummaryView>({ ...EMPTY_VIEW });
 
-// ── Host state, mirrored from `llm:state` as a hot, replayed value ────────────
+// ── Host state, mirrored from `llm:state` as one extended snapshot ────────────
 
 interface LlmQueueEntry {
 	clientId: string;
 	kind: string;
 	state: 'queued' | 'active';
 }
+interface LlmModelInfo {
+	state: 'unloaded' | 'loading' | 'ready' | 'failed';
+	id: string | null;
+	reason?: string;
+	/** Resolved backend once loaded ('vulkan'/'metal'/… → GPU, false/'cpu' → CPU); null otherwise. */
+	backend?: string | false | null;
+	/** Tier-2 engine detail from node-llama-cpp at load (GPU backend only for name/VRAM). */
+	gpuName?: string | null;
+	vramTotalMb?: number | null;
+	cpuCount?: number | null;
+}
 interface LlmHostState {
-	model: { state: 'unloaded' | 'loading' | 'ready'; id: string | null };
+	model: LlmModelInfo;
 	queue: LlmQueueEntry[];
 }
 const INITIAL_HOST: LlmHostState = { model: { state: 'unloaded', id: null }, queue: [] };
 
-/** A writable holding the latest host state; `fromStore` gives a hot Observable whose late
- *  subscribers synchronously see the current value — so a warm-load fired before a target
- *  subscribed is never missed (this is the `shareReplay(1)` role, race R3). */
-const hostState = writable<LlmHostState>(INITIAL_HOST);
+/** Static on-device engine detail for the status-bar Tier-2 tooltip. `null` until known. */
+export interface LlmEngineInfo {
+	gpuName: string | null;
+	vramTotalMb: number | null;
+	cpuCount: number | null;
+}
+/** One live per-generation resource sample (CPU%/RSS always; VRAM on a GPU backend). */
+export interface LlmResource {
+	cpuPct: number;
+	rssMb: number;
+	vramUsedMb: number | null;
+	vramTotalMb: number | null;
+}
+
+function toHostState(msg: Record<string, unknown>): LlmHostState {
+	const m = (msg.model ?? {}) as Record<string, unknown>;
+	return {
+		model: {
+			state: (m.state as LlmModelInfo['state']) ?? 'unloaded',
+			id: (m.id as string) ?? null,
+			reason: m.reason as string | undefined,
+			backend: (m.backend as string | false | null) ?? null,
+			gpuName: (m.gpuName as string | null) ?? null,
+			vramTotalMb: (m.vramTotalMb as number | null) ?? null,
+			cpuCount: (m.cpuCount as number | null) ?? null
+		},
+		queue: Array.isArray(msg.queue) ? (msg.queue as LlmQueueEntry[]) : []
+	};
+}
 
 // ── Svelte store → Observable adapter (sources live at the edges) ────────────
 
@@ -93,7 +141,165 @@ function fromStore<T>(store: Readable<T>): Observable<T> {
 		return () => unsub();
 	});
 }
-const hostState$ = fromStore(hostState);
+
+/** Sink boundary: expose an Observable as a Svelte-readable store. */
+function toStore<T>(obs$: Observable<T>, initial: T): Readable<T> {
+	return readable(initial, (set) => {
+		const sub = obs$.subscribe((v) => set(v));
+		return () => sub.unsubscribe();
+	});
+}
+
+// ── Host lines, parsed once ──────────────────────────────────────────────────
+// Carries the `llm:*` events plus the scan governor's `resource`. The host-derived signals below
+// all read from here, so the status bar and the summary panel can't disagree. (`externalState$`
+// is the exception: remote AI produces no host events, so it derives from describe outcomes.)
+const hostEvents$ = new Subject<Record<string, unknown>>();
+
+/** Model + queue snapshot. `shareReplay(1)` so a component mounting after a warm-load still sees
+ *  the current state. */
+const hostState$: Observable<LlmHostState> = hostEvents$.pipe(
+	filter((m) => m.event === 'llm:state'),
+	map(toHostState),
+	startWith(INITIAL_HOST),
+	shareReplay(1)
+);
+
+/** A generation holds the single model slot (something is generating anywhere). */
+const busy$: Observable<boolean> = hostState$.pipe(
+	map((h) => h.queue.some((e) => e.state === 'active')),
+	distinctUntilChanged(),
+	shareReplay(1)
+);
+/** Resolved engine once loaded: 'gpu' | 'cpu' | null (never a guess). */
+const backend$: Observable<'gpu' | 'cpu' | null> = hostState$.pipe(
+	map((h) =>
+		h.model.state === 'ready' ? (h.model.backend && h.model.backend !== 'cpu' ? 'gpu' : 'cpu') : null
+	),
+	distinctUntilChanged(),
+	shareReplay(1)
+);
+/** Hard-failure reason, or null when healthy. */
+const failed$: Observable<string | null> = hostState$.pipe(
+	map((h) => (h.model.state === 'failed' ? (h.model.reason ?? 'failed') : null)),
+	distinctUntilChanged(),
+	shareReplay(1)
+);
+/** Tier-2 engine detail for the tooltip. */
+const engineInfo$: Observable<LlmEngineInfo> = hostState$.pipe(
+	map((h) => ({
+		gpuName: h.model.gpuName ?? null,
+		vramTotalMb: h.model.vramTotalMb ?? null,
+		cpuCount: h.model.cpuCount ?? null
+	})),
+	distinctUntilChanged(
+		(a, b) => a.gpuName === b.gpuName && a.vramTotalMb === b.vramTotalMb && a.cpuCount === b.cpuCount
+	),
+	shareReplay(1)
+);
+
+// Live per-generation samples, scoped to the busy window: on idle we switch to `of(null)`, so the
+// meter clears itself instead of needing a separate reset path.
+const rawResource$: Observable<LlmResource> = hostEvents$.pipe(
+	filter((m) => m.event === 'llm:resource'),
+	map((m) => ({
+		cpuPct: Number(m.cpuPct ?? 0),
+		rssMb: Number(m.rssMb ?? 0),
+		vramUsedMb: m.vramUsedMb == null ? null : Number(m.vramUsedMb),
+		vramTotalMb: m.vramTotalMb == null ? null : Number(m.vramTotalMb)
+	}))
+);
+const resource$: Observable<LlmResource | null> = busy$.pipe(
+	switchMap((busy) => (busy ? rawResource$.pipe(startWith<LlmResource | null>(null)) : of(null))),
+	shareReplay(1)
+);
+
+/** External-provider status, derived from describe outcomes (no `llm:state` for remote AI): a
+ *  describe in flight → the globe pulses; a hard-failure → globe-x; cleared on the next success. */
+const externalState$: Observable<'idle' | 'fetching' | 'unavailable'> = combineLatest([
+	fromStore(aiMode),
+	fromStore(rootSummary),
+	fromStore(selectedSummary)
+]).pipe(
+	map(([mode, root, sel]) => {
+		if (mode !== 'external') return 'idle' as const;
+		if (root.status === 'error' || sel.status === 'error') return 'unavailable' as const;
+		if (root.status === 'generating' || sel.status === 'generating') return 'fetching' as const;
+		return 'idle' as const;
+	}),
+	distinctUntilChanged(),
+	shareReplay(1)
+);
+
+// ── Composite view-models rendered by the status bar ──────────────────────────
+export type AiCellState = 'shield' | 'pinwheel' | 'crash' | 'globe' | 'globe-pulse' | 'globe-x';
+const aiCellState$: Observable<AiCellState> = combineLatest([
+	fromStore(aiMode),
+	busy$,
+	failed$,
+	externalState$
+]).pipe(
+	map(([mode, busy, failed, ext]): AiCellState => {
+		if (mode === 'external')
+			return ext === 'unavailable' ? 'globe-x' : ext === 'fetching' ? 'globe-pulse' : 'globe';
+		return failed ? 'crash' : busy ? 'pinwheel' : 'shield';
+	}),
+	distinctUntilChanged(),
+	shareReplay(1)
+);
+
+/** The scan governor's CPU%/RSS/budget sample. Not an `llm:*` event — the owner emits `resource`
+ *  every 500ms on the same stdout stream, so it arrives on `hostEvents$` too.
+ *  `startWith(null)` so `aiMeter$`'s combineLatest fires before any scan has run. */
+interface ScanResource {
+	cpuPct: number;
+	rssMb: number;
+	budget: number;
+}
+const scanResource$: Observable<ScanResource | null> = hostEvents$.pipe(
+	filter((m) => m.event === 'resource'),
+	map((m) => ({ cpuPct: Number(m.cpuPct ?? 0), rssMb: Number(m.rssMB ?? 0), budget: Number(m.budget ?? 1) })),
+	startWith<ScanResource | null>(null),
+	shareReplay(1)
+);
+
+export type AiMeter =
+	| { kind: 'none' }
+	| { kind: 'scan'; cpuPct: number; rssMb: number; budget: number }
+	| { kind: 'gpu'; usedMb: number; totalMb: number }
+	| { kind: 'cpu'; cpuPct: number; rssMb: number };
+// The scan branch is gated on `isScanning` (the real scan lifecycle), not the resource event's
+// self-reported `scanning` flag, so the meter clears the instant the scan completes.
+const aiMeter$: Observable<AiMeter> = combineLatest([
+	fromStore(isScanning),
+	scanResource$,
+	busy$,
+	resource$,
+	backend$
+]).pipe(
+	map(([scanning, scanRes, busy, res, backend]): AiMeter => {
+		if (scanning && scanRes)
+			return { kind: 'scan', cpuPct: scanRes.cpuPct, rssMb: scanRes.rssMb, budget: scanRes.budget };
+		if (busy && res) {
+			if (backend === 'gpu' && res.vramTotalMb && res.vramUsedMb != null)
+				return { kind: 'gpu', usedMb: res.vramUsedMb, totalMb: res.vramTotalMb };
+			return { kind: 'cpu', cpuPct: res.cpuPct, rssMb: res.rssMb };
+		}
+		return { kind: 'none' };
+	}),
+	distinctUntilChanged((a, b) => JSON.stringify(a) === JSON.stringify(b)),
+	shareReplay(1)
+);
+
+// ── The exposed Svelte-readable stores (one `toStore` per signal, the only sink) ──
+export const aiCellState = toStore<AiCellState>(aiCellState$, 'shield');
+export const aiMeter = toStore<AiMeter>(aiMeter$, { kind: 'none' });
+export const llmBackend = toStore<'gpu' | 'cpu' | null>(backend$, null);
+export const llmEngineInfo = toStore<LlmEngineInfo>(engineInfo$, {
+	gpuName: null,
+	vramTotalMb: null,
+	cpuCount: null
+});
 
 // ── The describe as an Observable (streaming + transient retry, one operator) ─
 
@@ -216,7 +422,12 @@ function toView(actor: SummaryActor, host: LlmHostState, clientId: string): Summ
 		model: c.model,
 		cached: c.cached,
 		waiting: generating && host.queue.some((e) => e.clientId === clientId && e.state === 'queued'),
-		modelLoading: generating && host.model.state === 'loading'
+		// The queue snapshot is [active, ...queued] in order, so the index is how many are ahead.
+		queuedAhead: generating
+			? Math.max(0, host.queue.findIndex((e) => e.clientId === clientId && e.state === 'queued'))
+			: 0,
+		modelLoading: generating && host.model.state === 'loading',
+		reason: snap.value === 'unavailable' ? host.model.reason : undefined
 	};
 }
 
@@ -241,7 +452,8 @@ function runTarget(role: 'root' | 'selected', db: string, path: string): Observa
 					local: mode === 'local',
 					scanState: scan?.state ?? '',
 					phaseReady: STRUCTURE_READY_PHASES.includes(phase),
-					modelReady: host.model.state === 'ready'
+					modelReady: host.model.state === 'ready',
+					modelFailed: host.model.state === 'failed'
 				}
 			});
 		});
@@ -286,22 +498,17 @@ export async function initLlmDescribe(): Promise<() => void> {
 	if (started) return teardown;
 	started = true;
 
+	// Every host line becomes one event on `hostEvents$`; all AI signals derive from it.
 	unlisten = await onJobUpdate((e) => {
 		try {
-			const msg = JSON.parse(e.line);
-			if (msg.event !== 'llm:state') return;
-			hostState.set({
-				model: { state: msg.model?.state ?? 'unloaded', id: msg.model?.id ?? null },
-				queue: Array.isArray(msg.queue) ? msg.queue : []
-			});
-			// Keep the legacy 3-state store truthful (the status chip reads it).
-			llmModelState.set(
-				msg.model?.state === 'ready' ? 'ready' : msg.model?.state === 'loading' ? 'loading' : 'idle'
-			);
+			hostEvents$.next(JSON.parse(e.line));
 		} catch {
-			/* not our event */
+			/* not JSON / not our event */
 		}
 	});
+	// Keep the spine hot from init so a warm-load `llm:state` fired before any component subscribes
+	// is captured by shareReplay, not lost until the first mount.
+	subs.push(hostState$.subscribe());
 
 	const lang$ = fromStore(locale).pipe(
 		map((l) => (typeof l === 'string' ? l.slice(0, 2).toLowerCase() : 'en')),
