@@ -18,7 +18,7 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -48,6 +48,24 @@ pub struct Owner {
     pub run_id: Arc<std::sync::Mutex<String>>,
     /// Job id to tag scan events with; set by the command layer on `start_scan`.
     pub current_job_id: Arc<std::sync::Mutex<String>>,
+    /// When the last request was sent to this owner, in microseconds since process start — the
+    /// pool's LRU key and its idle clock. The active tab is queried constantly (hover, selection,
+    /// describe) while background tabs generate no traffic at all, so "least recently used" is
+    /// exactly "not the tab the user is looking at".
+    last_used: AtomicU64,
+    /// Whether this owner is mid-scan, tracked from the `job:*` lines already passing through
+    /// the reader. A scanning owner is never evicted — that would be cancelling work the user
+    /// asked for, not reclaiming an idle resource.
+    scanning: Arc<AtomicBool>,
+}
+
+/// Process-start reference for `Owner::last_used`. Monotonic (an `Instant`, so NTP steps can't
+/// make an owner look freshly used), and microseconds keep same-millisecond requests distinct
+/// enough to order.
+static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn now_micros() -> u64 {
+    START.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
 }
 
 impl Owner {
@@ -92,6 +110,7 @@ impl Owner {
         let pending: Arc<Mutex<HashMap<String, oneshot::Sender<QueryResponse>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let alive = Arc::new(AtomicBool::new(true));
+        let scanning = Arc::new(AtomicBool::new(false));
         let run_id = Arc::new(std::sync::Mutex::new(String::new()));
         let (ready_tx, ready_rx) = oneshot::channel::<String>();
 
@@ -99,6 +118,7 @@ impl Owner {
         {
             let pending = pending.clone();
             let alive = alive.clone();
+            let scanning = scanning.clone();
             let run_id = run_id.clone();
             let stdin_for_host = stdin.clone();
             let mut ready_tx = Some(ready_tx);
@@ -118,6 +138,16 @@ impl Owner {
                                 let _ = tx.send(run_id.lock().unwrap().clone());
                             }
                             continue; // internal handshake; not forwarded
+                        }
+                        // Track scan liveness off the canonical job vocabulary (job-context.ts)
+                        // so the pool can tell "idle, reclaimable" from "working". Paused counts
+                        // as idle: a paused scan resumes through a query, which respawns.
+                        match evt {
+                            "job:start" | "job:progress" => scanning.store(true, Ordering::SeqCst),
+                            "job:paused" | "job:complete" | "job:error" => {
+                                scanning.store(false, Ordering::SeqCst)
+                            }
+                            _ => {}
                         }
                         on_event(line);
                     } else if let Some(hreq) = v.get("host_request") {
@@ -183,7 +213,31 @@ impl Owner {
             alive,
             run_id,
             current_job_id,
+            last_used: AtomicU64::new(now_micros()),
+            scanning,
         })
+    }
+
+    /// Pool bookkeeping: LRU rank, idle duration, whether a scan is running, and whether any
+    /// request is in flight. Eviction requires all of them to say "idle".
+    pub fn last_used(&self) -> u64 {
+        self.last_used.load(Ordering::SeqCst)
+    }
+
+    /// How long since the last request. Saturating: a clock that somehow reads backwards yields
+    /// zero (looks freshly used) rather than a huge value that would evict a live owner.
+    pub fn idle_for(&self) -> Duration {
+        Duration::from_micros(now_micros().saturating_sub(self.last_used()))
+    }
+
+    pub fn is_scanning(&self) -> bool {
+        self.scanning.load(Ordering::SeqCst)
+    }
+
+    /// True if a request has been sent and not yet answered. Evicting such an owner would fail a
+    /// query the user is waiting on, so the pool skips it and takes the next candidate.
+    pub async fn has_pending(&self) -> bool {
+        !self.pending.lock().await.is_empty()
     }
 
     /// Send a request and await its correlated response, bounded by `timeout_ms`.
@@ -197,6 +251,7 @@ impl Owner {
         if !self.alive.load(Ordering::SeqCst) {
             return Err("session not alive".to_string());
         }
+        self.last_used.store(now_micros(), Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         {
             self.pending.lock().await.insert(request.id.clone(), tx);
@@ -216,6 +271,12 @@ impl Owner {
             Ok(Err(_)) => Err("session closed before responding".to_string()),
             Err(_) => {
                 self.pending.lock().await.remove(&request.id);
+                // Worth a line: the owner is still working on this, we just stopped waiting.
+                // Silent timeouts are what made the "delete that didn't delete" undiagnosable.
+                eprintln!(
+                    "[owner] request timed out after {}ms: action={} id={}",
+                    timeout_ms, request.action, request.id
+                );
                 Err("request timed out".to_string())
             }
         }
