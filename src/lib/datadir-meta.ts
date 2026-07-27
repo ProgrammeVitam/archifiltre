@@ -118,7 +118,10 @@ export async function writeDatadirTombstone(dbName: string): Promise<void> {
   }
 }
 
-async function datadirExists(dbName: string): Promise<boolean> {
+/** Does this scan's datadir exist on disk? The only reliable discriminator between "re-open an
+ *  existing scan" and "create a new one" — and it has to live here, in the sidecar, because the
+ *  path differs between a packaged app and `bun run` (see getDatabasePath). */
+export async function datadirExists(dbName: string): Promise<boolean> {
   try {
     return (await fs.stat(getDatabasePath(dbName))).isDirectory();
   } catch {

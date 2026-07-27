@@ -207,7 +207,9 @@ export async function scanDirectory(options: ScanOptions): Promise<CommandResult
 	// owners keep running → concurrent scans), point queries at it, fire the scan (acks
 	// immediately, streams job:progress/resource events), and resolve on job:complete /
 	// job:error — same canonical vocabulary as the scan command.
-	await ensureSession(options.dbName); // seed the gate: the scan IS this db's owner
+	// The ONE place allowed to bring a scan database into existence — a scan is starting, so a
+	// datadir is exactly what's wanted. Everywhere else attaches to one that already exists.
+	await ensureSession(options.dbName, true); // seed the gate: the scan IS this db's owner
 	setActiveQueryDb(options.dbName);
 	const jobId = options.jobId || options.scanId;
 	const done = new Promise<CommandResult>((resolve) => {
@@ -458,11 +460,16 @@ const sessionReady = new Map<string, Promise<string>>();
 /** Ensure this db's owner is up (or coming up) and resolve once it's ready. Idempotent:
  *  concurrent callers share ONE start_session — whoever asks first triggers it, the rest await
  *  the same promise, so no consumer can run before the owner is registered. Owner-mode only. */
-export function ensureSession(dbName?: string): Promise<string> {
+export function ensureSession(dbName?: string, allowCreate = false): Promise<string> {
 	const db = dbName ?? activeQueryDb ?? 'main';
 	let p = sessionReady.get(db);
 	if (!p) {
-		p = invoke<string>('start_session', { dbName: db }).catch((e) => {
+		// `allowCreate` defaults to FALSE: attaching to a scan is routine, bringing one into
+		// existence is not. Most queries omit a dbName and inherit `activeQueryDb`, so with
+		// creation on by default an app-level question (model_status, ping) aimed at an empty
+		// tab quietly built a whole empty database for it — invisible to reconciliation, and
+		// never reclaimed. Only scanDirectory, which genuinely starts a scan, passes true.
+		p = invoke<string>('start_session', { dbName: db, allowCreate }).catch((e) => {
 			sessionReady.delete(db); // failed to establish → let a later call retry cleanly
 			throw e;
 		});

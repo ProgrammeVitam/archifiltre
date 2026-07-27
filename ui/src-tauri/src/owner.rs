@@ -297,9 +297,14 @@ impl Owner {
     /// recompile). Updates the tracked run id from the session's response. On error the
     /// owner stays on its old db (caller should discard it). Refused by the session
     /// while it is scanning.
-    pub async fn switch_db(&self, db: &str, timeout_ms: u64) -> Result<(), String> {
+    /// Re-point this process at `db`. `create` distinguishes the two intents the session's
+    /// `createScanDatabase` otherwise conflates: re-opening a scan that exists (routine) versus
+    /// bringing a datadir into being (only ever correct when a scan is actually being started).
+    /// With `create: false` a missing datadir answers `db_absent` and this process is unchanged.
+    pub async fn switch_db(&self, db: &str, timeout_ms: u64, create: bool) -> Result<(), String> {
         let mut params = serde_json::Map::new();
         params.insert("db".to_string(), serde_json::json!(db));
+        params.insert("create".to_string(), serde_json::json!(create));
         let req = QueryRequest {
             id: format!("switchdb-{}", db),
             action: "switch_db".to_string(),
@@ -622,11 +627,11 @@ mod tests {
 
         // Switch to a fresh B (in-process), then back to A.
         let t = std::time::Instant::now();
-        owner.switch_db(db_b, 20000).await.expect("switch to B");
+        owner.switch_db(db_b, 20000, true).await.expect("switch to B");
         let switch_b_ms = t.elapsed().as_millis();
 
         let t = std::time::Instant::now();
-        owner.switch_db(db_a, 20000).await.expect("switch back to A");
+        owner.switch_db(db_a, 20000, true).await.expect("switch back to A");
         let switch_a_ms = t.elapsed().as_millis();
         // owner.run_id is refreshed only on (re)open — switching back to A must reload
         // A's completed run from scan_metadata (non-empty) and A's tree must be intact.

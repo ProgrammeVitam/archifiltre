@@ -53,6 +53,7 @@ import {
   datadirMetaPath,
   writeDatadirTombstone,
   sweepTombstonedDatadirs,
+  datadirExists,
   type DatadirStatus,
 } from '@lib/datadir-meta.ts';
 import { settleDatadir } from '@lib/settle-datadir.ts';
@@ -85,6 +86,12 @@ export default class Session extends Command {
   static override flags = {
     db: Flags.string({ char: 'd', description: 'Database name', default: 'main' }),
     'run-id': Flags.string({ description: 'Run ID for queries (defaults to latest)' }),
+    // Serve an EXISTING datadir only; refuse to bring one into being. Opening a session and
+    // creating a scan database are different intents that `createScanDatabase` conflates, and
+    // the difference matters after a delete: a stray query for a discarded scan must not
+    // resurrect 38 MB of empty database. The supervisor passes this whenever it is merely
+    // re-establishing a session (see get_or_spawn_owner), never when a scan is being started.
+    'no-create': Flags.boolean({ description: 'Fail instead of creating a missing datadir', default: false }),
   };
 
   private database: DatabaseConnection | undefined;
@@ -242,6 +249,13 @@ export default class Session extends Command {
       logger.error('Uncaught exception in session (survived)', err);
     });
 
+    if (flags['no-create'] && !(await datadirExists(flags.db))) {
+      // The caller only wanted to re-attach to a database that already exists. Say so and stop,
+      // rather than silently manufacturing an empty one the user never asked for.
+      logger.info('Refusing to create a missing datadir (--no-create)', { dbName: flags.db });
+      this.send({ event: 'db_absent', db: flags.db });
+      process.exit(3);
+    }
     this.database = await createScanDatabase(flags.db);
     await ensureEnrichmentTables(this.database);
 
@@ -445,6 +459,14 @@ export default class Session extends Command {
       // Opening an EXISTING datadir that Postgres can't recover (power-cut corruption)
       // throws here. Surface it as a typed 'datadir_damaged' so the UI offers Re-scan /
       // Delete instead of a raw error — the old connection is untouched (never swapped).
+      // Same intent split as the `--no-create` flag: re-targeting a spare at an EXISTING scan
+      // is routine, conjuring a datadir for one that was deleted is not. The old connection is
+      // untouched, so refusing here leaves this process perfectly usable.
+      if (req.create === false && !(await datadirExists(db))) {
+        logger.info('switch_db refused: datadir absent and create=false', { dbName: db });
+        this.send({ id, ok: false, error: 'db_absent' });
+        return;
+      }
       let next: DatabaseConnection;
       try {
         next = await createScanDatabase(db);

@@ -966,10 +966,16 @@ async fn get_query_run_id(state: tauri::State<'_, Arc<AppState>>) -> Result<Stri
 // ============================================================================
 
 /// Spawn one owner process on `db`, wired to emit its events on the job-update stream.
+/// Spawn a session sidecar for `db`. `allow_create` carries the caller's intent down to the
+/// sidecar, which is the only layer that can resolve a datadir path reliably (it differs between
+/// a packaged app and `bun run`). With `allow_create: false` a missing datadir makes the sidecar
+/// exit instead of manufacturing an empty database — the difference between re-attaching to a
+/// scan and inventing one that was deleted.
 async fn spawn_owner(
     app: &tauri::AppHandle,
     binary_path: &std::path::Path,
     db: &str,
+    allow_create: bool,
 ) -> Result<Arc<Owner>, String> {
     use tauri::Manager;
     let current_job_id = Arc::new(std::sync::Mutex::new(String::new()));
@@ -999,7 +1005,10 @@ async fn spawn_owner(
             })
         })
     };
-    let args = vec!["session".to_string(), "--db".to_string(), db.to_string()];
+    let mut args = vec!["session".to_string(), "--db".to_string(), db.to_string()];
+    if !allow_create {
+        args.push("--no-create".to_string());
+    }
     let owner = Owner::spawn_with_host(
         binary_path.to_string_lossy().as_ref(),
         &args,
@@ -1019,24 +1028,46 @@ async fn spawn_owner(
 fn ensure_warm_spare(app: tauri::AppHandle, state: Arc<AppState>) {
     // Tauri's runtime so this works from the sync setup hook AND async commands.
     tauri::async_runtime::spawn(async move {
-        if state.warm_spare.lock().await.as_ref().map(|o| o.is_alive()).unwrap_or(false) {
+        // Claim the right to spawn BEFORE spawning. The check and the spawn used to be separate,
+        // so two concurrent callers could both see "no spare" and both build one — each costing a
+        // full PGlite (~4 GB of Windows commit) while only one can ever be kept. Observed on the
+        // QA VM as two live `--db _warm` processes.
+        if SPARE_SPAWNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return; // someone else is already building one
+        }
+        let already_live = state
+            .warm_spare
+            .lock()
+            .await
+            .as_ref()
+            .map(|o| o.is_alive())
+            .unwrap_or(false);
+        if already_live {
+            SPARE_SPAWNING.store(false, std::sync::atomic::Ordering::SeqCst);
             return;
         }
         let bin = match find_sidecar_path(&app) {
             Ok(b) => b,
-            Err(_) => return,
+            Err(_) => {
+                SPARE_SPAWNING.store(false, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
         };
-        if let Ok(spare) = spawn_owner(&app, &bin, "_warm").await {
+        if let Ok(spare) = spawn_owner(&app, &bin, "_warm", true).await {
             let mut g = state.warm_spare.lock().await;
             if g.as_ref().map(|o| o.is_alive()).unwrap_or(false) {
                 drop(g);
-                spare.kill().await; // lost a race — discard ours
+                spare.kill().await; // a retired owner filled the slot meanwhile — discard ours
             } else {
                 *g = Some(spare);
             }
         }
+        SPARE_SPAWNING.store(false, std::sync::atomic::Ordering::SeqCst);
     });
 }
+
+/// Guards `ensure_warm_spare` against building two spares at once (see there).
+static SPARE_SPAWNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// How many scan-db owners may be live at once, on top of the warm spare.
 ///
@@ -1129,7 +1160,7 @@ async fn retire_owner(state: &Arc<AppState>, owner: Arc<Owner>) {
         let g = state.warm_spare.lock().await;
         g.as_ref().map(|o| !o.is_alive()).unwrap_or(true)
     };
-    if spare_free && owner.is_alive() && owner.switch_db("_warm", 20000).await.is_ok() {
+    if spare_free && owner.is_alive() && owner.switch_db("_warm", 20000, true).await.is_ok() {
         let mut g = state.warm_spare.lock().await;
         if g.as_ref().map(|o| o.is_alive()).unwrap_or(false) {
             drop(g); // lost a race — a real spare appeared meanwhile
@@ -1150,6 +1181,7 @@ async fn get_or_spawn_owner(
     app: &tauri::AppHandle,
     state: &Arc<AppState>,
     db: &str,
+    allow_create: bool,
 ) -> Result<Arc<Owner>, String> {
     // Claim/spawn under the lock, then retire the evicted owners after releasing it: retiring is
     // a `switch_db` round-trip, and holding the map lock across it would stall every other db's
@@ -1175,7 +1207,7 @@ async fn get_or_spawn_owner(
         // db in-process instead of a cold spawn — ~0.5 s versus 15–20 s on Windows.
         let spare = { state.warm_spare.lock().await.take() };
         let (owner, spare_taken) = match spare {
-            Some(spare) if spare.is_alive() && spare.switch_db(db, 20000).await.is_ok() => {
+            Some(spare) if spare.is_alive() && spare.switch_db(db, 20000, allow_create).await.is_ok() => {
                 (spare, true)
             }
             other => {
@@ -1184,7 +1216,7 @@ async fn get_or_spawn_owner(
                 }
                 // Cold path: no usable spare → spawn fresh.
                 let binary_path = find_sidecar_path(app)?;
-                (spawn_owner(app, &binary_path, db).await?, false)
+                (spawn_owner(app, &binary_path, db, allow_create).await?, false)
             }
         };
         owners.insert(db.to_string(), owner.clone());
@@ -1245,9 +1277,16 @@ async fn start_session(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AppState>>,
     db_name: Option<String>,
+    allow_create: Option<bool>,
 ) -> Result<String, String> {
     let db = db_name.unwrap_or_else(|| "main".to_string());
-    let owner = get_or_spawn_owner(&app, state.inner(), &db).await?;
+    // Creating a scan database is something only STARTING A SCAN may do. Every other caller is
+    // re-attaching to one that exists, so it defaults to false: the frontend routes db-less
+    // queries (model_status, ping, download_model — app-level questions that have nothing to do
+    // with any scan) at whichever tab is active, and with create enabled those were materialising
+    // ~38 MB of empty PGlite for tabs the user never scanned. Never adopted (no meta), never
+    // visible, never reclaimed.
+    let owner = get_or_spawn_owner(&app, state.inner(), &db, allow_create.unwrap_or(false)).await?;
     let run_id = owner.run_id.lock().unwrap().clone();
     Ok(run_id)
 }
@@ -1265,8 +1304,10 @@ async fn session_request(
     // last talked to it, and the frontend memoizes session promises so it wouldn't know to
     // re-establish. Rehydrating here keeps eviction entirely invisible above the IPC boundary.
     // `get_or_spawn_owner` returns a cloned Arc with the map lock released, so independent
-    // requests (across dbs or on the same owner) still run concurrently.
-    let owner = get_or_spawn_owner(&app, state.inner(), &db).await?;
+    // requests (across dbs or on the same owner) still run concurrently. `allow_create: false`
+    // is the important half: a query is never a reason to bring a database into existence, and
+    // without it a stray read for a just-deleted scan silently recreates its datadir.
+    let owner = get_or_spawn_owner(&app, state.inner(), &db, false).await?;
     // Tag scan events with the job id the UI passed on start_scan.
     if request.action == "start_scan" {
         if let Some(jid) = request.params.get("jobId").and_then(|v| v.as_str()) {
