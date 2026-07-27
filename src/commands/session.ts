@@ -48,7 +48,13 @@ import {
   flushSnapshotSync,
   deleteSnapshot,
 } from '@extensions/enrichment/snapshot.ts';
-import { writeDatadirMeta, datadirMetaPath, type DatadirStatus } from '@lib/datadir-meta.ts';
+import {
+  writeDatadirMeta,
+  datadirMetaPath,
+  writeDatadirTombstone,
+  sweepTombstonedDatadirs,
+  type DatadirStatus,
+} from '@lib/datadir-meta.ts';
 import { settleDatadir } from '@lib/settle-datadir.ts';
 
 // Enrichment actions that change the user's annotations → trigger a durable snapshot.
@@ -253,6 +259,13 @@ export default class Session extends Command {
     if (flags.db === '_warm') {
       void ensureTemplateInBackground();
     }
+
+    // Finish any deletion that was interrupted (app killed mid-removal, or the removal simply
+    // outlived the last session). Tombstoned datadirs are already invisible to reconciliation;
+    // this reclaims their bytes. Background + best-effort — it must never delay `ready`.
+    void sweepTombstonedDatadirs().catch(() => {
+      /* best-effort: still tombstoned, retried next launch */
+    });
 
     // Register any extension-provided AI agents into the AI API (built-ins self-register).
     registerExtensionAiProviders();
@@ -659,43 +672,72 @@ export default class Session extends Command {
 
   /**
    * Delete this owner's database and exit — the "close the tab = discard the scan" path.
-   * Stop any scan, close the connection so PGlite releases the datadir, remove the datadir,
-   * ack (so the caller knows it's gone), then exit so the Rust supervisor reaps the owner.
+   *
+   * Order matters. Removing the datadir means unlinking ~1000 files, which on Windows runs past
+   * the caller's 15 s wire timeout; acking only afterwards meant the caller timed out, swallowed
+   * the error, killed this process mid-removal, and the half-removed datadir came back at the
+   * next launch. So: write the tombstone, ACK, and only then do the slow work. Everything after
+   * the ack is interruptible — the tombstone alone is enough for the scan to stay deleted, and
+   * `sweepTombstonedDatadirs` finishes the removal on any later run.
    */
   private async handleDeleteDb(id: string): Promise<void> {
     const db = this.database?.name;
-    try {
-      this.scanPaused = true;
-      this.scanSubscription?.unsubscribe();
-      this.scanSubscription = undefined;
-      this.scanning = false;
-      // Explicit discard of this scan → discard its annotations snapshot too (the user
-      // chose to throw this scan away; the File-menu export is the "keep a copy" path).
-      // Read the root path before closing the connection, then cancel any pending write.
-      let discardRoot: string | null = null;
-      if (this.database && this.runId) {
-        try {
-          const r = await this.database.pg.query<{ root_path: string }>(
-            `SELECT root_path FROM scan_metadata WHERE run_id = $1`,
-            [this.runId]
-          );
-          discardRoot = r.rows[0]?.root_path ?? null;
-        } catch {
-          /* metadata unreadable → skip snapshot cleanup, leave the file */
-        }
-        cancelSnapshot(this.database);
+    logger.info('Delete requested', { dbName: db ?? null });
+
+    // Stop the scan first so nothing is writing into the datadir we're about to discard.
+    this.scanPaused = true;
+    this.scanSubscription?.unsubscribe();
+    this.scanSubscription = undefined;
+    this.scanning = false;
+
+    // Read the root path while the connection is still open — needed to discard this scan's
+    // annotations snapshot (explicit discard; the File-menu export is the "keep a copy" path).
+    let discardRoot: string | null = null;
+    if (this.database && this.runId) {
+      try {
+        const r = await this.database.pg.query<{ root_path: string }>(
+          `SELECT root_path FROM scan_metadata WHERE run_id = $1`,
+          [this.runId]
+        );
+        discardRoot = r.rows[0]?.root_path ?? null;
+      } catch {
+        /* metadata unreadable → skip snapshot cleanup, leave the file */
       }
-      if (this.database) await this.database.pg.close();
-      if (db) await rm(getDatabasePath(db), { recursive: true, force: true });
-      if (discardRoot) await deleteSnapshot(discardRoot);
-      // Also drop the meta sidecar (Phase 2) so reconciliation doesn't resurrect it.
-      if (db) await rm(datadirMetaPath(db), { force: true });
+      cancelSnapshot(this.database);
+    }
+
+    // The one step that decides success. Fast (a single small file) and done BEFORE pg.close(),
+    // so a close that hangs under memory pressure can't strand the deletion.
+    try {
+      if (db) await writeDatadirTombstone(db);
+      logger.info('Delete tombstoned; removal continues in background', { dbName: db ?? null });
       this.send({ id, ok: true });
     } catch (e) {
+      // Couldn't even mark it — report honestly rather than let the tab vanish from a scan that
+      // is still on disk. Stay alive: nothing was torn down that the session can't keep serving.
+      logger.error(
+        'Delete failed: could not write the tombstone',
+        e instanceof Error ? e : new Error(String(e))
+      );
       this.send({ id, ok: false, error: e instanceof Error ? e.message : String(e) });
+      return;
     }
-    // Give the ack a moment to flush down the pipe, then exit (datadir is gone; nothing
-    // left to serve). The supervisor's stdout-closed handler removes the dead owner.
+
+    // Slow, interruptible, best-effort from here on.
+    try {
+      if (this.database) await this.database.pg.close();
+      if (db) await rm(getDatabasePath(db), { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
+      if (discardRoot) await deleteSnapshot(discardRoot);
+      if (db) await rm(datadirMetaPath(db), { force: true });
+      logger.info('Delete complete', { dbName: db ?? null });
+    } catch (e) {
+      logger.warn('Delete removal incomplete; tombstone stands, sweep will retry', {
+        dbName: db ?? null,
+        error: (e as Error).message,
+      });
+    }
+    // Flush the ack down the pipe, then exit — the datadir is gone (or tombstoned), nothing left
+    // to serve. The supervisor's stdout-closed handler marks this owner dead.
     setTimeout(() => process.exit(0), 50);
   }
 

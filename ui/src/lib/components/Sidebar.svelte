@@ -61,17 +61,26 @@
 			}
 		}
 
-		// Close = discard: stop the owner's scan AND delete its datadir. Keep the row (showing
-		// "Removing…") until the delete round-trip returns, THEN drop it — so a slow delete gives
-		// feedback and the datadir is gone before the tab disappears (no silent resurrection).
+		// Close = discard: stop the owner's scan AND delete its datadir. The row shows "Removing…"
+		// until the owner confirms, and is dropped ONLY on confirmation — a tab that vanishes from
+		// a scan still on disk is the resurrection bug. On failure the row stays with a plain line
+		// saying so; the technical detail is in the log, never here.
 		deletingIds = new Set(deletingIds).add(scan.id);
+		let deleted = false;
 		try {
-			if (scan.path && scan.dbName) await deleteDatabase(scan.dbName);
+			deleted = scan.path && scan.dbName ? await deleteDatabase(scan.dbName) : true;
+		} catch {
+			deleted = false;
 		} finally {
-			scansStore.closeScan(scan.id);
 			const next = new Set(deletingIds);
 			next.delete(scan.id);
 			deletingIds = next;
+		}
+		if (deleted) {
+			scansStore.updateScan(scan.id, { deleteFailed: undefined });
+			scansStore.closeScan(scan.id);
+		} else {
+			scansStore.updateScan(scan.id, { deleteFailed: true });
 		}
 	}
 
@@ -191,7 +200,12 @@
 						<Icon size={16} class={iconClass} />
 					</span>
 				{/if}
-				<span class="scan-name">{deleting ? $_('common.removingScan') : scan.name}</span>
+				<span class="scan-name">
+					{deleting ? $_('common.removingScan') : scan.name}
+					{#if scan.deleteFailed && !deleting}
+						<span class="scan-note">{$_('common.scanStillHere')}</span>
+					{/if}
+				</span>
 				{#if deleting}
 					<span class="delete-btn" title={$_('common.removingScan')}>
 						<Loader2Icon size={14} class="animate-spin" />
@@ -429,6 +443,14 @@
 		white-space: nowrap;
 		overflow: hidden;
 		text-overflow: ellipsis;
+	}
+
+	/* One quiet line when a delete didn't take — the tab stays rather than vanishing from a
+	   scan that is still on disk. Muted, not alarming: it's a retry hint, not a failure. */
+	.scan-note {
+		display: block;
+		font-size: 11px;
+		color: var(--muted-foreground);
 	}
 
 	.delete-btn {

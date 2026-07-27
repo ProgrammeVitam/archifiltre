@@ -581,29 +581,31 @@ export async function cancelScan(dbName: string): Promise<void> {
 	await sendQuery({ id: `cancel_${Date.now()}`, action: 'cancel_scan' }, dbName);
 }
 
-/** Discard a scan entirely — used when CLOSING a tab. The owner stops its scan, deletes
- *  its datadir, and exits; then it's dropped from the supervisor. Errors are swallowed:
- *  the owner acks then exits, so a late "session closed" is expected and harmless. */
-export async function deleteDatabase(dbName: string): Promise<void> {
-	if (!useOwnerDb()) return;
+/** Discard a scan entirely — used when CLOSING a tab.
+ *
+ *  The owner tombstones the datadir and acks within ~50 ms, then removes the files in the
+ *  background and exits on its own. So this resolves fast and, crucially, REPORTS whether the
+ *  scan is actually gone: a false success here is what used to make a tab disappear from a scan
+ *  that was still on disk and came back at the next launch.
+ *
+ *  Deliberately does NOT stop_session afterwards. The owner exits itself once the removal is
+ *  done; killing it here raced the removal it had just been asked to perform. */
+export async function deleteDatabase(dbName: string): Promise<boolean> {
+	if (!useOwnerDb()) return true;
+	let deleted = false;
 	try {
-		// Ensure an owner exists for this db BEFORE asking it to delete itself. Without this,
-		// deleting a scan we never opened this session (its owner was never spawned) hits
-		// session_request's "No active session for this db" — which the catch below swallows,
-		// leaving the datadir on disk for startup reconciliation to resurrect ("removed but
-		// comes back"). start_session get-or-spawns the owner (reusing the warm spare), so the
-		// delete always reaches a live process that closes PGlite and removes the datadir.
+		// Ensure an owner exists for this db BEFORE asking it to delete itself — deleting a scan
+		// we never opened this session would otherwise have no process to ask.
 		await ensureSession(dbName);
-		await sendQuery({ id: `delete_${Date.now()}`, action: 'delete_db' }, dbName);
-	} catch {
-		/* owner exiting after its ack */
+		const res = await sendQuery({ id: `delete_${Date.now()}`, action: 'delete_db' }, dbName);
+		deleted = res.ok === true;
+	} catch (e) {
+		// The owner acks then exits, so a late "session closed" AFTER a successful ack is normal.
+		// Any other failure means the scan may still be on disk — say so.
+		deleted = isTransientSessionError(e) && deleted;
 	}
-	invalidateSession(dbName); // db is gone → forget its session so a re-scan re-establishes cleanly
-	try {
-		await invoke('stop_session', { dbName });
-	} catch {
-		/* already reaped */
-	}
+	invalidateSession(dbName); // owner is exiting → forget it so a re-scan re-establishes cleanly
+	return deleted;
 }
 
 // ── Undo / redo (per-scan enrichment history) ──────────────────────────────
