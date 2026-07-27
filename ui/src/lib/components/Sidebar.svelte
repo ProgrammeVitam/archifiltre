@@ -61,10 +61,10 @@
 			}
 		}
 
-		// Close = discard: stop the owner's scan AND delete its datadir. The row shows "Removing…"
-		// until the owner confirms, and is dropped ONLY on confirmation — a tab that vanishes from
-		// a scan still on disk is the resurrection bug. On failure the row stays with a plain line
-		// saying so; the technical detail is in the log, never here.
+		// Closing a tab discards the scan: stop the owner and delete its datadir. The row shows
+		// "Removing…" until the owner confirms, and is dropped only on confirmation, so it never
+		// disappears for a scan still on disk. On failure the row stays with a plain line saying
+		// so; the technical detail goes to the log.
 		deletingIds = new Set(deletingIds).add(scan.id);
 		let deleted = false;
 		try {
@@ -445,7 +445,7 @@
 		text-overflow: ellipsis;
 	}
 
-	/* One quiet line when a delete didn't take — the tab stays rather than vanishing from a
+	/* One quiet line when a delete didn't take, so the tab stays rather than vanishing from a
 	   scan that is still on disk. Muted, not alarming: it's a retry hint, not a failure. */
 	.scan-note {
 		display: block;

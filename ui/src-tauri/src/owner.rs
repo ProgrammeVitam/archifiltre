@@ -48,20 +48,20 @@ pub struct Owner {
     pub run_id: Arc<std::sync::Mutex<String>>,
     /// Job id to tag scan events with; set by the command layer on `start_scan`.
     pub current_job_id: Arc<std::sync::Mutex<String>>,
-    /// When the last request was sent to this owner, in microseconds since process start — the
-    /// pool's LRU key and its idle clock. The active tab is queried constantly (hover, selection,
-    /// describe) while background tabs generate no traffic at all, so "least recently used" is
-    /// exactly "not the tab the user is looking at".
+    /// When the last request was sent to this owner, in microseconds since process start. Serves
+    /// as the pool's LRU key and its idle clock. The active tab is queried constantly (hover,
+    /// selection, describe) while background tabs generate no traffic, so least-recently-used
+    /// resolves to the tab the user is not looking at.
     last_used: AtomicU64,
     /// Whether this owner is mid-scan, tracked from the `job:*` lines already passing through
-    /// the reader. A scanning owner is never evicted — that would be cancelling work the user
-    /// asked for, not reclaiming an idle resource.
+    /// the reader. A scanning owner is never evicted, since that would cancel work in progress
+    /// rather than reclaim an idle resource.
     scanning: Arc<AtomicBool>,
 }
 
-/// Process-start reference for `Owner::last_used`. Monotonic (an `Instant`, so NTP steps can't
-/// make an owner look freshly used), and microseconds keep same-millisecond requests distinct
-/// enough to order.
+/// Process-start reference for `Owner::last_used`. An `Instant`, so it is monotonic and an NTP
+/// step cannot make an owner look freshly used; microseconds keep same-millisecond requests
+/// distinguishable.
 static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 fn now_micros() -> u64 {
@@ -140,8 +140,8 @@ impl Owner {
                             continue; // internal handshake; not forwarded
                         }
                         // Track scan liveness off the canonical job vocabulary (job-context.ts)
-                        // so the pool can tell "idle, reclaimable" from "working". Paused counts
-                        // as idle: a paused scan resumes through a query, which respawns.
+                        // so the pool can tell a reclaimable owner from a working one. Paused
+                        // counts as idle: a paused scan resumes through a query, which respawns.
                         match evt {
                             "job:start" | "job:progress" => scanning.store(true, Ordering::SeqCst),
                             "job:paused" | "job:complete" | "job:error" => {
@@ -219,13 +219,13 @@ impl Owner {
     }
 
     /// Pool bookkeeping: LRU rank, idle duration, whether a scan is running, and whether any
-    /// request is in flight. Eviction requires all of them to say "idle".
+    /// request is in flight. Eviction requires all of them to report idle.
     pub fn last_used(&self) -> u64 {
         self.last_used.load(Ordering::SeqCst)
     }
 
-    /// How long since the last request. Saturating: a clock that somehow reads backwards yields
-    /// zero (looks freshly used) rather than a huge value that would evict a live owner.
+    /// How long since the last request. Saturating, so a clock reading backwards yields zero and
+    /// the owner looks freshly used, rather than a large value that would evict a live one.
     pub fn idle_for(&self) -> Duration {
         Duration::from_micros(now_micros().saturating_sub(self.last_used()))
     }
@@ -235,7 +235,7 @@ impl Owner {
     }
 
     /// True if a request has been sent and not yet answered. Evicting such an owner would fail a
-    /// query the user is waiting on, so the pool skips it and takes the next candidate.
+    /// query someone is waiting on, so the pool skips it and takes the next candidate.
     pub async fn has_pending(&self) -> bool {
         !self.pending.lock().await.is_empty()
     }
@@ -271,8 +271,8 @@ impl Owner {
             Ok(Err(_)) => Err("session closed before responding".to_string()),
             Err(_) => {
                 self.pending.lock().await.remove(&request.id);
-                // Worth a line: the owner is still working on this, we just stopped waiting.
-                // Silent timeouts are what made the "delete that didn't delete" undiagnosable.
+                // The owner is still working on this request; only the wait was abandoned.
+                // Logged because a silent timeout here otherwise leaves no trace to diagnose.
                 eprintln!(
                     "[owner] request timed out after {}ms: action={} id={}",
                     timeout_ms, request.action, request.id
@@ -297,10 +297,10 @@ impl Owner {
     /// recompile). Updates the tracked run id from the session's response. On error the
     /// owner stays on its old db (caller should discard it). Refused by the session
     /// while it is scanning.
-    /// Re-point this process at `db`. `create` distinguishes the two intents the session's
-    /// `createScanDatabase` otherwise conflates: re-opening a scan that exists (routine) versus
-    /// bringing a datadir into being (only ever correct when a scan is actually being started).
-    /// With `create: false` a missing datadir answers `db_absent` and this process is unchanged.
+    /// Re-point this process at `db`. `create` separates the two intents that the session's
+    /// `createScanDatabase` conflates: re-opening a scan that exists, versus bringing a datadir
+    /// into being, which is correct only when a scan is starting. With `create: false` a missing
+    /// datadir answers `db_absent` and this process is left unchanged.
     pub async fn switch_db(&self, db: &str, timeout_ms: u64, create: bool) -> Result<(), String> {
         let mut params = serde_json::Map::new();
         params.insert("db".to_string(), serde_json::json!(db));

@@ -86,11 +86,11 @@ export default class Session extends Command {
   static override flags = {
     db: Flags.string({ char: 'd', description: 'Database name', default: 'main' }),
     'run-id': Flags.string({ description: 'Run ID for queries (defaults to latest)' }),
-    // Serve an EXISTING datadir only; refuse to bring one into being. Opening a session and
-    // creating a scan database are different intents that `createScanDatabase` conflates, and
-    // the difference matters after a delete: a stray query for a discarded scan must not
-    // resurrect 38 MB of empty database. The supervisor passes this whenever it is merely
-    // re-establishing a session (see get_or_spawn_owner), never when a scan is being started.
+    // Serve an existing datadir only. `createScanDatabase` conflates two intents — opening a
+    // session and creating a scan database — and after a delete the difference matters: a
+    // query for a discarded scan would otherwise rebuild its datadir. The supervisor passes
+    // this whenever it is re-establishing a session (see get_or_spawn_owner); a starting scan
+    // is the only caller that omits it.
     'no-create': Flags.boolean({ description: 'Fail instead of creating a missing datadir', default: false }),
   };
 
@@ -170,8 +170,8 @@ export default class Session extends Command {
     this.batchStart = Date.now();
   }
 
-  /** Sample CPU%, RSS and system load every 500ms and emit as a `resource` event —
-   *  feeds the UI's live resource display AND (via effectiveBudget) the throttle. */
+  /** Sample CPU%, system memory and load every 500ms and emit as a `resource` event —
+   *  feeds the UI's live resource display and (via effectiveBudget) the throttle. */
   private startMonitor(): void {
     let lastCpu = process.cpuUsage();
     let lastT = Date.now();
@@ -182,10 +182,9 @@ export default class Session extends Command {
       const cpuPct = elapsed > 0 ? Math.round(((d.user + d.system) / 1000 / elapsed) * 100) : 0;
       lastCpu = process.cpuUsage();
       lastT = now;
-      // SYSTEM memory, not this process's RSS. The meter answers "what is this doing to my
-      // machine", and one sidecar's RSS is neither the app's footprint (there are several
-      // processes plus the webview) nor, on Windows, close to what it actually costs — a
-      // session charges ~4.4 GB of commit while its working set reads ~450 MB.
+      // Memory is system-wide. The app spans several processes plus the webview, and on
+      // Windows a session's working set (~450 MB) is far below what it actually costs the
+      // machine (~4.4 GB of commit charge), so one process's resident set would mislead.
       this.send({
         event: 'resource',
         cpuPct,
@@ -250,8 +249,7 @@ export default class Session extends Command {
     });
 
     if (flags['no-create'] && !(await datadirExists(flags.db))) {
-      // The caller only wanted to re-attach to a database that already exists. Say so and stop,
-      // rather than silently manufacturing an empty one the user never asked for.
+      // The caller asked to re-attach to a database that exists. Report the absence and stop.
       logger.info('Refusing to create a missing datadir (--no-create)', { dbName: flags.db });
       this.send({ event: 'db_absent', db: flags.db });
       process.exit(3);
@@ -279,9 +277,9 @@ export default class Session extends Command {
       void ensureTemplateInBackground();
     }
 
-    // Finish any deletion that was interrupted (app killed mid-removal, or the removal simply
-    // outlived the last session). Tombstoned datadirs are already invisible to reconciliation;
-    // this reclaims their bytes. Background + best-effort — it must never delay `ready`.
+    // Finish any deletion that was interrupted, by a kill mid-removal or by the removal
+    // outliving its session. Tombstoned datadirs are already invisible to reconciliation, so
+    // this only reclaims their bytes; it runs in the background so it cannot delay `ready`.
     void sweepTombstonedDatadirs().catch(() => {
       /* best-effort: still tombstoned, retried next launch */
     });
@@ -456,17 +454,17 @@ export default class Session extends Command {
       // atomic swap). Different datadir → no two-openers-of-one-datadir.
       const old = this.database;
       const oldRunId = this.runId;
-      // Opening an EXISTING datadir that Postgres can't recover (power-cut corruption)
-      // throws here. Surface it as a typed 'datadir_damaged' so the UI offers Re-scan /
-      // Delete instead of a raw error — the old connection is untouched (never swapped).
-      // Same intent split as the `--no-create` flag: re-targeting a spare at an EXISTING scan
-      // is routine, conjuring a datadir for one that was deleted is not. The old connection is
-      // untouched, so refusing here leaves this process perfectly usable.
+      // Same intent split as the `--no-create` flag: re-targeting a spare at an existing scan
+      // is routine, creating a datadir for one that was deleted is not.
       if (req.create === false && !(await datadirExists(db))) {
         logger.info('switch_db refused: datadir absent and create=false', { dbName: db });
         this.send({ id, ok: false, error: 'db_absent' });
         return;
       }
+      // Opening an existing datadir that Postgres can't recover (power-cut corruption)
+      // throws here. Surface it as a typed 'datadir_damaged' so the UI offers Re-scan /
+      // Delete instead of a raw error. The old connection is never swapped, so this process
+      // stays usable either way.
       let next: DatabaseConnection;
       try {
         next = await createScanDatabase(db);
@@ -701,24 +699,22 @@ export default class Session extends Command {
    * Delete this owner's database and exit — the "close the tab = discard the scan" path.
    *
    * Order matters. Removing the datadir means unlinking ~1000 files, which on Windows runs past
-   * the caller's 15 s wire timeout; acking only afterwards meant the caller timed out, swallowed
-   * the error, killed this process mid-removal, and the half-removed datadir came back at the
-   * next launch. So: write the tombstone, ACK, and only then do the slow work. Everything after
-   * the ack is interruptible — the tombstone alone is enough for the scan to stay deleted, and
-   * `sweepTombstonedDatadirs` finishes the removal on any later run.
+   * the caller's 15 s wire timeout, so the tombstone is written and acked first and the removal
+   * follows. Everything after the ack is interruptible: the tombstone alone keeps the scan
+   * deleted, and `sweepTombstonedDatadirs` finishes the removal on a later run.
    */
   private async handleDeleteDb(id: string): Promise<void> {
     const db = this.database?.name;
     logger.info('Delete requested', { dbName: db ?? null });
 
-    // Stop the scan first so nothing is writing into the datadir we're about to discard.
+    // Stop the scan first so nothing is writing into the datadir being discarded.
     this.scanPaused = true;
     this.scanSubscription?.unsubscribe();
     this.scanSubscription = undefined;
     this.scanning = false;
 
-    // Read the root path while the connection is still open — needed to discard this scan's
-    // annotations snapshot (explicit discard; the File-menu export is the "keep a copy" path).
+    // Read the root path while the connection is still open; it identifies the annotations
+    // snapshot to discard. Keeping a copy is the File-menu export, a separate path.
     let discardRoot: string | null = null;
     if (this.database && this.runId) {
       try {
@@ -733,15 +729,15 @@ export default class Session extends Command {
       cancelSnapshot(this.database);
     }
 
-    // The one step that decides success. Fast (a single small file) and done BEFORE pg.close(),
-    // so a close that hangs under memory pressure can't strand the deletion.
+    // The step that decides success: one small file, written before pg.close() so that a close
+    // hanging under memory pressure cannot strand the deletion.
     try {
       if (db) await writeDatadirTombstone(db);
       logger.info('Delete tombstoned; removal continues in background', { dbName: db ?? null });
       this.send({ id, ok: true });
     } catch (e) {
-      // Couldn't even mark it — report honestly rather than let the tab vanish from a scan that
-      // is still on disk. Stay alive: nothing was torn down that the session can't keep serving.
+      // The datadir is still on disk and still served: report the failure and stay alive, so
+      // the tab is not dropped for a scan that remains.
       logger.error(
         'Delete failed: could not write the tombstone',
         e instanceof Error ? e : new Error(String(e))
@@ -763,8 +759,8 @@ export default class Session extends Command {
         error: (e as Error).message,
       });
     }
-    // Flush the ack down the pipe, then exit — the datadir is gone (or tombstoned), nothing left
-    // to serve. The supervisor's stdout-closed handler marks this owner dead.
+    // Let the ack flush down the pipe, then exit: the datadir is gone or tombstoned, so there
+    // is nothing left to serve. The supervisor's stdout-closed handler marks this owner dead.
     setTimeout(() => process.exit(0), 50);
   }
 

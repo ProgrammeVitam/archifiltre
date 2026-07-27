@@ -99,8 +99,8 @@ export interface Scan {
 	/** Marks a scan adopted from disk by reconciliation (not from localStorage), so the
 	 *  UI can note "recovered" briefly. Transient. */
 	recovered?: boolean;
-	/** The owner could not confirm this scan was deleted, so the tab stays instead of
-	 *  vanishing from data that is still on disk. Cleared on a successful retry. Transient. */
+	/** The owner could not confirm this scan was deleted, so the tab stays rather than vanish
+	 *  for data still on disk. Transient; cleared on a successful retry. */
 	deleteFailed?: boolean;
 	/** Error message if state is 'error' */
 	errorMessage: string | null;

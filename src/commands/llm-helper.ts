@@ -394,10 +394,10 @@ export default class LlmHelper extends Command {
             promptChars: (req.prompt ?? '').length,
             backend: backend || 'cpu',
           });
-          // Live resource sampler for the status-bar meter: this helper's CPU% plus SYSTEM memory
-          // (and VRAM on a GPU backend) ~1×/s while this generation runs; cleared in `finally`.
-          // System rather than own-RSS: the meter is about machine load, and a single process's
-          // resident set is not the app's footprint.
+          // Live resource sampler for the status-bar meter: this helper's CPU% plus system
+          // memory, and VRAM on a GPU backend, once a second while this generation runs;
+          // cleared in `finally`. Memory is system-wide because the meter reports machine
+          // load rather than one process's footprint.
           const cores = cpus().length || 1;
           let lastCpu = process.cpuUsage();
           let lastAt = performance.now();

@@ -207,8 +207,8 @@ export async function scanDirectory(options: ScanOptions): Promise<CommandResult
 	// owners keep running → concurrent scans), point queries at it, fire the scan (acks
 	// immediately, streams job:progress/resource events), and resolve on job:complete /
 	// job:error — same canonical vocabulary as the scan command.
-	// The ONE place allowed to bring a scan database into existence — a scan is starting, so a
-	// datadir is exactly what's wanted. Everywhere else attaches to one that already exists.
+	// The one call site that may bring a scan database into existence: a scan is starting, so a
+	// datadir is what's wanted. Every other caller attaches to one that already exists.
 	await ensureSession(options.dbName, true); // seed the gate: the scan IS this db's owner
 	setActiveQueryDb(options.dbName);
 	const jobId = options.jobId || options.scanId;
@@ -464,11 +464,10 @@ export function ensureSession(dbName?: string, allowCreate = false): Promise<str
 	const db = dbName ?? activeQueryDb ?? 'main';
 	let p = sessionReady.get(db);
 	if (!p) {
-		// `allowCreate` defaults to FALSE: attaching to a scan is routine, bringing one into
-		// existence is not. Most queries omit a dbName and inherit `activeQueryDb`, so with
-		// creation on by default an app-level question (model_status, ping) aimed at an empty
-		// tab quietly built a whole empty database for it — invisible to reconciliation, and
-		// never reclaimed. Only scanDirectory, which genuinely starts a scan, passes true.
+		// `allowCreate` defaults to false. Most queries omit a dbName and inherit `activeQueryDb`,
+		// so with creation enabled an app-level question (model_status, ping) aimed at an empty
+		// tab would build a database for it — one reconciliation never sees and nothing reclaims.
+		// scanDirectory is the only caller that passes true.
 		p = invoke<string>('start_session', { dbName: db, allowCreate }).catch((e) => {
 			sessionReady.delete(db); // failed to establish → let a later call retry cleanly
 			throw e;
@@ -588,27 +587,26 @@ export async function cancelScan(dbName: string): Promise<void> {
 	await sendQuery({ id: `cancel_${Date.now()}`, action: 'cancel_scan' }, dbName);
 }
 
-/** Discard a scan entirely — used when CLOSING a tab.
+/** Discard a scan entirely, on closing a tab.
  *
  *  The owner tombstones the datadir and acks within ~50 ms, then removes the files in the
- *  background and exits on its own. So this resolves fast and, crucially, REPORTS whether the
- *  scan is actually gone: a false success here is what used to make a tab disappear from a scan
- *  that was still on disk and came back at the next launch.
+ *  background and exits on its own. The boolean reports whether the scan is actually gone, so
+ *  the caller can keep the tab when it isn't.
  *
- *  Deliberately does NOT stop_session afterwards. The owner exits itself once the removal is
- *  done; killing it here raced the removal it had just been asked to perform. */
+ *  Does not call stop_session afterwards: the owner exits once the removal is done, and killing
+ *  it here would race the removal it was just asked to perform. */
 export async function deleteDatabase(dbName: string): Promise<boolean> {
 	if (!useOwnerDb()) return true;
 	let deleted = false;
 	try {
-		// Ensure an owner exists for this db BEFORE asking it to delete itself — deleting a scan
-		// we never opened this session would otherwise have no process to ask.
+		// An owner has to exist before it can be asked to delete itself; a scan that was never
+		// opened this session has no process to ask.
 		await ensureSession(dbName);
 		const res = await sendQuery({ id: `delete_${Date.now()}`, action: 'delete_db' }, dbName);
 		deleted = res.ok === true;
 	} catch (e) {
-		// The owner acks then exits, so a late "session closed" AFTER a successful ack is normal.
-		// Any other failure means the scan may still be on disk — say so.
+		// The owner acks then exits, so a "session closed" arriving after a successful ack is
+		// expected. Any other failure means the scan may still be on disk.
 		deleted = isTransientSessionError(e) && deleted;
 	}
 	invalidateSession(dbName); // owner is exiting → forget it so a re-scan re-establishes cleanly

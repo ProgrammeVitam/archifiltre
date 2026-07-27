@@ -6,7 +6,7 @@
  * regular files and archive contents. Uses bounded memory regardless of dataset size.
  *
  * Key design principles:
- * - Never load all file paths into memory (unlike Archiscan)
+ * - Never load all file paths into memory
  * - Uses content_size for prefiltering (not physical_size)
  * - Archive-aware: extracts content on-demand from ZIP, TAR, 7Z, etc.
  * - Cross-platform path normalization for Windows/Unix compatibility

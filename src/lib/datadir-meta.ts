@@ -78,11 +78,10 @@ export async function writeDatadirMeta(meta: Omit<DatadirMeta, 'version' | 'upda
 
 // ── Deletion tombstones ─────────────────────────────────────────────────────
 // Removing a datadir means unlinking ~1000 files, which on Windows (NTFS + antivirus) can run
-// well past the caller's wire timeout. So deletion is a two-step: drop a tombstone INSIDE the
-// datadir (one small file, milliseconds), then do the slow removal in the background. A
-// tombstoned datadir is already "deleted" as far as the app is concerned — reconciliation skips
-// it and sweeps it — so the removal can be interrupted at any point without resurrecting the
-// scan. Idempotent: an interrupted sweep simply runs again next launch.
+// well past the caller's wire timeout. Deletion is therefore two steps: write a tombstone inside
+// the datadir, which takes milliseconds, then remove the files in the background. A tombstoned
+// datadir already counts as deleted — reconciliation skips it and the sweep reclaims it — so the
+// removal can be interrupted at any point. An interrupted sweep runs again next launch.
 
 const TOMBSTONE = '.deleted';
 
@@ -91,8 +90,8 @@ function tombstonePath(dbName: string): string {
   return path.join(getDatabasePath(dbName), TOMBSTONE);
 }
 
-/** Mark a datadir deleted. Throws if the marker can't be written — the caller must NOT report
- *  a successful delete when the datadir would come back. */
+/** Mark a datadir deleted. Throws if the marker can't be written, so the caller can avoid
+ *  reporting a successful delete for a datadir that would come back. */
 export async function writeDatadirTombstone(dbName: string): Promise<void> {
   const dest = tombstonePath(dbName);
   const body = JSON.stringify({ deletedAt: Math.floor(Date.now() / 1000) });
@@ -108,8 +107,8 @@ export async function writeDatadirTombstone(dbName: string): Promise<void> {
     await fs.rename(tmp, dest);
   } catch (error) {
     // Same antivirus/ENOENT hazard as writeDatadirMeta: the tmp can vanish before the rename.
-    // Fall back to a direct write — less atomic, but a torn tombstone still reads as "present",
-    // which is the only property that matters here.
+    // Fall back to a direct write. It is less atomic, but a torn tombstone still reads as
+    // present, which is the only property this marker needs.
     if ((error as NodeJS.ErrnoException).code === 'ENOENT' && !(await datadirExists(dbName))) {
       return; // datadir already gone → nothing to tombstone, deletion is a no-op success
     }
@@ -118,9 +117,9 @@ export async function writeDatadirTombstone(dbName: string): Promise<void> {
   }
 }
 
-/** Does this scan's datadir exist on disk? The only reliable discriminator between "re-open an
- *  existing scan" and "create a new one" — and it has to live here, in the sidecar, because the
- *  path differs between a packaged app and `bun run` (see getDatabasePath). */
+/** Does this scan's datadir exist on disk? This is what distinguishes re-opening an existing
+ *  scan from creating a new one. It lives in the sidecar because the path differs between a
+ *  packaged app and `bun run` (see getDatabasePath). */
 export async function datadirExists(dbName: string): Promise<boolean> {
   try {
     return (await fs.stat(getDatabasePath(dbName))).isDirectory();
@@ -139,9 +138,9 @@ export async function isDatadirTombstoned(dbName: string): Promise<boolean> {
   }
 }
 
-/** Remove every tombstoned datadir (and its meta sidecar). Best-effort and idempotent: whatever
- *  this pass fails to remove stays tombstoned and is retried next time. Run it from a long-lived
- *  process — a short-lived one would exit mid-removal and get nowhere. */
+/** Remove every tombstoned datadir and its meta sidecar. Best-effort and idempotent: whatever
+ *  this pass fails to remove stays tombstoned and is retried next time. Call it from a
+ *  long-lived process; a short-lived one exits mid-removal. */
 export async function sweepTombstonedDatadirs(): Promise<number> {
   let swept = 0;
   let names: string[];
@@ -216,10 +215,9 @@ export async function listDatadirs(): Promise<DatadirEntry[]> {
     if (!isDir) continue;
 
     const dbName = m[1];
-    // Deleted-but-not-yet-removed: the user discarded this scan and the removal is still in
-    // flight (or was interrupted). Reconciliation keys off the DIRECTORY existing, so without
-    // this check a half-removed datadir comes back as a tab — the "I deleted it and it
-    // returned" bug. The sweep finishes the job.
+    // Discarded, with the removal still in flight or interrupted. Reconciliation keys off the
+    // directory existing, so without this check a half-removed datadir would reappear as a tab.
+    // The sweep finishes the removal.
     if (await isDatadirTombstoned(dbName)) continue;
     const meta = await readDatadirMeta(dbName);
     let hasSnapshot = false;

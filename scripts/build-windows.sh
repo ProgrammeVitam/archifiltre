@@ -8,21 +8,21 @@
 #   scripts/build-windows.sh --sidecar-only # only the Windows sidecar + its acceptance gate (fast)
 #   scripts/build-windows.sh --skip-gates   # skip the acceptance checks (debug only; default: gates run)
 #
-# Two things here are NOT discoverable from the repo and cost a long rediscovery once:
+# Two things here are not discoverable from the repo and are expensive to rediscover:
 #
 #  1. `llm-runtime` is bundled via a BUILD-TIME `--config` override, not committed tauri.conf.json.
 #     The sidecar is compiled `--external node-llama-cpp`, so without llm-runtime sitting next to
 #     the exe, on-device AI is silently dead on Windows. The override puts it at <install>/llm-runtime,
 #     which is what Rust's llm_runtime_dir(sidecar) resolves to.
-#  2. Installer SIZE tells you nothing — NSIS LZMA squeezes the ~146MB Bun exe + 65M runtime down to
-#     ~40MB, identical to a build with no runtime at all. Only `7z l` proves it's really inside.
+#  2. Installer size tells you nothing: NSIS LZMA squeezes the ~146MB Bun exe and 65M runtime down
+#     to ~40MB, the same as a build with no runtime at all. Only `7z l` proves it is inside.
 #
-# Windows ships TWO prebuilts: win-x64-vulkan (GPU) and win-x64 (plain CPU). The Vulkan package does
-# carry every ggml-cpu-* backend, but that is not enough on its own — the only addon binding them is
-# Vulkan-linked, so on a machine with no working Vulkan ICD (Basic Display Adapter, RDP/VDI, a VM)
-# it fails to initialise and node-llama-cpp finds nothing to degrade to: `NoBinaryFoundError`, and
-# on-device AI is silently dead. Observed on the QA VM 2026-07-27, after a clean install removed the
-# stale win-x64 that layered installs had been quietly relying on. The plain sibling is the fallback.
+# Windows ships two prebuilts: win-x64-vulkan (GPU) and win-x64 (plain CPU). The Vulkan package
+# carries every ggml-cpu-* backend, but that is not enough on its own, because the only addon
+# binding them is Vulkan-linked. On a machine with no working Vulkan ICD (Basic Display Adapter,
+# RDP/VDI, a VM) it fails to initialise and node-llama-cpp has nothing to fall back to, exiting
+# with `NoBinaryFoundError` and leaving on-device AI unavailable. The plain sibling is that
+# fallback; a clean install surfaces the need for it, where layered installs kept a stale win-x64.
 # Unsigned (no signing identity on a Linux host) → SmartScreen warning on first run is expected.
 
 set -uo pipefail
@@ -58,10 +58,11 @@ die()  { printf '\n%sBUILD FAILED: %s%s\n' "$c_red" "$*" "$c_off" >&2; exit 1; }
 
 # ── GATE: the cross-compiled Windows sidecar must actually initialize PGlite.
 #    We can really run it here: wine executes the Bun exe and PGlite's WASM initdb works under it.
-#    Hermetic in the way that matters — the app's %AppData% inside the prefix is wiped before every
-#    attempt, so a corrupt warm-start DB template can never make a good build look broken (or a bad
-#    one look fine). Retries 3×: PGlite's WASM heap init can fail transiently under memory pressure.
-#    No wine installed → degrade to a structural check and SAY so, rather than silently proving less.
+#    Hermetic where it counts: the app's %AppData% inside the prefix is wiped before every attempt,
+#    so a corrupt warm-start DB template cannot make a good build look broken or a bad one look
+#    fine. Retries 3×, since PGlite's WASM heap init can fail transiently under memory pressure.
+#    With no wine installed, fall back to a structural check and report that, rather than imply
+#    the stronger check ran.
 gate_sidecar() {
   local out ready=0
   [ "$SKIP_GATES" = 1 ] && { echo "  (gate skipped)"; return 0; }
@@ -113,12 +114,12 @@ bash scripts/assemble-llm-runtime.sh win-x64-vulkan "$RUNTIME" >/dev/null 2>&1 \
 if [ "$SKIP_GATES" != 1 ]; then
   [ -n "$(find "$RUNTIME" -name 'llama-addon.node')" ] || die "runtime missing llama-addon.node"
   [ -n "$(find "$RUNTIME" -name 'ggml*.dll')" ]        || die "runtime missing ggml*.dll"
-  # The GPU backend — the whole point of shipping the Vulkan prebuilt. Its absence would silently
-  # regress us to CPU-only.
+  # The GPU backend, which is the reason for shipping the Vulkan prebuilt. Without it the runtime
+  # would quietly be CPU-only.
   [ -n "$(find "$RUNTIME" -name 'ggml-vulkan.dll')" ]  || die "runtime missing ggml-vulkan.dll — GPU acceleration would be absent"
-  # …and the CPU ADDON, which is a separate check: the ggml-cpu-*.dll backends are useless without a
-  # non-Vulkan llama-addon.node to bind them. This gate previously asserted only the GPU half, which
-  # is why a Vulkan-only runtime shipped and left machines with no Vulkan ICD with no AI at all.
+  # …and the CPU addon, which is a separate check: the ggml-cpu-*.dll backends are unusable without
+  # a non-Vulkan llama-addon.node to bind them. Asserting only the GPU half lets a Vulkan-only
+  # runtime through, which leaves machines with no Vulkan ICD without on-device AI.
   [ -d "$RUNTIME/node_modules/@node-llama-cpp/win-x64" ] \
     || die "runtime missing the plain win-x64 prebuilt — on-device AI would be DEAD on any machine without a working Vulkan driver"
   [ "$(find "$RUNTIME/node_modules/@node-llama-cpp" -name 'llama-addon.node' | wc -l)" -ge 2 ] \
@@ -150,8 +151,8 @@ ok "built $(du -h "$INSTALLER" | cut -f1) → $(basename "$INSTALLER")"
 if [ "$SKIP_GATES" != 1 ]; then
   say "Stage 4 · verify installer payload"
   LIST="$(7z l "$INSTALLER" 2>/dev/null)"
-  # here-strings, NOT `printf | grep -q`: grep -q exits on first match, the writer dies of SIGPIPE,
-  # and `set -o pipefail` then reports a SUCCESSFUL match as a failed pipeline.
+  # here-strings rather than `printf | grep -q`: grep -q exits on the first match, the writer dies
+  # of SIGPIPE, and `set -o pipefail` then reports a successful match as a failed pipeline.
   grep -qi 'llama-addon\.node' <<<"$LIST" || die "installer does NOT contain llama-addon.node — on-device AI would be dead"
   grep -qi 'ggml.*\.dll'       <<<"$LIST" || die "installer does NOT contain ggml*.dll"
   grep -qi 'ggml-vulkan\.dll'  <<<"$LIST" || die "installer does NOT contain ggml-vulkan.dll — GPU acceleration would be absent"

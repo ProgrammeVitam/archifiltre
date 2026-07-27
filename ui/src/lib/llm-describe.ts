@@ -109,9 +109,9 @@ export interface LlmEngineInfo {
 	vramTotalMb: number | null;
 	cpuCount: number | null;
 }
-/** One live per-generation resource sample (CPU% + system memory always; VRAM on a GPU
- *  backend). Memory is SYSTEM-wide, not the helper's own resident set: the meter reports machine
- *  load, and one process's RSS is neither the app's footprint nor, on Windows, its real cost. */
+/** One live per-generation resource sample: CPU% and system memory always, VRAM on a GPU
+ *  backend. Memory is system-wide because the meter reports machine load, and the app spans
+ *  several processes plus the webview. */
 export interface LlmResource {
 	cpuPct: number;
 	memUsedMb: number;
@@ -252,8 +252,8 @@ const aiCellState$: Observable<AiCellState> = combineLatest([
 	shareReplay(1)
 );
 
-/** The scan governor's CPU% / system-memory / budget sample. Not an `llm:*` event — the owner
- *  emits `resource` every 500ms on the same stdout stream, so it arrives on `hostEvents$` too.
+/** The scan governor's CPU% / system-memory / budget sample. The owner emits `resource` every
+ *  500ms on the same stdout stream as the `llm:*` events, so it arrives on `hostEvents$` too.
  *  `startWith(null)` so `aiMeter$`'s combineLatest fires before any scan has run. */
 interface ScanResource {
 	cpuPct: number;

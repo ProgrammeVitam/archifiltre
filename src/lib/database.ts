@@ -1,8 +1,7 @@
 /**
  * Database Operations - PGlite + Drizzle + RxJS
  *
- * Simple, working database implementation inspired by Archiscan's approach.
- * Uses PGlite for embedded PostgreSQL with Drizzle ORM and RxJS for reactive operations.
+ * Embedded PostgreSQL via PGlite, with Drizzle ORM and RxJS for reactive operations.
  */
 
 import * as path from 'node:path';

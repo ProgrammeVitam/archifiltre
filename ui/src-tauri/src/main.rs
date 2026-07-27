@@ -210,10 +210,10 @@ pub(crate) fn sidecar_command<S: AsRef<std::ffi::OsStr>>(program: S) -> tokio::p
     let mut cmd = tokio::process::Command::new(program);
     #[cfg(windows)]
     cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    // Reap the child if we drop its handle without killing it explicitly — insurance against
-    // our own paths (notably pool eviction) forgetting to. NOT crash protection: this only runs
-    // on an unwind, never when the parent is SIGKILLed/TerminateProcessed. That case is covered
-    // by the sidecar itself, which exits on stdin EOF (src/commands/session.ts `rl.on('close')`).
+    // Reap the child when its handle is dropped without an explicit kill, covering a path
+    // (pool eviction, say) that forgets to. This is not crash protection: it runs on an unwind
+    // only, never when the parent is SIGKILLed or TerminateProcessed. That case is handled by
+    // the sidecar, which exits on stdin EOF (src/commands/session.ts `rl.on('close')`).
     cmd.kill_on_drop(true);
     cmd
 }
@@ -967,10 +967,10 @@ async fn get_query_run_id(state: tauri::State<'_, Arc<AppState>>) -> Result<Stri
 
 /// Spawn one owner process on `db`, wired to emit its events on the job-update stream.
 /// Spawn a session sidecar for `db`. `allow_create` carries the caller's intent down to the
-/// sidecar, which is the only layer that can resolve a datadir path reliably (it differs between
-/// a packaged app and `bun run`). With `allow_create: false` a missing datadir makes the sidecar
-/// exit instead of manufacturing an empty database — the difference between re-attaching to a
-/// scan and inventing one that was deleted.
+/// sidecar, the only layer that can resolve a datadir path reliably, since it differs between a
+/// packaged app and `bun run`. With `allow_create: false` a missing datadir makes the sidecar
+/// exit rather than build an empty database, which is what separates re-attaching to a scan from
+/// recreating one that was deleted.
 async fn spawn_owner(
     app: &tauri::AppHandle,
     binary_path: &std::path::Path,
@@ -1028,10 +1028,9 @@ async fn spawn_owner(
 fn ensure_warm_spare(app: tauri::AppHandle, state: Arc<AppState>) {
     // Tauri's runtime so this works from the sync setup hook AND async commands.
     tauri::async_runtime::spawn(async move {
-        // Claim the right to spawn BEFORE spawning. The check and the spawn used to be separate,
-        // so two concurrent callers could both see "no spare" and both build one — each costing a
-        // full PGlite (~4 GB of Windows commit) while only one can ever be kept. Observed on the
-        // QA VM as two live `--db _warm` processes.
+        // Claim the right to spawn before spawning. With the check and the spawn separate, two
+        // concurrent callers can both see no spare and both build one, each costing a full PGlite
+        // (~4 GB of Windows commit charge) when only one can be kept.
         if SPARE_SPAWNING.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return; // someone else is already building one
         }
@@ -1071,29 +1070,29 @@ static SPARE_SPAWNING: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 
 /// How many scan-db owners may be live at once, on top of the warm spare.
 ///
-/// Every open PGlite database reserves ~4 GiB of address space for its wasm32 heap (the engine
-/// takes the full 2³² regardless of the declared `maximum`), and Windows — which does not
-/// overcommit — charges all of it against RAM + pagefile even though only ~400 MB is ever
-/// touched. So the ceiling is set by the *number of open databases*, not by real memory, and
-/// consolidating owners into one process would not help: the reservation is per database.
-/// A typical 8 GB laptop has a ~20 GB commit limit; at ~4.4 GB apiece, 2 owners + the spare
+/// Every open PGlite database reserves ~4 GiB of address space for its wasm32 heap: the engine
+/// takes the full 2³² regardless of the declared `maximum`. Windows does not overcommit, so it
+/// charges all of that against RAM + pagefile even though only ~400 MB is ever touched. The
+/// ceiling therefore follows the number of open databases rather than real memory, and
+/// consolidating owners into one process would not help, since the reservation is per database.
+/// A typical 8 GB laptop has a ~20 GB commit limit; at ~4.4 GB apiece, 2 owners plus the spare
 /// (~13 GB) leaves room for the webview, the LLM helper and Windows itself.
 const MAX_OWNERS: usize = 2;
 
 /// Retire an owner idle for this long even when the pool is under `MAX_OWNERS`, so an app left
-/// open overnight doesn't sit on databases nobody is looking at.
+/// open overnight does not hold databases nobody is looking at.
 const OWNER_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// Drop dead entries, then remove and return the owners that must go for the pool to sit at
-/// `MAX_OWNERS`. Only removes from the map — retiring them (a `switch_db` round-trip) happens
-/// off the lock, so a slow sidecar can't stall every other query behind it.
+/// `MAX_OWNERS`. This only removes them from the map; retiring them costs a `switch_db`
+/// round-trip and happens off the lock, so a slow sidecar cannot stall every other query.
 ///
 /// Callers must already hold the `owners` lock.
 async fn take_evictable_owners(
     owners: &mut HashMap<String, Arc<Owner>>,
     keep: &str,
 ) -> Vec<Arc<Owner>> {
-    // Dead entries are free to drop and may be all the room we need.
+    // Dead entries are free to drop and may free enough slots on their own.
     let dead: Vec<String> = owners
         .iter()
         .filter(|(db, o)| db.as_str() != keep && !o.is_alive())
@@ -1116,8 +1115,8 @@ async fn take_evictable_owners(
             });
         }
         let Some(victim_db) = pick_eviction_victim(&snapshot, keep) else {
-            // Everything left is busy. Exceeding the cap beats cancelling the user's work; the
-            // idle tick reclaims as soon as something goes quiet.
+            // Everything left is busy. Exceeding the cap is preferable to cancelling work in
+            // progress; the idle tick reclaims as soon as something goes quiet.
             break;
         };
         if let Some(victim) = owners.remove(&victim_db) {
@@ -1138,12 +1137,11 @@ struct OwnerSnapshot {
     pending: bool,
 }
 
-/// Choose which owner to give up: the least-recently-used one that is genuinely idle. Returns
-/// `None` when every owner is busy — the caller then runs over the cap rather than interrupting
-/// work, which is always the better trade.
+/// Choose which owner to give up: the least-recently-used one that is idle. Returns `None` when
+/// every owner is busy, in which case the caller runs over the cap rather than interrupt work.
 ///
-/// Pure so the rules that matter (never the active db, never a scanning owner, never one with a
-/// request in flight, otherwise strict LRU) can be tested without spawning a single process.
+/// Kept pure so the rules (skip the active db, skip a scanning owner, skip one with a request in
+/// flight, otherwise strict LRU) can be tested without spawning a process.
 fn pick_eviction_victim(owners: &[OwnerSnapshot], keep: &str) -> Option<String> {
     owners
         .iter()
@@ -1152,9 +1150,8 @@ fn pick_eviction_victim(owners: &[OwnerSnapshot], keep: &str) -> Option<String> 
         .map(|o| o.db.clone())
 }
 
-/// Park a retired owner as the warm spare if that slot is free, otherwise kill it. Recycling is
-/// strictly better than kill-then-respawn: same process, no cold start, and the next tab switch
-/// gets a warm claim.
+/// Park a retired owner as the warm spare if that slot is free, otherwise kill it. Recycling
+/// reuses the process, so the next tab switch gets a warm claim instead of a cold start.
 async fn retire_owner(state: &Arc<AppState>, owner: Arc<Owner>) {
     let spare_free = {
         let g = state.warm_spare.lock().await;
@@ -1173,38 +1170,38 @@ async fn retire_owner(state: &Arc<AppState>, owner: Arc<Owner>) {
     owner.kill().await;
 }
 
-/// Get-or-spawn the owner for `db`, enforcing the pool cap. The single place an owner comes into
-/// existence, so both `start_session` and `session_request` go through it — that is what makes
-/// eviction invisible to the frontend, which memoizes its session promises and would otherwise
-/// hit "No active session for this db" the first time it touched an evicted database.
+/// Get-or-spawn the owner for `db`, enforcing the pool cap. The one place an owner comes into
+/// existence, used by both `start_session` and `session_request`, which is what keeps eviction
+/// invisible to the frontend: it memoizes its session promises and would otherwise hit "No
+/// active session for this db" the first time it touched an evicted database.
 async fn get_or_spawn_owner(
     app: &tauri::AppHandle,
     state: &Arc<AppState>,
     db: &str,
     allow_create: bool,
 ) -> Result<Arc<Owner>, String> {
-    // Claim/spawn under the lock, then retire the evicted owners after releasing it: retiring is
-    // a `switch_db` round-trip, and holding the map lock across it would stall every other db's
-    // queries behind a sidecar that might be slow.
+    // Claim or spawn under the lock, then retire the evicted owners after releasing it. Retiring
+    // costs a `switch_db` round-trip, and holding the map lock across it would stall every other
+    // db's queries behind a sidecar that may be slow.
     let (owner, evicted, spare_taken) = {
-        // Hold `owners` across the spawn/claim so two concurrent callers for the SAME db can't
-        // both open its datadir (two openers = corruption). ≤~0.5 s on the warm path.
+        // Hold `owners` across the spawn or claim so two concurrent callers for the same db
+        // cannot both open its datadir, which corrupts it. Around 0.5 s on the warm path.
         let mut owners = state.owners.lock().await;
-        // A live one is reused (reconnect after a scan, another tab on the same scan) — no cold
-        // start, no killing it. Other dbs' owners are left untouched, so concurrent scans/tabs
-        // each keep running.
+        // A live owner is reused, whether reconnecting after a scan or opening a second tab on
+        // the same one, so there is no cold start. Other dbs' owners are untouched, so concurrent
+        // scans and tabs keep running.
         if let Some(existing) = owners.get(db) {
             if existing.is_alive() {
                 return Ok(existing.clone());
             }
-            // Stale/dead entry for this db — drop it before respawning on the same datadir.
+            // Stale or dead entry for this db: drop it before respawning on the same datadir.
             if let Some(dead) = owners.remove(db) {
                 dead.kill().await;
             }
         }
 
-        // Warm path: claim the pre-warmed spare (WASM already compiled) and re-target it at this
-        // db in-process instead of a cold spawn — ~0.5 s versus 15–20 s on Windows.
+        // Warm path: claim the pre-warmed spare, which has WASM compiled already, and re-target
+        // it at this db in-process. Around 0.5 s against 15-20 s for a cold spawn on Windows.
         let spare = { state.warm_spare.lock().await.take() };
         let (owner, spare_taken) = match spare {
             Some(spare) if spare.is_alive() && spare.switch_db(db, 20000, allow_create).await.is_ok() => {
@@ -1221,15 +1218,15 @@ async fn get_or_spawn_owner(
         };
         owners.insert(db.to_string(), owner.clone());
 
-        // Enforce the cap only AFTER taking the new owner in. Evicting first would free a slot
-        // we then immediately refill from the spare, leaving the spare empty and forcing a cold
-        // spawn; this order lets the evicted owner BECOME the next spare instead.
+        // Enforce the cap after taking the new owner in. Evicting first frees a slot that is
+        // then refilled from the spare, leaving the spare empty and the next open cold. In this
+        // order the evicted owner becomes the next spare.
         let evicted = take_evictable_owners(&mut owners, db).await;
         (owner, evicted, spare_taken)
     };
 
-    // Recycle the evicted owners into the spare slot (or kill them), then make sure a spare
-    // exists either way. Backgrounded so a caller never waits on it.
+    // Recycle the evicted owners into the spare slot, or kill them, then ensure a spare exists
+    // either way. Backgrounded so no caller waits on it.
     if !evicted.is_empty() || spare_taken {
         let state = state.clone();
         let app = app.clone();
@@ -1244,14 +1241,14 @@ async fn get_or_spawn_owner(
 }
 
 /// Periodically retire owners nobody has touched for a while, under the same idle rules as
-/// eviction. Without this, an app left open keeps every database it ever showed.
+/// eviction. Without it, an app left open keeps every database it ever showed.
 fn start_owner_idle_reaper(state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(60));
         loop {
             tick.tick().await;
-            // Pick and remove under the lock; retire outside it (a `switch_db` round-trip must
-            // not block other dbs' queries).
+            // Pick and remove under the lock, retire outside it: a `switch_db` round-trip must
+            // not block other dbs' queries.
             let stale: Vec<Arc<Owner>> = {
                 let mut owners = state.owners.lock().await;
                 let mut dbs: Vec<String> = Vec::new();
@@ -1280,12 +1277,11 @@ async fn start_session(
     allow_create: Option<bool>,
 ) -> Result<String, String> {
     let db = db_name.unwrap_or_else(|| "main".to_string());
-    // Creating a scan database is something only STARTING A SCAN may do. Every other caller is
-    // re-attaching to one that exists, so it defaults to false: the frontend routes db-less
-    // queries (model_status, ping, download_model — app-level questions that have nothing to do
-    // with any scan) at whichever tab is active, and with create enabled those were materialising
-    // ~38 MB of empty PGlite for tabs the user never scanned. Never adopted (no meta), never
-    // visible, never reclaimed.
+    // Only a starting scan may create a scan database; every other caller re-attaches to one
+    // that exists, hence the default of false. The frontend routes db-less queries — model_status,
+    // ping, download_model, all app-level questions unrelated to any scan — at whichever tab is
+    // active, so with creation enabled those build ~38 MB of empty PGlite for tabs that were
+    // never scanned. Such a datadir has no meta, so reconciliation never adopts or reclaims it.
     let owner = get_or_spawn_owner(&app, state.inner(), &db, allow_create.unwrap_or(false)).await?;
     let run_id = owner.run_id.lock().unwrap().clone();
     Ok(run_id)
@@ -1300,13 +1296,13 @@ async fn session_request(
     timeout_ms: Option<u64>,
 ) -> Result<QueryResponse, String> {
     let db = db_name.unwrap_or_else(|| "main".to_string());
-    // Get-or-spawn, not get-or-fail: the pool may have evicted this db's owner since the caller
-    // last talked to it, and the frontend memoizes session promises so it wouldn't know to
-    // re-establish. Rehydrating here keeps eviction entirely invisible above the IPC boundary.
+    // Get-or-spawn rather than get-or-fail: the pool may have evicted this db's owner since the
+    // caller last used it, and the frontend memoizes session promises, so it would not know to
+    // re-establish one. Rehydrating here keeps eviction invisible above the IPC boundary.
     // `get_or_spawn_owner` returns a cloned Arc with the map lock released, so independent
-    // requests (across dbs or on the same owner) still run concurrently. `allow_create: false`
-    // is the important half: a query is never a reason to bring a database into existence, and
-    // without it a stray read for a just-deleted scan silently recreates its datadir.
+    // requests, across dbs or on the same owner, still run concurrently. `allow_create: false`
+    // keeps a query from bringing a database into existence; without it a read for a
+    // just-deleted scan recreates its datadir.
     let owner = get_or_spawn_owner(&app, state.inner(), &db, false).await?;
     // Tag scan events with the job id the UI passed on start_scan.
     if request.action == "start_scan" {
@@ -1317,9 +1313,9 @@ async fn session_request(
     owner.send_request(&request, timeout_ms.unwrap_or(15000)).await
 }
 
-/// Kill every owner plus the pre-warmed spare. App teardown: each holds an open PGlite, and an
-/// open PGlite costs ~4 GB of Windows commit charge (an untouched wasm32 reservation), so an
-/// owner that outlives the app is expensive as well as wrong.
+/// Kill every owner plus the pre-warmed spare, on app teardown. Each holds an open PGlite, and
+/// an open PGlite costs ~4 GB of Windows commit charge as an untouched wasm32 reservation, so an
+/// owner outliving the app is expensive as well as wrong.
 async fn reap_all(state: &Arc<AppState>) {
     let owners: Vec<Arc<Owner>> = state.owners.lock().await.drain().map(|(_, o)| o).collect();
     for owner in owners {
@@ -1514,8 +1510,8 @@ fn main() {
             // startup and the first scan can claim it (no-op if owner mode is unused —
             // the spare just sits idle and is reaped on teardown).
             ensure_warm_spare(app.handle().clone(), state_for_setup.clone());
-            // Retire owners nobody is looking at, so an app left open doesn't sit on every
-            // database it ever showed (each one reserves ~4 GiB of Windows commit charge).
+            // Retire owners nobody is looking at, so an app left open does not hold every
+            // database it showed; each reserves ~4 GiB of Windows commit charge.
             start_owner_idle_reaper(state_for_setup);
             // Native window effect (vibrancy/acrylic) on the primary window.
             if let Some(window) = app.get_webview_window("main") {
@@ -1562,10 +1558,10 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app_handle, event| {
-            // App exit: reap every child we spawned — THE llm-helper (holds the ~1 GB model) and
-            // every session owner plus the warm spare. `stop_session` is frontend-driven and does
-            // not fire on window close (the route is never unmounted), so Rust must do it here or
-            // the owners outlive the app.
+            // App exit: reap every child, meaning the llm-helper, which holds the ~1 GB model,
+            // and every session owner plus the warm spare. `stop_session` is frontend-driven and
+            // does not fire on window close, since the route is never unmounted, so this has to
+            // happen here or the owners outlive the app.
             if let tauri::RunEvent::Exit = event {
                 use tauri::Manager;
                 let state = app_handle.state::<Arc<AppState>>().inner().clone();
@@ -1593,14 +1589,14 @@ mod pool_tests {
 
     #[test]
     fn never_evicts_the_db_being_opened() {
-        // "b" is the oldest, but it's the one we're making room for.
+        // "b" is the oldest, but it is the db being made room for.
         let owners = [snap("a", 100, false, false), snap("b", 5, false, false)];
         assert_eq!(pick_eviction_victim(&owners, "b").as_deref(), Some("a"));
     }
 
     #[test]
     fn never_evicts_a_scanning_owner() {
-        // The LRU owner is mid-scan — evicting it would cancel work the user asked for.
+        // The LRU owner is mid-scan, so evicting it would cancel work in progress.
         let owners = [snap("scanning", 1, true, false), snap("idle", 900, false, false)];
         assert_eq!(pick_eviction_victim(&owners, "other").as_deref(), Some("idle"));
     }
@@ -1613,7 +1609,7 @@ mod pool_tests {
 
     #[test]
     fn gives_up_rather_than_interrupt_work() {
-        // Everything is busy: run over the cap instead of cancelling something.
+        // Everything is busy, so run over the cap rather than cancel something.
         let owners = [snap("a", 1, true, false), snap("b", 2, false, true), snap("keep", 3, false, false)];
         assert_eq!(pick_eviction_victim(&owners, "keep"), None);
     }
@@ -1624,10 +1620,10 @@ mod pool_tests {
     }
 }
 
-/// Live-process pool tests. These spawn REAL session sidecars, so they are `#[ignore]`d by
+/// Live-process pool tests. These spawn real session sidecars, so they are `#[ignore]`d by
 /// default and run explicitly:
 ///   cargo test --bin archifiltre-ui pool_live -- --ignored --test-threads=1
-/// They need `target/debug/archifiltre` (the compiled sidecar) and isolate themselves in a
+/// They need `target/debug/archifiltre`, the compiled sidecar, and isolate themselves in a
 /// throwaway XDG_DATA_HOME so they never touch a real scan.
 #[cfg(test)]
 mod pool_live_tests {
@@ -1651,8 +1647,8 @@ mod pool_live_tests {
     }
 
     /// The eviction path end to end: at the cap, the least-recently-used idle owner is removed
-    /// and RECYCLED into the empty spare slot rather than killed — which is what keeps a cold
-    /// start (15-20 s on Windows) off the tab-switch path.
+    /// and recycled into the empty spare slot rather than killed, which keeps a cold start
+    /// (15-20 s on Windows) off the tab-switch path.
     #[test]
     #[ignore]
     fn evicted_owner_is_recycled_as_the_warm_spare() {
@@ -1660,7 +1656,7 @@ mod pool_live_tests {
             eprintln!("skip: {} not built", sidecar().display());
             return;
         }
-        // Isolate: every db this test opens lands in a throwaway data home.
+        // Every db this test opens lands in a throwaway data home.
         let tmp = std::env::temp_dir().join(format!("af-pool-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         std::env::set_var("XDG_DATA_HOME", &tmp);
@@ -1670,7 +1666,7 @@ mod pool_live_tests {
             let state = Arc::new(AppState::default());
             let mut owners: HashMap<String, Arc<Owner>> = HashMap::new();
 
-            // Three owners; touch them so LRU order is unambiguous (oldest = "a").
+            // Three owners, touched in turn so the LRU order is unambiguous (oldest is "a").
             for db in ["pool_a", "pool_b", "pool_c"] {
                 owners.insert(db.to_string(), spawn_test_owner(db).await);
             }
@@ -1686,15 +1682,15 @@ mod pool_live_tests {
 
             assert!(state.warm_spare.lock().await.is_none(), "no spare to start with");
 
-            // MAX_OWNERS is 2, so opening a third must shed exactly one — and it must be "a",
-            // the one nobody has touched.
+            // MAX_OWNERS is 2, so opening a third sheds exactly one, and it must be "a", the
+            // one nobody has touched.
             let evicted = take_evictable_owners(&mut owners, "pool_c").await;
             assert_eq!(evicted.len(), 1, "exactly one owner shed to reach the cap");
             assert_eq!(owners.len(), MAX_OWNERS, "pool sits at the cap");
             assert!(!owners.contains_key("pool_a"), "the LRU owner is the one shed");
             assert!(owners.contains_key("pool_c"), "the db being opened is never shed");
 
-            // The novel bit: it becomes the spare instead of dying.
+            // The evicted owner becomes the spare rather than being killed.
             let victim = evicted.into_iter().next().unwrap();
             retire_owner(&state, victim).await;
             {
@@ -1703,7 +1699,7 @@ mod pool_live_tests {
                 assert!(spare.is_alive(), "recycled spare is a LIVE process, not a corpse");
             }
 
-            // Cleanup: the two still in the pool, plus the recycled spare.
+            // Clean up the two still in the pool, plus the recycled spare.
             for (_, o) in owners.drain() {
                 o.kill().await;
             }

@@ -3,7 +3,7 @@
 import { $ } from 'bun';
 
 /**
- * Smart dataset resolution like archiscan
+ * Resolve a test dataset: a path is used as-is, a bare name gets the `testfolder-` prefix.
  */
 function resolveTestDataset(input: string): string {
   // If full path, use as-is

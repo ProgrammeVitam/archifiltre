@@ -1,8 +1,7 @@
 /**
  * Scanner Library - Core File Scanning Functionality
  *
- * Streaming file scanner inspired by ArchiScan's proven architecture.
- * Single-pass RxJS pipeline that discovers, ingests, and analyzes files in real-time.
+ * Single-pass RxJS pipeline that discovers, ingests, and analyzes files in real time.
  *
  * Flow: Clean → Stream(Discover+Ingest) → Duplicate Detection
  */
@@ -1354,8 +1353,8 @@ function seedWalk(rootPath: string, seedDirs?: string[]): { stack: string[]; que
 }
 
 /**
- * Simple file walker like ArchiScan - stack-based approach (not recursive)
- * Yields files immediately as discovered for streaming processing
+ * Stack-based file walker, not recursive.
+ * Yields files as they are discovered, for streaming processing.
  * Catalogs ALL files with metadata flags for flexible filtering later
  *
  * Sequential (concurrency 1). The default/legacy path — behaviour is byte-for-byte as
