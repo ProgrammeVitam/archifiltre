@@ -264,7 +264,7 @@
 				<CpuIcon class="h-3 w-3" />
 				<span>{meter.cpuPct}%</span>
 				<span class="text-[8px] opacity-40">{sep}</span>
-				<span>{meter.rssMb} MB</span>
+				<span>{(meter.memUsedMb / 1024).toFixed(1)} GB</span>
 				{#if meter.budget < 1}
 					<span class="text-[8px] opacity-40">{sep}</span>
 					<span class="text-[var(--color-warning,#d97706)]"
@@ -285,7 +285,7 @@
 				<CpuIcon class="h-3 w-3" />
 				<span>{meter.cpuPct}%</span>
 				<span class="text-[8px] opacity-40">{sep}</span>
-				<span>{meter.rssMb} MB</span>
+				<span>{(meter.memUsedMb / 1024).toFixed(1)} GB</span>
 			</span>
 			<span class="text-[8px] opacity-40">{sep}</span>
 		{/if}

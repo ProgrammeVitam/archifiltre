@@ -28,7 +28,7 @@
  */
 import { Command } from '@oclif/core';
 import { createInterface } from 'node:readline';
-import { cpus } from 'node:os';
+import { cpus, freemem, totalmem } from 'node:os';
 import {
   DEFAULT_LOCAL_MODEL,
   DownloadError,
@@ -394,8 +394,10 @@ export default class LlmHelper extends Command {
             promptChars: (req.prompt ?? '').length,
             backend: backend || 'cpu',
           });
-          // Live resource sampler for the status-bar meter: this helper's own CPU%/RSS (plus VRAM
-          // on a GPU backend) ~1×/s while this generation runs; cleared in `finally`.
+          // Live resource sampler for the status-bar meter: this helper's CPU% plus SYSTEM memory
+          // (and VRAM on a GPU backend) ~1×/s while this generation runs; cleared in `finally`.
+          // System rather than own-RSS: the meter is about machine load, and a single process's
+          // resident set is not the app's footprint.
           const cores = cpus().length || 1;
           let lastCpu = process.cpuUsage();
           let lastAt = performance.now();
@@ -407,7 +409,8 @@ export default class LlmHelper extends Command {
             lastCpu = cur;
             lastAt = now;
             const cpuPct = Math.min(100, Math.round((busyUs / 1000 / elapsedMs / cores) * 100));
-            const rssMb = Math.round(process.memoryUsage().rss / 1048576);
+            const memUsedMb = Math.round((totalmem() - freemem()) / 1048576);
+            const memTotalMb = Math.round(totalmem() / 1048576);
             void (async () => {
               let vramUsedMb: number | undefined;
               let vramTotalMb: number | undefined;
@@ -420,7 +423,7 @@ export default class LlmHelper extends Command {
               } catch {
                 /* best-effort telemetry */
               }
-              send({ id, type: 'resource', cpuPct, rssMb, vramUsedMb, vramTotalMb });
+              send({ id, type: 'resource', cpuPct, memUsedMb, memTotalMb, vramUsedMb, vramTotalMb });
             })();
           };
           // Seed one reading at 350 ms so even a sub-second generation lights the meter.

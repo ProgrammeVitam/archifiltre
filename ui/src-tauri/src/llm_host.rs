@@ -767,7 +767,8 @@ async fn run_on_helper(
                 sink(json!({
                     "event":"llm:resource",
                     "cpuPct": msg.get("cpuPct"),
-                    "rssMb": msg.get("rssMb"),
+                    "memUsedMb": msg.get("memUsedMb"),
+                    "memTotalMb": msg.get("memTotalMb"),
                     "vramUsedMb": msg.get("vramUsedMb"),
                     "vramTotalMb": msg.get("vramTotalMb"),
                 })

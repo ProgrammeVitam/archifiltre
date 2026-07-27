@@ -175,10 +175,15 @@ export default class Session extends Command {
       const cpuPct = elapsed > 0 ? Math.round(((d.user + d.system) / 1000 / elapsed) * 100) : 0;
       lastCpu = process.cpuUsage();
       lastT = now;
+      // SYSTEM memory, not this process's RSS. The meter answers "what is this doing to my
+      // machine", and one sidecar's RSS is neither the app's footprint (there are several
+      // processes plus the webview) nor, on Windows, close to what it actually costs — a
+      // session charges ~4.4 GB of commit while its working set reads ~450 MB.
       this.send({
         event: 'resource',
         cpuPct,
-        rssMB: Math.round(process.memoryUsage().rss / 1048576),
+        memUsedMb: Math.round((os.totalmem() - os.freemem()) / 1048576),
+        memTotalMb: Math.round(os.totalmem() / 1048576),
         load1: +os.loadavg()[0].toFixed(2),
         cores: os.cpus().length,
         budget: +this.effectiveBudget().toFixed(2),

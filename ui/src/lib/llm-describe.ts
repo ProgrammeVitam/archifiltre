@@ -109,10 +109,13 @@ export interface LlmEngineInfo {
 	vramTotalMb: number | null;
 	cpuCount: number | null;
 }
-/** One live per-generation resource sample (CPU%/RSS always; VRAM on a GPU backend). */
+/** One live per-generation resource sample (CPU% + system memory always; VRAM on a GPU
+ *  backend). Memory is SYSTEM-wide, not the helper's own resident set: the meter reports machine
+ *  load, and one process's RSS is neither the app's footprint nor, on Windows, its real cost. */
 export interface LlmResource {
 	cpuPct: number;
-	rssMb: number;
+	memUsedMb: number;
+	memTotalMb: number;
 	vramUsedMb: number | null;
 	vramTotalMb: number | null;
 }
@@ -204,7 +207,8 @@ const rawResource$: Observable<LlmResource> = hostEvents$.pipe(
 	filter((m) => m.event === 'llm:resource'),
 	map((m) => ({
 		cpuPct: Number(m.cpuPct ?? 0),
-		rssMb: Number(m.rssMb ?? 0),
+		memUsedMb: Number(m.memUsedMb ?? 0),
+		memTotalMb: Number(m.memTotalMb ?? 0),
 		vramUsedMb: m.vramUsedMb == null ? null : Number(m.vramUsedMb),
 		vramTotalMb: m.vramTotalMb == null ? null : Number(m.vramTotalMb)
 	}))
@@ -248,26 +252,32 @@ const aiCellState$: Observable<AiCellState> = combineLatest([
 	shareReplay(1)
 );
 
-/** The scan governor's CPU%/RSS/budget sample. Not an `llm:*` event — the owner emits `resource`
- *  every 500ms on the same stdout stream, so it arrives on `hostEvents$` too.
+/** The scan governor's CPU% / system-memory / budget sample. Not an `llm:*` event — the owner
+ *  emits `resource` every 500ms on the same stdout stream, so it arrives on `hostEvents$` too.
  *  `startWith(null)` so `aiMeter$`'s combineLatest fires before any scan has run. */
 interface ScanResource {
 	cpuPct: number;
-	rssMb: number;
+	memUsedMb: number;
+	memTotalMb: number;
 	budget: number;
 }
 const scanResource$: Observable<ScanResource | null> = hostEvents$.pipe(
 	filter((m) => m.event === 'resource'),
-	map((m) => ({ cpuPct: Number(m.cpuPct ?? 0), rssMb: Number(m.rssMB ?? 0), budget: Number(m.budget ?? 1) })),
+	map((m) => ({
+		cpuPct: Number(m.cpuPct ?? 0),
+		memUsedMb: Number(m.memUsedMb ?? 0),
+		memTotalMb: Number(m.memTotalMb ?? 0),
+		budget: Number(m.budget ?? 1)
+	})),
 	startWith<ScanResource | null>(null),
 	shareReplay(1)
 );
 
 export type AiMeter =
 	| { kind: 'none' }
-	| { kind: 'scan'; cpuPct: number; rssMb: number; budget: number }
+	| { kind: 'scan'; cpuPct: number; memUsedMb: number; memTotalMb: number; budget: number }
 	| { kind: 'gpu'; usedMb: number; totalMb: number }
-	| { kind: 'cpu'; cpuPct: number; rssMb: number };
+	| { kind: 'cpu'; cpuPct: number; memUsedMb: number; memTotalMb: number };
 // The scan branch is gated on `isScanning` (the real scan lifecycle), not the resource event's
 // self-reported `scanning` flag, so the meter clears the instant the scan completes.
 const aiMeter$: Observable<AiMeter> = combineLatest([
@@ -279,11 +289,17 @@ const aiMeter$: Observable<AiMeter> = combineLatest([
 ]).pipe(
 	map(([scanning, scanRes, busy, res, backend]): AiMeter => {
 		if (scanning && scanRes)
-			return { kind: 'scan', cpuPct: scanRes.cpuPct, rssMb: scanRes.rssMb, budget: scanRes.budget };
+			return {
+				kind: 'scan',
+				cpuPct: scanRes.cpuPct,
+				memUsedMb: scanRes.memUsedMb,
+				memTotalMb: scanRes.memTotalMb,
+				budget: scanRes.budget
+			};
 		if (busy && res) {
 			if (backend === 'gpu' && res.vramTotalMb && res.vramUsedMb != null)
 				return { kind: 'gpu', usedMb: res.vramUsedMb, totalMb: res.vramTotalMb };
-			return { kind: 'cpu', cpuPct: res.cpuPct, rssMb: res.rssMb };
+			return { kind: 'cpu', cpuPct: res.cpuPct, memUsedMb: res.memUsedMb, memTotalMb: res.memTotalMb };
 		}
 		return { kind: 'none' };
 	}),
