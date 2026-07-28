@@ -82,7 +82,7 @@ describe('CLI Integration', () => {
       const result = await execCLI(['version']);
 
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain('5.0.0-dev');
+      expect(result.stdout).toContain('5.0.0-beta.2');
     });
 
     it('should execute health command', async () => {
@@ -105,7 +105,7 @@ describe('CLI Integration', () => {
       const result = await execCLI(['--version']);
 
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain('archifiltre/5.0.0-dev');
+      expect(result.stdout).toContain('archifiltre/5.0.0-beta.2');
     });
 
     it('should handle version with verbose flag', async () => {

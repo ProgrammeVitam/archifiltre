@@ -139,7 +139,7 @@ async function getBuildInfo(): Promise<BuildInfo> {
     const packageJson = JSON.parse(await readFile(packageJsonPath, 'utf-8'));
 
     return {
-      version: process.env.APP_VERSION || packageJson.version || '5.0.0-dev',
+      version: process.env.APP_VERSION || packageJson.version || '5.0.0-beta.2',
       gitSha: process.env.GIT_SHA || process.env.GITHUB_SHA || 'unknown',
       buildDate: process.env.BUILD_DATE || new Date().toISOString(),
       os: getOsName(),
@@ -151,7 +151,7 @@ async function getBuildInfo(): Promise<BuildInfo> {
       'yellow'
     );
     return {
-      version: '5.0.0-dev',
+      version: '5.0.0-beta.2',
       gitSha: 'unknown',
       buildDate: new Date().toISOString(),
       os: getOsName(),
