@@ -49,6 +49,9 @@
 		"category": "Utility",
 		"shortDescription": "Privacy-first file scanning tool",
 		"windows": {
+			"webviewInstallMode": {
+				"type": "skip"
+			},
 			"nsis": {
 				"installerHooks": "./installer-hooks.nsh",
 				"customLanguageFiles": {
