@@ -227,7 +227,7 @@ This tool is designed for French government compliance requirements:
 
 - **Organization**: République française – Ministère de la Culture (SNUM/SIAF)
 - **Program**: Vitam (Programme interministériel)
-- **License**: Apache-2.0
+- **License**: MIT
 - **Standard**: SPDX 3.0.1 (System Package Data Exchange)
 - **Contact**: archifiltre@culture.gouv.fr
 
@@ -262,7 +262,7 @@ The `generate-spdx3.py` script can be tested independently:
 
 ## License
 
-Apache-2.0 - Compatible with French government requirements
+MIT - Compatible with French government requirements
 
 ## Support
 
